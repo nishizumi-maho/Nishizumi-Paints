@@ -1148,31 +1148,6 @@ Yes. Use `--nogui`.
 
 ---
 
-## Recommended GitHub repository contents
-
-If you are publishing this project, a clean repository layout would be something like:
-
-```text
-.
-├─ README.md
-├─ LICENSE
-├─ requirements.txt
-├─ nishizumi_paints_build_ready.py
-├─ nishizumi_paints_icon.ico
-├─ nishizumi_paints_icon.png
-└─ build_nishizumi_paints_exe.bat
-```
-
-Suggested `requirements.txt`:
-
-```text
-requests
-PyYAML
-pyirsdk
-```
-
----
-
 ## Final notes
 
 Nishizumi Paints is meant to feel invisible when everything is working correctly:
