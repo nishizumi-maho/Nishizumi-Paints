@@ -1,0 +1,7 @@
+# Nishizumi Paints runtime dependencies
+requests>=2.31.0
+PyYAML>=6.0
+pyirsdk>=1.1.8
+
+# Optional: used only to build the Windows EXE
+# pyinstaller>=6.0
