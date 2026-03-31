@@ -2,18 +2,18 @@
 
 <img width="512" height="512" alt="nishizumi_paints_icon" src="https://github.com/user-attachments/assets/7ba4ccbc-7dfe-4b8c-abe2-182e3fd0254a" />
 
-
-**Nishizumi Paints** is a lightweight desktop app for **iRacing** that watches your current session, downloads the correct Trading Paints files for the drivers in that session, installs them into your local iRacing paint folder, and optionally triggers an automatic texture refresh so the paints appear in-game without manual work.
+**Nishizumi Paints** is a lightweight Windows desktop app for **iRacing** that watches your current session through the **iRacing SDK**, downloads the correct **Trading Paints** files for the drivers in that session, installs them into your local iRacing paint folder, and optionally tells iRacing to refresh textures so the liveries appear in-game with as little manual work as possible.
 
 The app is designed to be:
 
-- **always-on while open**
-- **minimal in UI and CPU usage**
+- **always active while open**
+- **small and practical**
 - **fast on large sessions**
 - **safe to leave running in the background**
-- **simple enough for normal users, detailed enough for power users**
+- **simple for normal users**
+- **detailed enough for advanced users and debugging**
 
-It includes a compact built-in UI, persistent settings, tray support, autostart support on Windows, retry logic, download auto-tuning, automatic cleanup, and detailed activity logging.
+Nishizumi Paints includes a compact built-in UI, persistent settings, Windows auto-start support, single-instance protection, retry logic, adaptive download tuning, optional manual worker control, automatic cleanup behavior, and a detailed activity log.
 
 ---
 
@@ -27,7 +27,8 @@ It includes a compact built-in UI, persistent settings, tray support, autostart 
 - [Quick start](#quick-start)
 - [User interface overview](#user-interface-overview)
 - [Detailed explanation of every option](#detailed-explanation-of-every-option)
-- [Buttons and actions](#buttons-and-actions)
+- [Download workers](#download-workers)
+- [Buttons and manual actions](#buttons-and-manual-actions)
 - [Activity log and status messages](#activity-log-and-status-messages)
 - [Advanced technical details](#advanced-technical-details)
 - [Headless mode and command-line options](#headless-mode-and-command-line-options)
@@ -49,21 +50,22 @@ When you join a session, the app:
 
 1. reads the current session ID and driver list
 2. identifies each driver's `UserID` and `CarPath`
-3. asks Trading Paints which paint files exist for those users
-4. filters the returned files so each driver only gets files that match the car currently in the session
-5. downloads those files in parallel
-6. extracts compressed paint files when needed
+3. asks Trading Paints which files exist for those users
+4. filters those results so each driver only receives files that match the car currently being used in the session
+5. downloads the needed files in parallel
+6. extracts compressed files when needed
 7. installs them into your local `Documents\iRacing\paint` folder
 8. optionally tells iRacing to reload textures
 9. keeps watching for session changes
-10. optionally clears downloaded files when you leave that session or exit the app
+10. optionally removes previously downloaded session files when they are no longer needed
 
-The app is meant to remove the usual manual workflow of:
+The app is meant to reduce the usual manual workflow of:
 
 - opening another downloader
 - waiting for it to sync
 - pressing `Ctrl+R`
-- clearing old session files by hand
+- manually clearing old session files
+- re-opening the same helper app again and again
 
 ---
 
@@ -85,175 +87,199 @@ The app is meant to remove the usual manual workflow of:
 - Extracts `.bz2` paint files automatically
 - Saves files into the correct local iRacing paint folders
 - Can automatically trigger an iRacing texture reload
-- Can clear session files when you leave a session
-- Can preserve your own local livery if desired
+- Can remove downloaded session files when leaving a session or exiting iRacing
+- Can preserve your own livery locally
+- Can optionally refresh the current session manually with one button
 
 ### Reliability and stability
 
 - Built-in retry logic for manifest requests and file downloads
-- Exponential retry backoff
-- Session fingerprinting to avoid unnecessary repeat work
-- Worker auto-tuning for downloads and manifest lookups
-- Duplicate item removal before download
-- Safe temp-folder handling and stale temp cleanup
+- Exponential backoff on retries
+- Session fingerprinting to avoid repeated work
+- Duplicate removal before the final download phase
+- Automatic stale temp cleanup on startup
 - Atomic save/replace behavior to reduce partial-file issues
-- Background watchdog that restarts the worker loop if it crashes
+- Background watchdog that restarts the worker loop if it crashes unexpectedly
+- One-instance protection to avoid multiple copies of the app running at once
+- Re-open behavior that brings the existing app window into focus instead of launching duplicates
 
 ### UI and usability
 
 - Small built-in desktop UI
-- Always active while open, no manual Start/Stop workflow
-- Optional activity log
-- Verbose logging option
-- Windows autostart support
-- Start minimized when launched by Windows autostart
-- Minimize to tray behavior on close
+- No Start/Stop workflow
+- The app is considered active as long as it is open
+- Optional activity log panel
+- Optional verbose logging
+- Windows auto-start support
+- Start minimized when launched automatically by Windows
+- Keep running in the Windows background area on close
 - Manual “Refresh paints” action
 - Manual “Clear downloaded” action
-- One-click open paint folder
+- One-click open paint folder action
+- Manual or automatic download worker control
 
 ### Build and deployment
 
 - Pure Python source
-- Ready for PyInstaller one-file EXE build
-- Supports a custom app icon for both UI and final EXE
+- Ready for PyInstaller one-file EXE builds
+- Supports a custom app icon for the UI and the final EXE
 
 ---
 
 ## How it works
 
-This section explains the full workflow in plain language.
+This section explains the full workflow from startup to session cleanup.
 
 ### 1. App startup
 
-When the app starts, it loads the saved configuration from a JSON settings file in the user's app data folder.
+When the app starts, it loads the saved configuration from a JSON settings file stored in the user's app data folder.
 
 It then:
 
 - initializes logging
 - prepares the background service
-- builds the UI
-- starts the background watcher thread automatically
-- optionally minimizes to tray if the app was launched by autostart and `Start minimized` is enabled
+- creates the UI
+- starts the background watcher automatically
+- starts the single-instance listener
+- optionally minimizes only when launched by Windows auto-start and `Start minimized` is enabled
 
-When the app is opened manually by double-clicking it, it **stays visible**. The minimized startup behavior is only meant for Windows autostart launches.
+If the app is opened manually by double-clicking it, it stays visible. The minimized startup behavior is only meant for automatic startup launches.
 
-### 2. SDK connection
+### 2. Single-instance protection
+
+Nishizumi Paints is designed to allow only **one running instance**.
+
+If the user opens the EXE again while one instance is already active:
+
+- a second full copy is **not** launched
+- the existing app is notified
+- the existing window is brought to the front instead
+
+This avoids duplicate background watchers, duplicate downloads, duplicate texture reloads, and general confusion.
+
+### 3. SDK connection
 
 The service tries to initialize the iRacing SDK.
 
 There are two common outcomes:
 
-- **iRacing is already running and connected to a session**: the service immediately starts processing
-- **iRacing is not running yet or not in a session**: the service stays alive and waits in watch mode
+- **iRacing is already running and connected to a session**: the service immediately begins watching and can process the session
+- **iRacing is not running yet or not in a valid session**: the service stays alive and waits
 
-This means you can open Nishizumi Paints before launching iRacing and just leave it running.
+This means Nishizumi Paints can be opened before iRacing and simply left running.
 
-### 3. Session polling
+### 4. Session polling
 
-The app periodically polls the SDK. It reads:
+The app periodically polls the SDK. It reads values such as:
 
 - `WeekendInfo`
 - `DriverInfo`
 - `SessionInfoUpdate`
-- `OkToReloadTextures` when needed
+- `OkToReloadTextures` when a texture reload is needed
 
-Instead of reading raw YAML only, the app uses the relevant SDK sections and builds its own internal session model.
+If the relevant session data has not changed since the last poll, the app does nothing. That prevents repeated work and unnecessary network traffic.
 
-If the session data has not changed since the last poll, the app does nothing. This avoids repeated downloads and unnecessary work.
+### 5. Session model creation
 
-### 4. Session model creation
-
-From the SDK data, the app builds a session object containing:
+From the SDK data, the app builds an internal session object containing:
 
 - the main session ID
 - the sub-session ID if present
-- a set of users in the session
+- a set of users in the current session
 - each user's `UserID`
 - each user's `CarPath`
-- the local driver's own user ID when it can be determined
+- the local player's user ID when it can be determined
 
-That local user identification is important for options like:
+That local player identification is important for settings like:
 
 - **Update my own paints**
 - **Keep my livery locally**
 
-### 5. Manifest lookups
+### 6. Manifest lookups
 
-For each user in the session, the app calls the Trading Paints manifest endpoint and asks which files exist for that specific `UserID`.
+For each user in the session, the app queries the Trading Paints manifest endpoint and asks which files exist for that specific `UserID`.
 
-Those lookups happen in parallel, with an auto-tuned worker count.
+Those manifest lookups are performed in parallel. The number of manifest workers is derived from the download worker mode so the app remains balanced.
 
-The result for each driver may contain different file types such as car, helmet, suit, spec map, and so on.
+### 7. File matching
 
-### 6. File matching
+A user can have paints for several cars, but the current session only uses one car per driver.
 
-Not every file returned by a user manifest should be installed. A user may have paints for several cars, but the current session only uses one specific car.
-
-To avoid installing the wrong files, Nishizumi Paints checks whether the manifest entry matches the driver's current `CarPath`.
+To avoid installing the wrong files, Nishizumi Paints filters the manifest response using the driver's current `CarPath`.
 
 Matching rules include:
 
 - exact directory match
-- normalized directory match for slightly different naming formats
-- helmet and suit files are always accepted for that user
+- normalized directory match for slight naming differences
+- helmet and suit files are accepted independently of the car directory
 
-### 7. Download queue building
+### 8. Download queue building
 
 After matching, the app builds the final queue of files that should be downloaded.
 
-Before downloading:
+Before the first download starts:
 
-- duplicate entries are removed
-- the download worker count is auto-tuned
-- progress totals are known in advance for logging
+- duplicates are removed
+- the worker count is resolved
+- progress totals become known in advance
+- per-stage progress logging is prepared
 
-### 8. Parallel downloads
+### 9. Parallel downloads
 
 Downloads are performed in parallel using worker threads.
 
-Each item is downloaded into a temp session folder first, not directly into the final iRacing paint folder.
-
-This helps with:
+Each file is first downloaded into a temp session folder rather than directly into the final iRacing paint folder. This helps with:
 
 - cleanup
 - crash recovery
-- partial-download safety
-- clearer session separation
+- separation between sessions
+- safer file replacement
+- reduced risk of leaving partially written files in the live paint folder
 
-If a request fails, retry logic is applied automatically.
+If a request fails, automatic retry logic is used.
 
-### 9. Extraction and install
+### 10. Extraction and install
 
 After download:
 
 - `.bz2` files are decompressed
-- final output filenames are generated according to the iRacing paint naming rules
-- files are written atomically using a temp destination plus `os.replace`
+- output filenames are mapped to iRacing's paint naming rules
+- files are written atomically using a temporary destination and final replace operation
 
-This reduces the chance of corrupt or partially written paint files.
+This reduces the chance of corrupt or half-written paint files.
 
-### 10. Texture reload
+### 11. Texture reload
 
-If **Auto refresh paints** is enabled, the app tries to tell iRacing to reload textures through the SDK.
+If **Auto refresh paints** is enabled, the app tells iRacing to reload textures through the SDK.
 
-It does not blindly spam reload requests. Instead, it checks whether iRacing reports that it is safe to reload textures.
+It does not blindly spam reload requests. It checks whether iRacing reports that it is safe to reload textures.
 
-If not immediately allowed, the app waits and tries again. If the SDK never becomes ready for too long, it can attempt a forced refresh later.
+If texture reload is not immediately allowed, the app waits and tries again.
 
-### 11. Session cleanup behavior
+### 12. Session cleanup behavior
 
-When you leave a valid session, or when a new session replaces the current one, the app can automatically remove the previously downloaded files.
+When you leave a valid session, or when a new session replaces the current one, the app can remove previously downloaded files automatically.
 
-This helps avoid keeping old session files around forever and keeps the local paint folder cleaner.
+This keeps the local paint folder from accumulating old session files forever.
 
-If **Keep my livery locally** is enabled, your own downloaded files can be preserved while the rest are removed.
+If **Keep my livery locally** is enabled, the app can preserve your own files while still cleaning up the rest.
 
-### 12. Watchdog behavior
+### 13. Background behavior on close
 
-If the internal worker loop crashes unexpectedly, the app logs the crash and tries to recover by restarting the service loop.
+If **Keep running in background on close** is enabled and you click the window close button (`X`):
 
-This is one of the reasons the app is safe to leave open for long periods.
+- the app does **not** exit
+- the main window is hidden
+- the app continues running in the Windows notification area / “Show hidden icons” area
+- the background watcher keeps working
+
+This is useful for users who want the app to stay active without leaving the main window visible.
+
+### 14. Watchdog behavior
+
+If the internal worker loop stops unexpectedly, the watchdog logs the event and restarts the background service loop.
+
+This helps the app stay usable over long sessions and long-running desktop use.
 
 ---
 
@@ -261,900 +287,740 @@ This is one of the reasons the app is safe to leave open for long periods.
 
 ### Operating system
 
-- **Windows** is the main supported target, especially for:
-  - tray behavior
-  - registry-based autostart
-  - EXE builds
+- **Windows**
 
-The script can technically run elsewhere in some cases, but the app is primarily designed for Windows + iRacing.
+The UI, auto-start behavior, notification-area behavior, and EXE build flow are all aimed at Windows desktop usage.
 
-### Software
+### Python
 
-- Python 3.10 or newer recommended
+- **Python 3.10+** recommended
+
+### iRacing
+
 - iRacing installed
-- iRacing SDK available to Python
-- Internet connection
+- iRacing SDK accessible from the running environment
 
 ### Python packages
 
-Install the dependencies with:
+See [`requirements.txt`](requirements.txt).
 
-```bash
-pip install requests pyyaml pyirsdk
-```
+At minimum, the runtime app uses:
 
-Notes:
-
-- `tkinter` is included with most normal Windows Python installs
-- `pyinstaller` is only needed if you want to build the EXE
+- `requests`
+- `PyYAML`
+- `pyirsdk`
 
 ---
 
 ## Installation
 
-### Option 1: Run the Python script directly
+### Option 1: run from Python source
 
-Place these files together in one folder:
-
-- `nishizumi_paints_build_ready.py`
-- `nishizumi_paints_icon.ico`
-- `nishizumi_paints_icon.png`
-
-Then run:
+1. Install Python
+2. Clone or download this repository
+3. Install dependencies:
 
 ```bash
-python nishizumi_paints_build_ready.py
+pip install -r requirements.txt
 ```
 
-### Option 2: Build the EXE
+4. Run the app:
 
-See [Build the EXE](#build-the-exe) below.
+```bash
+python nishizumi_paints_single_instance_v5.py
+```
+
+### Option 2: build a Windows EXE
+
+1. Install Python
+2. Install dependencies:
+
+```bash
+pip install -r requirements.txt
+pip install pyinstaller
+```
+
+3. Use the provided build batch file
+4. Run the generated EXE
 
 ---
 
 ## Quick start
 
-1. Install Python and the required packages
-2. Run `nishizumi_paints_build_ready.py`
-3. Leave the app open
-4. Launch iRacing whenever you want
-5. Join a session
-6. Nishizumi Paints will automatically detect the session and fetch the correct paint files
-7. If `Auto refresh paints` is enabled, the app will attempt to refresh textures automatically
+1. Launch **Nishizumi Paints**
+2. Leave the default settings enabled if you want the easiest experience
+3. Start iRacing
+4. Join a session
+5. The app will detect the session, fetch the necessary paints, install them, and refresh textures if enabled
+6. Leave the app open in the background if desired
 
 Recommended default usage:
 
-- leave the app open in the background
-- use tray minimize if you want a clean desktop
-- keep `Auto refresh paints` enabled
-- keep `Delete downloaded livery` enabled unless you specifically want old session files to remain
-- leave `Parallel downloads` at **8** unless you know why you want more
+- leave **Auto start** enabled
+- leave **Start minimized** enabled if you want Windows startup to stay unobtrusive
+- leave **Keep running in background on close** enabled
+- leave **Auto refresh paints** enabled
+- leave **Download workers mode** on **Auto**
+- only enable **Verbose logs** when you actually need deeper diagnostics
 
 ---
 
 ## User interface overview
 
-The UI is deliberately compact and split into a few simple sections.
+The app window is intentionally compact.
 
-### Header
+It is divided into three main areas:
+
+### 1. Header
 
 The top row shows:
 
-- **App name**
-- **Version**
-- **Current status**
+- app name
+- app version
+- service status text
 
-Typical status values include:
+### 2. Settings area
 
-- `Starting`
-- `Watching`
-- `Processing <session id>`
-- `Watching • <session id>`
-- `Recovering`
-- `Stopped`
-- `SDK unavailable`
+The middle portion is divided into three groups:
 
-### General
+- **General**
+- **Session**
+- **Downloads**
 
-Contains startup and window behavior options.
+### 3. Actions and activity area
 
-### Session
+The lower portion contains:
 
-Contains session-specific paint behavior and logging options.
-
-### Downloads
-
-Contains the parallel download cap and the manual refresh action.
-
-### Bottom actions
-
-Contains utility buttons such as:
-
-- `Clear downloaded`
-- `Paint folder`
-- `Hide`
-
-### Activity
-
-A scrollable live log panel that shows what the background service is doing.
+- the **Clear downloaded** button
+- the **Paint folder** button
+- the **Activity** log panel
 
 ---
 
 ## Detailed explanation of every option
 
-This section explains **every checkbox and control** in the app.
+This section explains every checkbox and control in the UI.
 
 ### Auto start
 
-When enabled on Windows, the app writes a registry entry under the current user's `Run` key so Nishizumi Paints launches automatically when Windows starts.
+When enabled, Nishizumi Paints registers itself to launch automatically when Windows signs in.
 
-Important details:
+Use this if you want the app to always be available without launching it manually.
 
-- this is per-user autostart, not system-wide service installation
-- if the app is running from source, it stores a Python command line in the registry
-- if the app is running as a packaged EXE, it stores the EXE path in the registry
-
-Best for users who want the app always ready before launching iRacing.
+Default: **On**
 
 ### Start minimized
 
-Controls whether the app should start hidden/minimized **when launched automatically from Windows autostart**.
+When enabled, Nishizumi Paints starts minimized **when launched by Windows auto-start**.
 
-Important detail:
+Important:
 
-- it does **not** hide the window when you open the app manually by double-clicking it
-- this was intentionally designed to avoid confusing non-technical users
+- if the app is launched manually, it stays visible
+- this prevents confusing behavior when the user intentionally opens it themselves
 
-### Minimize to tray on close
+Default: **On**
 
-Changes what happens when the window close button is pressed.
+### Keep running in background on close
 
-If enabled:
+When enabled, clicking the `X` button hides the window instead of exiting the app.
 
-- closing the window hides the app to the system tray instead of exiting
-- the watcher keeps running
-- paint downloading continues normally
+The app continues running in the Windows notification area, commonly accessed through **Show hidden icons**.
 
-If disabled:
+This keeps the watcher active without leaving the main window visible.
 
-- closing the window exits the app completely
+Default: **On**
 
 ### Auto refresh paints
 
-If enabled, the app tries to ask iRacing to reload textures after the new paint files are saved.
+When enabled, the app attempts to trigger an iRacing texture reload after installing new paint files.
 
-If disabled:
+This reduces the need for manual refresh actions.
 
-- the app still downloads and installs files
-- but it will not request the SDK texture refresh
-- the user may need to rely on manual refresh behavior if they want immediate appearance changes
+Default: **On**
 
 ### Update my own paints
 
-Controls whether the app should also fetch paint files for your own driver from the server.
+When enabled, the app includes your own user in the Trading Paints sync process.
 
-If enabled:
+This is useful if you also want your own current livery pulled through the same workflow.
 
-- your own current Trading Paints livery can be re-downloaded like everyone else's in the session
-
-If disabled:
-
-- the app skips manifest syncing for your own driver
-- useful if you prefer to keep only your current local files untouched
+Default: **On**
 
 ### Keep my livery locally
 
-Controls cleanup behavior for your own files.
+When enabled, your own installed livery files are preserved when downloaded session files are cleaned up.
 
-If enabled:
+This is useful if you do not want your own files removed when the session changes or when cleanup runs.
 
-- when the app clears downloaded session files, it keeps your own paint files if it can identify your user ID in the session
-
-If disabled:
-
-- your own downloaded session files are treated like any other and can be removed during cleanup
-
-This option is especially useful for people who want automatic cleanup but do not want their own current livery removed.
+Default: **On**
 
 ### Delete downloaded livery
 
-Controls whether the app removes downloaded session files when the session becomes inactive or when the app exits.
+When enabled, downloaded session files can be removed automatically when they are no longer needed.
 
-If enabled:
+This helps keep the iRacing paint folder cleaner and reduces disk clutter.
 
-- session files are cleaned when you leave a valid session
-- session files are cleaned when the app exits
-- helps keep the local paint folder tidy
-
-If disabled:
-
-- files are left behind after the session/app ends
-- useful for debugging, manual inspection, or keeping downloaded assets around
+Default: **On**
 
 ### Show activity
 
-Controls whether the live `Activity` log panel is visible in the UI.
+Shows the activity panel in the UI.
 
-If disabled:
+This is useful for:
 
-- the app still works normally
-- the service still runs
-- the log panel is just hidden from view
+- normal visibility into what the app is doing
+- quick troubleshooting
+- checking whether a session has been detected
+
+Default: **On**
 
 ### Verbose logs
 
-Switches the log level from standard informational logging to detailed debug logging.
+Enables more detailed logging.
 
-If enabled:
+Verbose logging is useful for debugging but intentionally disabled by default so the app stays cleaner for normal users.
 
-- more internal details appear in the activity panel
-- helpful for troubleshooting SDK behavior, matching logic, worker tuning, and retries
-- enabling this also automatically forces `Show activity` on, so the detailed logs are actually visible
+Default: **Off**
 
-### Parallel downloads
+### Download workers mode
 
-Sets the **upper cap** for how many paint downloads the app is allowed to run in parallel.
+Lets you choose between **Auto** and **Manual**.
 
-Default value:
+This controls how many concurrent download workers Nishizumi Paints uses.
 
-- **8**
+Default: **Auto**
 
-Valid range:
+### Manual workers
 
-- **1 to 24**
+Only used when **Download workers mode** is set to **Manual**.
 
-Important detail:
+Allowed range:
 
-- this is a **cap**, not a fixed always-on number
-- the app still auto-tunes the actual worker count below that limit depending on session size
+- minimum: **1**
+- maximum: **20**
 
-The UI includes a reminder:
+If you set the value to **20**, the app will honor that exact value in every session until you change it again.
 
-> Default is 8 • higher values use more internet • above 20 is at your own risk
-
-That is intentional. Larger values can increase throughput in large sessions, but they also increase:
-
-- bandwidth use
-- short-term server pressure
-- chance of transient failures
-- debugging complexity on weak connections
+Default value: **8**
 
 ---
 
-## Buttons and actions
+## Download workers
+
+Nishizumi Paints supports two download worker modes.
+
+### Auto mode
+
+**Auto** is the default mode and the recommended option for most users.
+
+In Auto mode, the app dynamically adjusts the number of parallel download workers based on the current session size and workload. This keeps the downloader light on smaller sessions while still scaling up when there are more liveries to process.
+
+The goal is to balance:
+
+- speed
+- stability
+- network usage
+- responsiveness
+
+without requiring manual tuning.
+
+Use Auto if you want the app to make the decision for you.
+
+### Manual mode
+
+If preferred, the downloader can be switched to **Manual** mode.
+
+In Manual mode, the user selects a fixed number of parallel download workers from **1 to 20**.
+
+Once set, Nishizumi Paints will honor that exact value in every session instead of using adaptive behavior.
+
+Examples:
+
+- If Manual is set to **6**, the app uses **6** download workers in every session.
+- If Manual is set to **20**, the app uses **20** download workers in every session.
+
+This is useful for advanced users who want predictable, fixed behavior regardless of session size.
+
+### Which mode should I use?
+
+- Use **Auto** for the best plug-and-play behavior.
+- Use **Manual** only if you want a fixed worker count.
+
+### Notes
+
+- Auto mode remains the safest general-purpose choice.
+- Manual mode does not auto-scale.
+- Higher manual values can increase bandwidth usage and put more pressure on slower or less stable connections.
+- Manifest worker count is still derived intelligently from the chosen download mode so the app stays balanced.
+
+---
+
+## Buttons and manual actions
+
+Nishizumi Paints intentionally keeps the number of buttons small.
 
 ### Refresh paints
 
-This does **not** simply refresh textures.
-
-It requests a **manual re-download pass** for the current session.
-
-What happens internally:
-
-1. the app marks the current session for a forced refresh
-2. the next loop treats the session as needing a new fetch even if the fingerprint is unchanged
-3. if cleanup-before-fetch is enabled, old session files may be removed first
-4. the app fetches manifests again
-5. matching files are downloaded again
-6. files are reinstalled
-7. texture reload is requested again if enabled
+Requests a new download pass for the current session.
 
 Use this when:
 
-- a paint changed on the server
-- you want to force another sync
-- you are debugging download behavior
+- you want to force another sync for the active field
+- you know liveries changed and want another pass
+- you want to validate a fix while testing
 
 ### Clear downloaded
 
-Requests immediate cleanup of the currently downloaded session files.
-
-What happens internally:
-
-- the current downloaded file list is cleared
-- if `Keep my livery locally` is enabled, your own files may be preserved
-- if `Auto refresh paints` is enabled, a new texture reload request is queued so iRacing updates what it is displaying
+Removes tracked downloaded files that belong to the app's managed session handling.
 
 Use this when:
 
-- you want to remove downloaded session paints without exiting the app
-- you are troubleshooting file installation behavior
+- you want to clear session-managed files immediately
+- you are debugging a livery issue
+- you want a clean state before testing again
 
 ### Paint folder
 
-Opens the local iRacing paint folder in the operating system file browser.
-
-On Windows this opens:
-
-```text
-Documents\iRacing\paint
-```
+Opens the local iRacing paint directory in Windows Explorer.
 
 Use this when:
 
 - you want to inspect installed files manually
-- you want to compare session output
-- you want to verify that a paint was downloaded correctly
-
-### Hide
-
-Sends the app window to tray if tray support is available.
-
-If tray support is not available, it falls back to a normal minimize operation.
-
-Use this when:
-
-- you want the app to keep running without occupying taskbar/window space
+- you want to verify file names
+- you want to compare what the app downloaded against what is already present
 
 ---
 
 ## Activity log and status messages
 
-The activity panel is one of the most important tools for understanding what the app is doing.
+The activity log shows what the background service is doing.
 
-### Common log patterns
+Typical examples include:
 
-#### Startup
+- waiting for iRacing or a valid session
+- processing a session
+- manifest lookup progress
+- download progress
+- save progress
+- cleanup actions
+- SDK reload events
+- watchdog recovery events
 
-```text
-iRacing SDK watcher started. Waiting for iRacing/session...
-```
+### Status text in the header
 
-The app is alive and waiting.
+The header status may show states such as:
 
-#### Session processing
+- `Starting`
+- `Watching`
+- `Processing`
+- `Background`
+- `Error`
 
-```text
-Processing session 304985042_84631336
-```
+Exact wording may vary slightly depending on the current build state.
 
-A valid session was found and work has started.
+### Progress-style logging
 
-#### Manifest progress
+Nishizumi Paints includes stage progress messages to make debugging easier later.
 
-```text
-Manifest progress 3/12 • user 697744: 3 matching files
-```
+Examples:
 
-This means:
+- `Manifest progress 3/12`
+- `Download progress 7/20`
+- `Save progress 7/20`
 
-- 3 manifest requests out of 12 users have completed
-- user `697744` produced 3 relevant files for the current session
+This helps identify:
 
-#### Download attempt lines
-
-```text
-[4/20] Downloading helmet for user 697744 (helmets) [attempt 1/3]
-```
-
-This means:
-
-- this item is #4 out of 20 total queued downloads
-- the file type is `helmet`
-- the owner user ID is `697744`
-- the manifest directory for the item is `helmets`
-- this is attempt 1 of up to 3
-
-#### Download progress lines
-
-```text
-Download progress 7/20 • completed user 697744 helmet
-```
-
-This means:
-
-- 7 finished download futures have completed so far
-- the downloaded item that just completed was that user's helmet file
-
-#### Save progress
-
-```text
-Save progress 7/20 • user 697744 helmet
-```
-
-This means the file has already been moved/extracted into the final iRacing paint location.
-
-#### Session completion
-
-```text
-Session 304985042_84631336 complete: 20 queued, 20 downloaded, 20 saved
-```
-
-This is the best high-level summary line.
-
-#### Texture reload
-
-```text
-Triggered iRacing texture reload via SDK
-```
-
-The app successfully asked iRacing to refresh textures.
-
-#### Waiting for reload permission
-
-```text
-Waiting for iRacing to allow texture reload before refreshing paints...
-```
-
-The app is being cautious and waiting until iRacing says it is safe to refresh.
+- where a run is currently spending time
+- whether problems happen before download, during download, or during file install
+- how far a session got before an interruption
 
 ### Verbose logs
 
-When `Verbose logs` is enabled, you may also see messages about:
+When `Verbose logs` is enabled, you may also see lower-level messages such as:
 
-- poll state changes
-- SDK startup edge cases
-- unchanged `SessionInfoUpdate`
+- SDK polling details
+- unchanged session checks
 - directory normalization matches
-- duplicate download removal
-- auto-tune decisions
-- retry delays
-- cleanup details
-- crash recovery
+- retry timing information
+- internal recovery notes
+
+Because verbose mode is intended for diagnostics, it is **disabled by default**.
 
 ---
 
 ## Advanced technical details
 
-This section is intentionally more detailed for advanced users, maintainers, and anyone who wants to understand the app deeply.
+This section is intentionally more detailed for advanced users and developers.
 
 ### Session fingerprinting
 
-The app does not just look at a session ID alone. It creates a **fingerprint** composed of:
+The app keeps an internal fingerprint made from:
 
-- `SessionId`
-- the sorted `(user_id, car_path)` pairs in the session
+- session identifiers
+- driver user IDs
+- driver car directories
 
-This helps prevent unnecessary reprocessing when nothing meaningful changed.
+If the fingerprint has not changed, the app skips reprocessing.
 
-### Download worker auto-tuning
+This prevents unnecessary repeat downloads and file writes.
 
-The configured `Parallel downloads` value is not always the exact number of active workers. It is a cap.
+### HTTP session reuse
 
-Actual download workers are selected like this:
+The downloader reuses thread-local HTTP sessions with connection pooling.
 
-- up to 10 items → 4 workers
-- up to 20 items → 8 workers
-- up to 40 items → 12 workers
-- up to 80 items → 16 workers
-- above 80 items → 20 workers
+This improves:
 
-Then the app takes the minimum of:
-
-- item count
-- auto-tuned value
-- user-configured cap
-
-### Manifest worker auto-tuning
-
-Manifest requests are tuned separately:
-
-- up to 10 users → 4 workers
-- up to 20 users → 6 workers
-- up to 40 users → 8 workers
-- above 40 users → 10 workers
-
-The manifest cap is automatically derived from the download cap when the service runs in the UI flow.
-
-Derived mapping:
-
-- download cap 1–4 → manifest cap 3
-- download cap 5–8 → manifest cap 5
-- download cap 9–12 → manifest cap 7
-- download cap 13–16 → manifest cap 8
-- above 16 → manifest cap 10
+- efficiency
+- connection reuse
+- overall responsiveness during large batches
 
 ### Retry behavior
 
-The app retries manifest and download requests.
+Manifest requests and downloads both use retry logic.
 
-Defaults:
+The retry strategy uses exponential backoff based on the configured base interval.
 
-- retries: `3`
-- retry backoff base: `1.0` second
+Typical pattern:
 
-Backoff pattern:
+- attempt 1
+- wait `1x`
+- attempt 2
+- wait `2x`
+- attempt 3
+- wait `4x`
 
-- attempt 1 retry wait → 1 second
-- attempt 2 retry wait → 2 seconds
-- attempt 3 retry wait → 4 seconds
+This helps with transient network failures without permanently stalling the app.
 
-The delay is capped so it does not grow forever.
+### Temp folder strategy
 
-### Thread-local HTTP sessions
+Downloads are placed into a temp directory first, under a session-specific folder.
 
-Each worker thread gets its own reusable `requests.Session` object.
+This gives the app:
 
-Benefits:
+- cleaner organization
+- easier cleanup
+- safer installs
+- less risk of mixing old partial data into the live paint folder
 
-- lower connection setup overhead
-- cleaner concurrency model
-- better reuse of HTTP connections
+### Atomic file writes
 
-### Atomic writes
+When possible, the app writes through a temporary destination and then replaces the final file atomically.
 
-Files are not written directly to the final destination name first.
+This reduces the chance of partially written visible files.
 
-Instead, the app:
+### Cleanup tracking
 
-1. writes or moves into a temp target file
-2. replaces the final target using `os.replace`
+The app tracks which files it saved for the current managed session.
 
-Benefits:
+This is important because cleanup should target only the files the app installed as part of its tracked session process, not arbitrary unrelated files in the paint folder.
 
-- reduced chance of partially written output files
-- safer updates if a crash happens mid-save
+### Notification-area behavior
 
-### Stale temp cleanup
+When the close behavior is enabled, the app hides to the Windows notification area instead of exiting.
 
-At startup, the app cleans old temp files in the app temp directory if they are older than the configured stale threshold used by the code.
+This is the area commonly reached through the `Show hidden icons` button on the taskbar.
 
-This helps keep abandoned temp folders from accumulating after interrupted runs.
+It is not meant as a desktop minimize action. The purpose is to keep the service alive without showing the full app window.
 
-### Watchdog and recovery
+### Single-instance signal path
 
-The worker loop is wrapped so that if it crashes unexpectedly, the service can:
+A small local inter-process signaling mechanism is used to bring the existing window back into focus if the EXE is launched again.
 
-- log the exception
-- log a traceback in verbose mode
-- mark status as recovering
-- wait briefly
-- attempt to restart the main loop
+This prevents the classic problem of users opening multiple background helper copies by accident.
 
-### Texture reload control
+### Watchdog recovery
 
-Auto-refresh is intentionally conservative.
+If the background loop stops unexpectedly, the watchdog:
 
-The app checks SDK readiness through `OkToReloadTextures`. If iRacing is not ready yet:
+- detects the stop
+- logs the event
+- attempts to restart the worker loop
 
-- it waits first
-- logs that it is waiting
-- optionally forces a refresh later if the ready flag stays unavailable too long
-
-This reduces the chance of firing reload requests too early.
-
-### Own-driver behavior
-
-The app tries to determine your own iRacing user ID by comparing:
-
-- the session's `DriverCarIdx`
-- each driver's `CarIdx`
-
-That allows it to:
-
-- skip syncing your own livery when desired
-- preserve your own files during cleanup when desired
+This improves long-running stability.
 
 ---
 
 ## Headless mode and command-line options
 
-The app includes a no-GUI mode.
+Nishizumi Paints can also run without the built-in UI.
 
-Run:
+Example:
 
 ```bash
-python nishizumi_paints_build_ready.py --nogui
+python nishizumi_paints_single_instance_v5.py --nogui
 ```
 
-This starts the background service without the desktop UI.
-
-### Available command-line options
+### Common options
 
 #### `--nogui`
-Runs the service without the built-in UI.
 
-#### `--session-yaml <path>`
-Reads session data from a YAML file instead of the iRacing SDK.
+Runs the app without the desktop UI.
 
-Useful for testing or offline development.
+#### `--autostart-launched`
 
-#### `--iracing-sdk`
-Forces SDK mode explicitly. If no session YAML file is given, SDK mode is already the default.
-
-#### `--watch`
-Keep running and watch for changes when using session YAML input.
-
-#### `--poll-seconds <float>`
-Polling interval between checks.
-
-UI default behavior uses the saved config, which defaults to `0.8` seconds.
-
-#### `--paints-dir <path>`
-Override the default local paint folder.
-
-#### `--temp-dir <path>`
-Override the temp working folder.
-
-#### `--keep-session-paints`
-In headless mode, keeps downloaded session paints instead of deleting them on session change/exit.
-
-#### `--max-concurrent-manifests <int>`
-Sets a cap for manifest lookups in command-line mode.
-
-#### `--max-concurrent-downloads <int>`
-Sets a cap for downloads in command-line mode.
-
-#### `--retries <int>`
-Number of retries for network operations.
-
-#### `--retry-backoff-seconds <float>`
-Base retry delay.
+Internal flag used for Windows auto-start behavior. Normal users usually do not need to pass this manually.
 
 #### `-v` / `--verbose`
-Enable debug-level logging.
+
+Enables verbose logging.
+
+#### `--poll-seconds`
+
+Adjusts the SDK polling interval.
+
+#### `--retries`
+
+Sets how many retry attempts are allowed for manifest/download requests.
+
+#### `--retry-backoff-seconds`
+
+Sets the base retry backoff interval.
+
+#### `--max-concurrent-downloads`
+
+Defines the auto-mode upper cap for download workers.
+
+#### `--max-concurrent-manifests`
+
+Defines the upper cap for manifest lookup workers.
 
 ---
 
 ## Build the EXE
 
-The repository includes a Windows batch file that automates the PyInstaller build.
+A Windows batch file is included for PyInstaller builds.
 
-### Files needed in the same folder
+Typical build flow:
 
-- `nishizumi_paints_build_ready.py`
-- `nishizumi_paints_icon.ico`
-- `nishizumi_paints_icon.png`
-- `build_nishizumi_paints_exe.bat`
+1. place the script, icon, and build batch file together
+2. run the build batch file
+3. wait for PyInstaller to finish
+4. run the generated EXE from the `dist` folder
 
-### Build steps
+If you are using the latest single-instance version, use the corresponding build batch file shipped with that version.
 
-1. Open the folder on Windows
-2. Double-click `build_nishizumi_paints_exe.bat`
-3. The batch file installs or updates `pyinstaller`
-4. PyInstaller builds a one-file, windowed EXE
-5. The final executable appears in the `dist` folder
-
-### What the batch file does
-
-It runs a PyInstaller command equivalent to:
+### Typical build requirements
 
 ```bash
-py -m PyInstaller --noconfirm --clean --onefile --windowed --name "Nishizumi Paints" --icon "nishizumi_paints_icon.ico" --add-data "nishizumi_paints_icon.ico;." --add-data "nishizumi_paints_icon.png;." "nishizumi_paints_build_ready.py"
+pip install -r requirements.txt
+pip install pyinstaller
 ```
 
-This ensures the icon files are bundled into the executable so the app can use them at runtime.
+If your build script handles SDK packaging explicitly, it may also install or verify:
+
+- `pyirsdk`
+- `irsdk` hidden import collection
+- package metadata collection for the frozen app
 
 ---
 
 ## Files and folders used by the app
 
-### Local iRacing paint folder
+### Local paint folder
 
 Default:
 
 ```text
-%USERPROFILE%\Documents\iRacing\paint
+Documents\iRacing\paint
 ```
 
-Examples of generated files:
+This is where the final livery files are installed.
 
-- `car_<userid>.tga`
-- `decal_<userid>.tga`
-- `car_num_<userid>.tga`
-- `car_spec_<userid>.mip`
-- `helmet_<userid>.tga`
-- `suit_<userid>.tga`
+### Temp folder
 
-### Temp working folder
-
-Default:
-
-```text
-%TEMP%\NishizumiPaints
-```
-
-Used for:
-
-- per-session temp downloads
-- decompression staging
-- crash-safe intermediate work
+A temporary working folder is used for staged downloads before final installation.
 
 ### Settings file
 
-Default on Windows:
+Typical path on Windows:
 
 ```text
 %APPDATA%\NishizumiPaints\settings.json
 ```
 
-Stores persistent UI settings such as:
+This stores UI preferences and operational settings.
 
-- autostart
-- tray behavior
-- log visibility
-- download cap
-- retries
-- poll interval
+### Windows auto-start entry
 
-### Windows autostart registry key
-
-Stored under:
-
-```text
-HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run
-```
-
-Value name:
-
-```text
-NishizumiPaints
-```
+When **Auto start** is enabled, the app writes the necessary startup entry for Windows sign-in launch behavior.
 
 ---
 
 ## Performance notes
 
-### Recommended download cap
+Nishizumi Paints is intended to stay light while still scaling well.
+
+### Good default approach
 
 For most users:
 
-- **8** is a very good default
+- keep the app open
+- keep **Auto refresh paints** enabled
+- keep **Download workers mode** on **Auto**
+- only use **Manual** mode if you truly want a fixed worker count
+- only enable **Verbose logs** when actively debugging
 
-This keeps the app responsive and efficient without being too aggressive.
+### Why Auto mode is recommended
 
-### When to increase it
+Most users do not benefit from micro-managing worker counts.
 
-You might increase the cap if:
+Auto mode adapts to small sessions and large sessions without requiring the user to constantly change settings.
 
-- your internet connection is strong
-- you frequently join large official sessions
-- you want slightly faster total sync time
+### Manual mode considerations
 
-### When not to increase it
+Manual mode is best for advanced users who want repeatable behavior.
 
-Leave it at 8 or lower if:
+Higher values may:
 
-- your connection is unstable
-- you use mobile hotspot or limited bandwidth
-- you see more transient failures at higher concurrency
-- you do not need every last bit of speed
+- use more bandwidth
+- create more simultaneous network pressure
+- provide less benefit on slower or unstable connections
 
-### Why higher values can be worse
+### Manifest and download balance
 
-More parallel workers do not always mean better real-world results. Higher values can cause:
-
-- more simultaneous bandwidth use
-- burstier request patterns
-- more retry events on unstable networks
-- more difficult debugging when problems happen
+The app does not only download files. It also performs manifest lookups first. Those phases are balanced so one stage does not become wildly more aggressive than the other.
 
 ---
 
 ## Troubleshooting
 
-### The app says it is watching, but nothing downloads
+### The app says the iRacing SDK is not installed
+
+Install the SDK package:
+
+```bash
+pip install pyirsdk
+```
+
+If you are using a frozen EXE build, make sure the build script correctly bundles:
+
+- `irsdk`
+- its package data
+- any required metadata
+
+### The app is open but no session is being processed
 
 Check:
 
 - iRacing is running
-- you are actually inside a valid session
-- the SDK is available to Python
-- verbose logs for SDK poll state messages
+- you are actually in a valid session
+- the SDK is accessible
+- the activity log is visible
+- verbose logs if you need deeper diagnosis
 
-### Paints downloaded, but they appeared a few seconds later
+### Liveries downloaded but appeared a few seconds later
 
-That delay is usually the iRacing texture pipeline catching up after the reload request. The app can save the files quickly, but visible appearance in the sim still depends on the game side finishing the refresh.
+A small delay between file save and visible car update can happen because iRacing still needs time to apply the refreshed textures.
 
-### My own paint keeps disappearing
+### Closing the window did not exit the app
 
-Check:
+This is expected when **Keep running in background on close** is enabled.
 
-- `Keep my livery locally`
-- `Delete downloaded livery`
-- `Update my own paints`
-
-If you want cleanup for everyone else but not for your current car, keep `Keep my livery locally` enabled.
-
-### I closed the window and thought the app exited
-
-If `Minimize to tray on close` is enabled, closing the window hides it instead of exiting it. This is intentional.
+The app hides to the Windows notification area and keeps running.
 
 ### Verbose logs are not visible
 
-Enable:
+Check that:
 
-- `Verbose logs`
-- `Show activity`
+- `Show activity` is enabled
+- `Verbose logs` is enabled
 
-The UI also forces activity visibility when verbose logging is enabled.
+Verbose mode is off by default.
 
-### The app does not start with Windows
+### I launched the EXE again and no new window appeared
 
-Check:
+That is usually expected.
 
-- `Auto start` is enabled
-- Windows did not block the startup entry
-- the EXE or Python path still exists where the registry entry points
+The app is single-instance. Launching it again should bring the existing instance into focus instead of creating another copy.
 
-### Refresh paints did not instantly change what I see
+### My manual workers value is not changing per session
 
-The button triggers a re-download workflow. Actual visible change still depends on:
+That is expected when `Download workers mode` is set to **Manual**.
 
-- the new file really being different
-- iRacing accepting the texture reload request
-- the game finishing its own refresh pipeline
-
-### The service stopped unexpectedly
-
-The UI includes a watchdog. In many cases the app will log that the service stopped and automatically restart it. Check the activity log for the lines immediately before the recovery.
+Manual mode is intentionally fixed and honored across all sessions until changed.
 
 ---
 
 ## Known limitations
 
-- The app depends on the iRacing SDK being available and usable from Python
-- The app is built around the current Trading Paints fetch workflow and expected manifest behavior
-- Texture reload timing ultimately depends on what iRacing allows and when it applies the visual update
-- Windows tray and autostart behavior are Windows-specific features
-- The app cannot guarantee that every driver has a matching server-side paint for every session
-- Very aggressive concurrency settings can increase the chance of transient failures
+- The app depends on iRacing SDK availability
+- Texture appearance timing is still partly controlled by iRacing's own reload and rendering behavior
+- Auto-start and notification-area behavior are Windows-oriented features
+- Trading Paints-side availability depends on the user actually having files available for the requested content
+- Manual refresh is still sometimes useful in edge cases even when auto refresh is enabled
 
 ---
 
 ## Privacy and network behavior
 
-Nishizumi Paints is very focused in what it does.
+Nishizumi Paints does not attempt to be a general cloud sync platform.
 
-It interacts with:
+Its network behavior is focused on the specific job of downloading relevant livery assets for the current session.
 
-- the local iRacing SDK
-- the local iRacing paint folder
-- the Trading Paints fetch endpoint for user paint manifests and files
+In practical terms, it:
 
-It does **not** need a full browser workflow to operate in the normal session-sync path shown here.
+- talks to the iRacing SDK locally
+- requests Trading Paints file manifests for relevant users
+- downloads only the files that match the current session need
+- writes files into the local iRacing paint folder
 
-It stores local settings in a JSON file so your preferences persist between runs.
+It is not intended to browse unrelated personal data or act outside the livery workflow.
 
 ---
 
 ## FAQ
 
-### Is the app always active?
+### Does the app need to stay open?
 
-Yes. If the app is open, it is considered active. The design intentionally avoids Start/Stop buttons.
+Yes. If the app is open, it is considered active and watching.
 
-### Can I leave it open all the time?
+### Do I need to press Start?
 
-Yes. That is one of the intended usage styles.
+No. There are no Start/Stop buttons in the main workflow. The app starts watching automatically.
 
-### Can I hide it without stopping it?
+### Can I close the window and keep it running?
 
-Yes. Use the `Hide` button or close the window if `Minimize to tray on close` is enabled.
+Yes. If **Keep running in background on close** is enabled, clicking `X` hides the app to the Windows notification area instead of exiting.
 
-### Does it work if iRacing is not open yet?
+### Can I open the app more than once?
 
-Yes. It can start first and wait.
+No. The app is designed to allow only one instance. Opening it again should focus the existing instance.
 
-### What is the safest download setting?
+### Should I use Auto or Manual download workers?
 
-For most users: **8**.
+Use **Auto** unless you specifically want a fixed worker count.
 
-### What is the fastest setting?
+### If I set Manual to 20, will it really use 20 every session?
 
-There is no single best number for everyone. Higher caps can be faster on strong internet, but they are more aggressive and not always better. Values above **20** should be treated as experimental.
+Yes. Manual mode is fixed. If you set it to 20, the app honors 20 across sessions until you change it.
 
-### What happens if I switch sessions?
+### Why are verbose logs off by default?
 
-The app detects the session change, optionally clears old downloaded files, and starts processing the new session.
+Because most users do not need extra diagnostic noise all the time. They are mainly for debugging and support cases.
 
-### What happens if I leave the session and go back to the menu?
+### Why does the app sometimes take a few seconds after refresh to show the paint?
 
-If `Delete downloaded livery` is enabled, the app clears the downloaded session files when no active valid session is detected.
+Because file installation and texture application are not exactly the same moment. iRacing still needs time to apply the refreshed textures.
 
-### Can I use it without the UI?
+### Can I leave the app running all the time?
 
-Yes. Use `--nogui`.
+Yes. That is one of the intended usage patterns.
 
 ---
 
 ## Final notes
 
-Nishizumi Paints is meant to feel invisible when everything is working correctly:
+Nishizumi Paints is built around a simple idea: **open it, leave it running, join sessions, and let it handle the rest**.
 
-- open it once
-- leave it running
-- join sessions
-- let it do the work
+The UI is intentionally minimal, but the behavior underneath is meant to be robust enough for real daily use:
 
-The app is intentionally small on the surface, but there is a lot happening underneath to make it fast, stable, and practical for real iRacing use.
+- automatic watching
+- safe background operation
+- single-instance behavior
+- adaptive downloads
+- optional fixed manual worker control
+- session cleanup
+- texture refresh support
+- detailed logging when needed
+
+If you want the easiest experience, leave the defaults enabled and keep the worker mode on **Auto**.
