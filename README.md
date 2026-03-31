@@ -2,6 +2,8 @@
 
 <img width="512" height="512" alt="nishizumi_paints_icon" src="https://github.com/user-attachments/assets/7ba4ccbc-7dfe-4b8c-abe2-182e3fd0254a" />
 
+Download new releases here: https://github.com/nishizumi-maho/Nishizumi-Paints/releases
+
 **Nishizumi Paints** is a lightweight Windows desktop app for **iRacing** that watches your current session through the **iRacing SDK**, downloads the correct **Trading Paints** files for the drivers in that session, installs them into your local iRacing paint folder, and optionally tells iRacing to refresh textures so the liveries appear in-game with as little manual work as possible.
 
 The app is designed to be:
