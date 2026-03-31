@@ -28,6 +28,7 @@ Nishizumi Paints includes a compact built-in UI, persistent settings, Windows au
 - [User interface overview](#user-interface-overview)
 - [Detailed explanation of every option](#detailed-explanation-of-every-option)
 - [Download workers](#download-workers)
+- [TP worker monitor](#tp-worker-monitor)
 - [Buttons and manual actions](#buttons-and-manual-actions)
 - [Activity log and status messages](#activity-log-and-status-messages)
 - [Advanced technical details](#advanced-technical-details)
@@ -110,6 +111,7 @@ The app is meant to reduce the usual manual workflow of:
 - The app is considered active as long as it is open
 - Optional activity log panel
 - Optional verbose logging
+- Optional TP worker monitor panel for throughput testing
 - Windows auto-start support
 - Start minimized when launched automatically by Windows
 - Keep running in the Windows background area on close
@@ -393,6 +395,7 @@ The lower portion contains:
 
 - the **Clear downloaded** button
 - the **Paint folder** button
+- the optional **TP worker monitor** panel
 - the **Activity** log panel
 
 ---
@@ -474,6 +477,22 @@ This is useful for:
 
 Default: **On**
 
+### Show TP monitor
+
+Shows the **TP worker monitor** panel.
+
+This panel is meant for advanced testing. It helps estimate the effective parallelism Trading Paints is actually allowing in real sessions by comparing requested workers against observed throughput.
+
+Use this when:
+
+- you want to discover your practical worker ceiling
+- you are tuning manual manifest, download, or save workers
+- you want to compare Auto mode against Manual mode with real measurements
+
+Because most users do not need it on every run, it is hidden by default.
+
+Default: **Off**
+
 ### Verbose logs
 
 Enables more detailed logging.
@@ -490,39 +509,56 @@ This controls how many concurrent download workers Nishizumi Paints uses.
 
 Default: **Auto**
 
-### Manual workers
+### Manual manifests, downloads, and saves
 
-Only used when **Download workers mode** is set to **Manual**.
+These controls are only used when **Download workers mode** is set to **Manual**.
 
-Allowed range:
+In Manual mode, Nishizumi Paints lets you set three separate fixed worker counts:
+
+- **Manual manifests**
+- **Manual downloads**
+- **Manual saves**
+
+Allowed range for each:
 
 - minimum: **1**
-- maximum: **20**
+- maximum: **100**
 
-If you set the value to **20**, the app will honor that exact value in every session until you change it again.
+If you set the values manually, the app will honor those exact numbers in every session until you change them again.
 
-Default value: **8**
+Example:
+
+- manifests = **16**
+- downloads = **20**
+- saves = **16**
+
+In that case, every session will use exactly those three values instead of auto-tuning.
+
+Default values: **8 / 8 / 8**
 
 ---
 
 ## Download workers
 
-Nishizumi Paints supports two download worker modes.
+Nishizumi Paints supports two worker modes.
 
 ### Auto mode
 
 **Auto** is the default mode and the recommended option for most users.
 
-In Auto mode, the app dynamically adjusts the number of parallel download workers based on the current session size and workload. This keeps the downloader light on smaller sessions while still scaling up when there are more liveries to process.
+In Auto mode, the app dynamically adjusts worker counts based on the current session size and workload. It does not only tune downloads. It also keeps the surrounding stages balanced so the pipeline stays efficient overall:
 
-The goal is to balance:
+- manifest lookups are auto-sized
+- downloads are auto-sized
+- saves are auto-sized
+
+The goal is to keep the downloader light on smaller sessions while still scaling up when there are more liveries to process. Auto mode is designed to balance:
 
 - speed
 - stability
-- network usage
+- bandwidth usage
 - responsiveness
-
-without requiring manual tuning.
+- reduced manual micromanagement
 
 Use Auto if you want the app to make the decision for you.
 
@@ -530,30 +566,119 @@ Use Auto if you want the app to make the decision for you.
 
 If preferred, the downloader can be switched to **Manual** mode.
 
-In Manual mode, the user selects a fixed number of parallel download workers from **1 to 20**.
+In Manual mode, you set three separate fixed values:
 
-Once set, Nishizumi Paints will honor that exact value in every session instead of using adaptive behavior.
+- **Manual manifests**
+- **Manual downloads**
+- **Manual saves**
+
+Each can be set from **1 to 100**.
+
+Once set, Nishizumi Paints will honor those exact values in every session instead of using adaptive behavior.
 
 Examples:
 
-- If Manual is set to **6**, the app uses **6** download workers in every session.
-- If Manual is set to **20**, the app uses **20** download workers in every session.
+- manifests = **12**, downloads = **16**, saves = **16**
+- manifests = **16**, downloads = **20**, saves = **16**
+- manifests = **25**, downloads = **25**, saves = **25**
 
-This is useful for advanced users who want predictable, fixed behavior regardless of session size.
+If you set downloads to **20**, the app will keep using **20 download workers in every session** until you change it. The same applies to manifests and saves.
 
-### Which mode should I use?
+### Why manual mode exists
 
-- Use **Auto** for the best plug-and-play behavior.
-- Use **Manual** only if you want a fixed worker count.
+Manual mode is meant for advanced users who want repeatable, fixed behavior.
+
+It is especially useful when you want to:
+
+- benchmark different worker values on your own connection
+- compare the real throughput of several presets
+- cap the app to a conservative value for a slower connection
+- force a specific worker level that you already know performs best on your setup
+- tune manifest, download, and save stages separately instead of treating them as one number
+
+### Why manifests and saves matter too
+
+The pipeline is not just a download stage. It has three main worker-driven parts:
+
+1. **Manifest lookups**: asks Trading Paints which files exist for each driver
+2. **Downloads**: fetches the actual files
+3. **Saves**: extracts and installs files into the iRacing paint folder
+
+If only downloads are tuned while manifests or saves are too low, one of those stages can become the new bottleneck. Manual mode exists so advanced users can tune the full pipeline when needed.
+
+### Which mode should I use
+
+- Use **Auto** for the best plug-and-play behavior
+- Use **Manual** if you specifically want fixed, repeatable values
+- Use **Manual + TP worker monitor** if you want to discover your practical ceiling and find the best preset for your setup
 
 ### Notes
 
-- Auto mode remains the safest general-purpose choice.
-- Manual mode does not auto-scale.
-- Higher manual values can increase bandwidth usage and put more pressure on slower or less stable connections.
-- Manifest worker count is still derived intelligently from the chosen download mode so the app stays balanced.
+- Auto mode remains the safest general-purpose choice
+- Manual mode does not auto-scale
+- Higher manual values can increase bandwidth usage and network pressure
+- Very high requested values do not always mean more real throughput
+- The TP worker monitor exists to help you measure the effective parallelism you are actually getting
 
----
+## TP worker monitor
+
+The **TP worker monitor** is an advanced diagnostics panel that estimates how much real parallelism Trading Paints is effectively allowing in practice.
+
+It is **hidden by default**. To show it, enable **Show TP monitor** in the UI.
+
+### What it shows
+
+After a completed session, the monitor summarizes:
+
+- the last processed session ID
+- whether you were using **Auto** or **Manual** mode
+- the requested worker values for manifests, downloads, and saves
+- total file count for that session
+- download stage time
+- save stage time
+- files per second
+- average time per file
+- average download Mbps
+- effective observed parallelism
+- an approximate observed ceiling hint
+
+### What the numbers mean
+
+The key value is usually **effective parallelism**.
+
+That number is an estimate of how many downloads were truly progressing in parallel based on observed stage timings. It is often much lower than the number you requested, especially when you ask for very high manual worker counts.
+
+Example:
+
+- requested downloads = **100**
+- effective parallelism = **25.5**
+
+That means the app asked for 100 workers, but the real observed behavior looked more like about 25 active parallel downloads.
+
+### Why this is useful
+
+The monitor helps you discover your **practical ceiling**. That ceiling might come from Trading Paints, your network, connection reuse, file sizes, or the full end-to-end path.
+
+From a tuning perspective, that difference does not matter much. What matters is the real throughput you actually get.
+
+### When to use it
+
+Use the TP worker monitor when you want to:
+
+- compare Auto mode against Manual mode
+- find the best fixed manual worker preset
+- understand whether downloads or saves are the current bottleneck
+- verify whether very high worker counts are helping or just creating overhead
+
+### When to leave it hidden
+
+For normal daily usage, you can leave it hidden. The panel is mainly intended for advanced tuning and debugging.
+
+### Reset TP monitor
+
+The **Reset TP monitor** button clears the accumulated monitor snapshot so you can start a fresh comparison run.
+
+This is useful when testing several presets back to back and you want the monitor to reflect only the newest data.
 
 ## Buttons and manual actions
 
@@ -933,11 +1058,11 @@ That is usually expected.
 
 The app is single-instance. Launching it again should bring the existing instance into focus instead of creating another copy.
 
-### My manual workers value is not changing per session
+### My manual workers values are not changing per session
 
 That is expected when `Download workers mode` is set to **Manual**.
 
-Manual mode is intentionally fixed and honored across all sessions until changed.
+Manual mode is intentionally fixed and honored across all sessions until changed. That applies separately to manifests, downloads, and saves.
 
 ---
 
@@ -986,13 +1111,13 @@ Yes. If **Keep running in background on close** is enabled, clicking `X` hides t
 
 No. The app is designed to allow only one instance. Opening it again should focus the existing instance.
 
-### Should I use Auto or Manual download workers?
+### Should I use Auto or Manual worker mode?
 
-Use **Auto** unless you specifically want a fixed worker count.
+Use **Auto** unless you specifically want fixed manifest, download, and save worker counts.
 
-### If I set Manual to 20, will it really use 20 every session?
+### If I set Manual values, will the app really use them every session?
 
-Yes. Manual mode is fixed. If you set it to 20, the app honors 20 across sessions until you change it.
+Yes. Manual mode is fixed. If you set manifests, downloads, and saves manually, the app honors those exact values across sessions until you change them.
 
 ### Why are verbose logs off by default?
 
