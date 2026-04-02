@@ -6,22 +6,34 @@ Download releases here: https://github.com/nishizumi-maho/Nishizumi-Paints/relea
 
 **Nishizumi Paints** is a lightweight Windows desktop app for **iRacing** that watches the current session, downloads the correct **Trading Paints** files for the drivers in that session, installs them into your local iRacing paint folders, and optionally refreshes textures so liveries appear in game with as little manual work as possible.
 
+The app can be used in two ways:
+
+- **GUI mode** for setup, live status, and manual tools
+- **Headless mode** for lower daily resource usage while still keeping the downloader active in a console window
+
 The current application is built around a simple idea:
 
 - open it
+- choose **GUI** or **Headless** at startup if needed
 - leave it running
 - join sessions
 - let it handle the paint workflow automatically
 
-At the same time, the current build is much more advanced than the older README versions. It now includes:
+At the same time, the current build is much more advanced than older README versions. It now includes:
 
 - **single-instance protection**
+- **GUI / headless startup mode selection**
+- **shared settings between GUI and headless**
+- **manual launch overrides with `--gui` and `--nogui`**
+- **Shift-at-startup override** to show the mode selector again
 - **automatic and manual GitHub update checks**
-- **three UI tabs** instead of the older single-page description
+- **four UI tabs** instead of the older single-page description
+- **a live Session tab with per-driver status**
 - **AI roster tools**
 - **a local random fallback system**
 - **Trading Paints contextual fetch support** for team / series / league / night / numbers cases
 - **superspeedway `_ss` support** when relevant
+- **replay-pack capture and restore**
 - **log export**
 - **a TP worker monitor**
 - **manual or adaptive worker control**
@@ -37,7 +49,9 @@ At the same time, the current build is much more advanced than the older README 
 - [Requirements](#requirements)
 - [Installation](#installation)
 - [Quick start](#quick-start)
+- [Startup mode selector and headless mode](#startup-mode-selector-and-headless-mode)
 - [User interface overview](#user-interface-overview)
+- [Session tab](#session-tab)
 - [General tab](#general-tab)
 - [AI & Random tab](#ai--random-tab)
 - [Logs tab](#logs-tab)
@@ -45,6 +59,7 @@ At the same time, the current build is much more advanced than the older README 
 - [TP worker monitor](#tp-worker-monitor)
 - [Random pool](#random-pool)
 - [AI support](#ai-support)
+- [Replay packs](#replay-packs)
 - [GitHub update checks](#github-update-checks)
 - [Buttons and manual actions](#buttons-and-manual-actions)
 - [Activity log and status information](#activity-log-and-status-information)
@@ -75,6 +90,7 @@ When you join a session, the app can:
 9. keep watching for session changes
 10. clear tracked live session paints when they are no longer needed
 11. optionally recycle downloaded TP car sets into a **local random pool** for later fallback use
+12. optionally capture and restore **replay packs** based on saved session paints
 
 For normal users, the value is convenience.
 For advanced users, the value is that the app is now much closer to a full paint workflow manager rather than just a simple downloader.
@@ -102,6 +118,17 @@ For advanced users, the value is that the app is now much closer to a full paint
 - Can clear old live session paints when needed
 - Can preserve your own livery targets when cleanup runs
 
+### Startup mode and daily-use flow
+
+- Built-in startup mode selector
+- Choice between **GUI mode** and **Headless mode**
+- Optional **Remember this choice** setting
+- GUI and headless automatically share the same `settings.json`
+- `--gui` and `--nogui` can override the saved preference at any time
+- Holding **Shift** while opening the app shows the startup mode selector again
+- If a launch preference is saved, Windows auto-start follows that preference
+- If no launch preference is saved, Windows auto-start falls back to the GUI path
+
 ### Trading Paints context support
 
 This build does not rely only on simple per-user lookups.
@@ -120,6 +147,17 @@ That matters because some Trading Paints behavior depends on more than only the 
 
 The script contains superspeedway-specific handling for car-related paints.
 When the session is treated as a superspeedway session, compatible car files can be saved in both normal and `_ss` forms when appropriate.
+
+### Session visibility
+
+The current build includes a **Session** tab that shows:
+
+- the current detected session
+- the current driver list
+- per-driver download state
+- whether an entry was downloaded, skipped, missing, fallback-based, or replay-pack based
+
+This makes it much easier to understand what the app actually did during a session.
 
 ### AI tools
 
@@ -150,6 +188,19 @@ It can be used for:
 - randomized local AI roster creation
 - reusing cached material instead of losing it after normal live-session cleanup
 
+### Replay-pack handling
+
+The app can also manage **replay packs** in the background.
+
+In practical terms, that means it can:
+
+- detect replay files in your iRacing replay folder
+- archive the current session paint set into a replay-pack folder when a replay is created
+- restore a matching replay paint set later when the same session fingerprint is detected again
+- remove replay-pack entries when the related replay file no longer exists
+
+This helps keep paint sets usable beyond the immediate live session.
+
 ### Reliability and daily-use features
 
 - retry logic for manifest requests and downloads
@@ -170,6 +221,8 @@ It can be used for:
 - background-on-close support
 - Windows auto-start support
 - start-minimized behavior for auto-start launches
+- startup mode chooser
+- headless console mode for lower overhead
 - manual refresh
 - manual cleanup
 - update check button
@@ -183,9 +236,16 @@ It can be used for:
 
 ### 1. Startup
 
-When the app starts, it loads saved settings, initializes logging, creates the UI, starts the background service, enables single-instance handling, schedules update checks, and refreshes the random-pool summary.
+When the app starts, it loads saved settings, resolves the launch mode, initializes logging, then starts either the full GUI path or the headless path.
 
-If it was launched by Windows auto-start and **Start minimized** is enabled, it starts minimized or hidden to the background area depending on the close/background setting.
+The launch decision follows this practical order:
+
+1. `--gui` or `--nogui` if you passed one manually
+2. saved launch preference if one exists
+3. startup mode selector if no saved choice exists, or if you hold **Shift** while opening the app
+4. GUI fallback for some auto-start cases when no saved mode exists yet
+
+If it was launched by Windows auto-start and **Start minimized** is enabled, the GUI path starts minimized or hidden to the background area depending on the close/background setting.
 
 ### 2. Single-instance handling
 
@@ -194,9 +254,11 @@ If you launch the EXE again while the app is already running:
 
 - a second full copy is not supposed to stay active
 - the existing instance is notified
-- the existing window is brought to the front
+- the existing window or headless console is brought to the front
 
 This prevents duplicate watchers and duplicate downloads.
+
+GUI and headless are not meant to run as separate independent copies at the same time.
 
 ### 3. Session polling
 
@@ -238,11 +300,15 @@ The app can run those stages in **Auto** or **Manual** worker mode.
 If **Recycle downloaded TP paints into the local random pool** is enabled, reusable TP car sets are archived before live session copies disappear.
 Then the app can optionally apply local random fallback logic for real drivers and AI targets that still need a usable paint.
 
-### 8. Texture refresh
+### 8. Replay-pack archival
+
+If replay-pack management is active, the app can capture a replay paint snapshot when a replay file appears and later restore a matching saved set for replay use.
+
+### 9. Texture refresh
 
 If **Auto refresh paints** is enabled, the app waits until iRacing is in a usable state and then requests a texture reload.
 
-### 9. Cleanup and preservation
+### 10. Cleanup and preservation
 
 When the app refreshes a session or moves to another session, tracked live session paints can be removed.
 If **Keep my livery locally** is enabled, the local user / team targets are preserved above normal cleanup.
@@ -255,7 +321,7 @@ If **Keep my livery locally** is enabled, the local user / team targets are pres
 
 - **Windows**
 
-The UI, tray/background behavior, auto-start behavior, and EXE flow are Windows-oriented.
+The UI, console/headless behavior, auto-start behavior, and EXE flow are Windows-oriented.
 
 ### Python
 
@@ -292,7 +358,7 @@ pip install -r requirements.txt
 4. Run the current script:
 
 ```bash
-python nishizumi_paints_single_instance_v5_team_sessions_updates_v21.py
+python nishizumi_paints_v2-2-1_mode_selector.py
 ```
 
 ### Option 2: build a Windows EXE
@@ -313,11 +379,12 @@ pip install pyinstaller
 ## Quick start
 
 1. Launch **Nishizumi Paints**
-2. Leave the default settings enabled unless you have a specific reason to change them
-3. Start iRacing
-4. Join a session
-5. Let the app detect the session, fetch paints, install them, and refresh textures
-6. Leave the app open in the background if you want it always ready
+2. Choose **GUI** or **Headless** if the startup selector appears
+3. Leave the default settings enabled unless you have a specific reason to change them
+4. Start iRacing
+5. Join a session
+6. Let the app detect the session, fetch paints, install them, and refresh textures
+7. Leave the app open in the background if you want it always ready
 
 Recommended default usage for most people:
 
@@ -329,6 +396,51 @@ Recommended default usage for most people:
 - leave **Sync TP AI rosters** enabled if you use AI content
 - leave **Recycle downloaded TP paints into the local random pool** enabled if you want useful fallback reuse later
 - leave **Download workers mode** on **Auto** unless you specifically want fixed worker counts
+
+---
+
+## Startup mode selector and headless mode
+
+When the app starts normally with no forced launch flag, it can show a small startup window where you choose:
+
+- **GUI mode**
+- **Headless mode**
+
+The startup window also includes:
+
+- **Remember this choice**
+- a note showing the currently saved startup choice, if one exists
+- a reminder that holding **Shift** while opening the app will show the chooser again
+
+### GUI mode
+
+Use GUI mode when you want:
+
+- the full window
+- the Session tab
+- access to all settings and buttons
+- logs and worker monitor in the UI
+
+### Headless mode
+
+Use Headless mode when you want:
+
+- lower CPU/RAM usage in normal daily use
+- the downloader engine without the live Tk redraws
+- a visible terminal / console window where you can still watch what the app is doing
+
+### Shared settings
+
+GUI mode and headless mode both use the same saved configuration file.
+That means you can configure everything in the GUI, then later run in headless mode and keep the same settings.
+
+### Getting back to the selector
+
+If you saved a choice and want to change it later, you can:
+
+- hold **Shift** while opening the app
+- run with `--gui`
+- run with `--nogui`
 
 ---
 
@@ -347,8 +459,9 @@ The header shows:
 
 ### Tabs
 
-The notebook contains **three tabs**:
+The notebook contains **four tabs**:
 
+- **Session**
 - **General**
 - **AI & Random**
 - **Logs**
@@ -365,6 +478,43 @@ The random-pool summary is **not** in the footer. It is shown inside the **AI & 
 
 ---
 
+## Session tab
+
+The **Session** tab is meant to show the live session state more clearly.
+
+### Current session box
+
+This area shows:
+
+- the current session summary
+- whether the app is waiting for iRacing or already processing
+- short status text about the current session context
+
+### Drivers in session
+
+The driver list shows per-driver information such as:
+
+- state
+- car number
+- iRating
+- license
+- safety rating
+- display name
+
+Current state labels can include:
+
+- **Queued**
+- **Downloading**
+- **Downloaded**
+- **Replay pack**
+- **Fallback**
+- **Missing**
+- **Skipped**
+
+This makes it easier to understand why a paint did or did not end up installed.
+
+---
+
 ## General tab
 
 The **General** tab contains the core daily-use settings and actions.
@@ -377,9 +527,12 @@ Registers the app in Windows auto-start.
 
 Default: **On**
 
+Important behavior:
+the auto-start command follows your saved launch-mode preference when one exists, so it can start in GUI or headless mode depending on what you saved.
+
 #### Start minimized
 
-Only affects launches that come from Windows auto-start.
+Only affects launches that come from Windows auto-start on the GUI path.
 If the app is launched manually, it stays visible.
 
 Default: **On**
@@ -736,6 +889,33 @@ You can also copy your current saved car or the current session cars into the lo
 
 ---
 
+## Replay packs
+
+Replay packs are background archives of paint files tied to replay files.
+
+### What they do
+
+When the app notices a new replay file, it can try to copy the current saved paint set into a replay-pack folder.
+Later, if a matching replay/session fingerprint is detected again, the app can restore those paint files back into the paint folder.
+
+### Why this matters
+
+This helps in cases where the live session is already gone, but you still want the matching liveries available for replay viewing.
+
+### Replay-pack cleanup
+
+If the original `.rpy` replay file is deleted, the related replay-pack entry can be removed too.
+
+### Replay-pack location
+
+Default on Windows:
+
+```text
+%APPDATA%\Nishizumi-Paints\ReplayPacks
+```
+
+---
+
 ## GitHub update checks
 
 The current build includes both automatic and manual update checking.
@@ -813,6 +993,7 @@ The activity log can contain messages such as:
 - AI roster sync events
 - random-pool archival and trimming
 - random fallback results
+- replay-pack capture / restore events
 - texture reload attempts
 - watchdog recovery events
 - update-check results
@@ -833,12 +1014,14 @@ The footer shows:
 
 ## Command-line options
 
-The current script still supports headless and file-based usage.
+The current script supports both normal startup selection and explicit launch flags.
 
-Example headless launch:
+Examples:
 
 ```bash
-python nishizumi_paints_single_instance_v5_team_sessions_updates_v21.py --nogui
+python nishizumi_paints_v2-2-1_mode_selector.py
+python nishizumi_paints_v2-2-1_mode_selector.py --nogui
+python nishizumi_paints_v2-2-1_mode_selector.py --gui
 ```
 
 ### Available options
@@ -894,6 +1077,10 @@ Default: **3**
 Base backoff interval for retry timing.
 Default: **1.0**
 
+#### `--gui`
+
+Force the built-in GUI even if a launch preference is already saved.
+
 #### `--nogui`
 
 Run without the built-in UI.
@@ -906,6 +1093,10 @@ Normal users do not need to pass this manually.
 #### `-v` / `--verbose`
 
 Enable verbose debug logging.
+
+### Shift startup override
+
+Holding **Shift** while opening the app forces the startup mode selector to appear again, even if you already saved a launch preference.
 
 ---
 
@@ -947,6 +1138,14 @@ Default on Windows:
 %APPDATA%\Nishizumi-Paints\RandomPool
 ```
 
+### Replay packs folder
+
+Default on Windows:
+
+```text
+%APPDATA%\Nishizumi-Paints\ReplayPacks
+```
+
 ### Settings file
 
 Default on Windows:
@@ -954,6 +1153,8 @@ Default on Windows:
 ```text
 %APPDATA%\NishizumiPaints\settings.json
 ```
+
+This file stores the normal app settings and the saved launch-mode preference.
 
 Note the folder name here is **NishizumiPaints** with no hyphen, while some other cached folders use **Nishizumi-Paints** with a hyphen.
 
@@ -968,6 +1169,8 @@ Default behavior uses:
 ### Windows auto-start entry
 
 When **Auto start** is enabled, the app writes a Windows Run entry for the current user.
+
+That auto-start command can include GUI or headless launch arguments depending on your saved launch-mode preference.
 
 ---
 
@@ -997,9 +1200,14 @@ That reduces the chance of partial visible files.
 The local fallback system can draw from the random pool and compatible local AI-livery sources when present.
 It also tracks repeated-source use so it can avoid reuse too early when possible.
 
+### Replay-pack matching
+
+Replay packs are tied to a session-fingerprint key, not only a replay filename.
+That improves the chance of restoring the correct set for the correct replay/session combination.
+
 ### Watchdog recovery
 
-If the service stops unexpectedly, the UI-side poll logic can detect that and start it again.
+If the service stops unexpectedly, the running path can detect that and start it again.
 
 ### Log retention inside the UI
 
@@ -1028,6 +1236,14 @@ Check:
 - the SDK is accessible
 - the activity log is visible
 - verbose logs if deeper diagnosis is needed
+
+### I selected headless before and now I want the GUI back
+
+Use one of these:
+
+- run the app with `--gui`
+- hold **Shift** while opening the app and choose GUI
+- clear or change the saved startup choice through the selector
 
 ### Liveries saved but not visible immediately
 
@@ -1061,6 +1277,14 @@ The most reliable approach is usually:
 - clone or randomize a local AI roster if needed
 - recreate or reselect the roster in iRacing
 
+### Replay pack was not created
+
+Possible reasons:
+
+- the replay file was detected before a usable saved paint set existed
+- there were no remaining saved paint files left to archive for that replay
+- the replay/session match was not strong enough to restore later
+
 ### The pool was cleaned and files disappeared
 
 That is expected for **Clean pool now**.
@@ -1079,9 +1303,10 @@ Manual mode is fixed until you change it.
 - Texture appearance timing is still partly controlled by iRacing itself
 - Trading Paints-side availability still depends on the files that actually exist for that user / context
 - Hosted AI workflows are most reliable through synced/local roster workflows, not guaranteed live repainting in every possible situation
+- Replay-pack usefulness still depends on whether matching session paint data existed when the replay was captured
 - Random fallback can only use what already exists locally for that car type
 - Extremely high worker values do not guarantee better real throughput
-- Auto-start, tray/background behavior, and registry behavior are Windows-specific usage patterns
+- Auto-start, tray/background behavior, console/headless behavior, and registry behavior are Windows-specific usage patterns
 
 ---
 
@@ -1119,6 +1344,10 @@ Yes. If **Keep running in background on close** is enabled, clicking `X` hides i
 No. It is intended to run as a single instance.
 Launching it again should focus the existing copy.
 
+### Can GUI and headless run separately at the same time?
+
+No. They are intended to be two launch paths for the same app, not two independent running copies.
+
 ### Should I use Auto or Manual worker mode?
 
 Use **Auto** unless you specifically want fixed repeatable values.
@@ -1126,6 +1355,10 @@ Use **Auto** unless you specifically want fixed repeatable values.
 ### What is the random pool in simple terms?
 
 It is a local cache of reusable TP-style car sets that the app can reuse later.
+
+### What is a replay pack in simple terms?
+
+It is a saved archive of session paint files that can later be reused for replay viewing.
 
 ### Will deleting live session paints always erase everything forever?
 
@@ -1139,4 +1372,4 @@ That is one of the intended usage patterns.
 ### Is the app meant for both normal users and advanced users?
 
 Yes.
-The defaults are designed for simple daily use, while the logs, worker controls, AI tools, and monitor exist for deeper control and debugging.
+The defaults are designed for simple daily use, while the logs, worker controls, AI tools, session status view, and monitor exist for deeper control and debugging.
