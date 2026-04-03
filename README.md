@@ -17,14 +17,19 @@ The app is designed so a normal user can:
 This README reflects the current app flow and interface, including:
 
 - startup mode selection (**normal window** or **console/headless**)
-- the new **Quick Start** wizard
+- the **Quick Start** wizard
 - separate **AI** and **Random** tabs
-- the new **Online Trading Paints** fallback workflow
+- the **Online Trading Paints** fallback workflow
 - support for a **secondary / smurf / mule** Trading Paints account
 - the **TP manifest member ID override** field
 - **TP mule fast mode**
 - optional **showroom total-page detection**
 - a **local random paints pool** that still matters even when Online is selected
+- a **bundled / embedded browser runtime** workflow for Trading Paints login
+- the new **Session Total** worker mode
+- **incremental same-session roster refreshes** instead of redownloading the whole session
+- separate **car / suit / helmet** session states
+- support for **helmet** and **suit** fallback handling
 - a **Reset app settings** tool in the Logs tab
 
 ---
@@ -40,8 +45,10 @@ Nishizumi Paints keeps watching your current iRacing session and tries to make s
 In simple terms, it can:
 
 - download the normal Trading Paints files for people in your session
+- download and save **car**, **helmet**, and **suit** files when available
 - fill in missing paints when some drivers or AI cars do not have a usable TP paint
 - reuse local cached paints later so you do not lose everything after a session ends
+- react to roster changes inside the same session without throwing away everything it already downloaded
 
 ### The simplest recommended setup
 
@@ -88,18 +95,6 @@ Benefits:
 - you do not have to worry as much about the app restoring your real everyday paint after every fallback action
 
 Important detail: you can be **racing on one iRacing account** while the app is **logged in to another Trading Paints account** for the online fallback workflow. That is the intended mule-account setup.
-
-**You can create a secondary account for FREE by subscribing to iRacing through a new Steam account.**
-
-Create a new Steam account.
-Subscribe to iRacing for 1 month.
-Go to the iRacing member site and complete the account validation.
-Log in to Trading Paints using this new iRacing account.
-Save your iRacing ID.
-Request a refund on Steam.
-
-You don’t need to open or play the game on the secondary account. The only goal is to create the account, link it to Trading Paints, and save the iRacing ID.
-Even after the refund is processed and the subscription expires, you can still access the iRacing ID through the member site. However, it’s much easier to retrieve and save the ID before submitting the refund request.
 
 ### Is it safe to log in through the app
 
@@ -158,6 +153,7 @@ If you want the best beginner-friendly setup: use the normal window mode, go thr
 - [Important warning about the connected Trading Paints account](#important-warning-about-the-connected-trading-paints-account)
 - [Requirements](#requirements)
 - [Installation](#installation)
+- [Bundled browser runtime](#bundled-browser-runtime)
 - [First launch](#first-launch)
 - [Quick Start wizard](#quick-start-wizard)
 - [Startup mode selector](#startup-mode-selector)
@@ -174,6 +170,7 @@ If you want the best beginner-friendly setup: use the normal window mode, go thr
 - [How the local random paints pool works](#how-the-local-random-paints-pool-works)
 - [AI support](#ai-support)
 - [Download workers](#download-workers)
+- [Same-session roster changes](#same-session-roster-changes)
 - [Replay packs](#replay-packs)
 - [Buttons and manual actions](#buttons-and-manual-actions)
 - [Command-line options](#command-line-options)
@@ -200,6 +197,8 @@ When you join a session, the app can:
 9. optionally recycle downloaded TP car sets into a reusable **local random paints pool**
 10. keep watching for the next session automatically
 
+What it can fetch and save depends on what is available for the user and car combination, but it now treats the session assets separately so you can see **car**, **suit**, and **helmet** progress more clearly.
+
 ---
 
 ## How Nishizumi Paints handles missing paints
@@ -211,7 +210,7 @@ The app can apply fallback paints for:
 - **real drivers without a TP paint**
 - **AI drivers without a TP paint**
 
-You can enable either one or both.
+The fallback handling is not limited to the main car texture anymore. The app can also try to resolve **helmet** and **suit** files using the same general fallback idea when those files are missing.
 
 Then you choose a **Preferred source**:
 
@@ -339,13 +338,52 @@ Main Python packages used by the runtime include:
 pip install -r requirements.txt
 ```
 
-4. Run the current script
+4. If you plan to use **Online** fallback from source, also make sure the Playwright browser runtime is available in a way your environment expects.
+5. Run the current script.
 
 ### Option 2: use a compiled Windows EXE
 
 1. Download the latest release package from GitHub
-2. Open the EXE
-3. Go through the startup selector and Quick Start on first use
+2. Extract the full release folder
+3. Keep the EXE and its support folders together
+4. Open the EXE
+5. Go through the startup selector and Quick Start on first use
+
+If you use a compiled **directory/onedir** release, do not separate the EXE from its support folders.
+
+---
+
+## Bundled browser runtime
+
+The compiled app can use a **bundled / embedded Chromium-based browser runtime** for the Trading Paints login flow.
+
+This is useful because the app does not have to depend only on a separately installed Google Chrome anymore.
+
+### What the app checks first
+
+If available, the app can prefer a browser shipped with the app itself, for example inside folders such as:
+
+- `embedded_browser`
+- `browser`
+- `chrome`
+- `chrome_runtime`
+- `chrome-portable`
+- `ms-playwright`
+
+Typical expected layouts include a direct `chrome.exe` or a `chrome-win64\chrome.exe` style folder.
+
+### If no bundled browser is available
+
+The app can still fall back to installed Chromium-based browsers such as:
+
+- Google Chrome
+- Microsoft Edge
+- Brave
+- Chromium
+
+### Practical recommendation
+
+For normal EXE releases, keep the bundled browser files exactly where the release package expects them. Do not move the EXE somewhere else by itself if your package includes a local browser runtime.
 
 ---
 
@@ -446,7 +484,10 @@ The **Session** tab shows the live session and the per-driver status.
 
 The current driver list includes columns such as:
 
-- state
+- overall state
+- **car** state
+- **suit** state
+- **helmet** state
 - number
 - iRating
 - license
@@ -455,7 +496,7 @@ The current driver list includes columns such as:
 
 ### Important fallback labels
 
-The Session tab can now distinguish between:
+The Session tab can distinguish between:
 
 - **FALLBACK LOCAL**
 - **FALLBACK ONLINE**
@@ -470,6 +511,8 @@ Other states can include:
 - missing
 - skipped
 - replay pack
+
+The separate **car / suit / helmet** columns are there so the user can see exactly which asset type is missing, queued, downloaded, or resolved by fallback.
 
 ---
 
@@ -533,7 +576,7 @@ The **AI** tab now contains only AI-related actions that are not the general ran
 
 ### AI actions
 
-- **Sync AI rosters now**
+- **Sync AI rosters**
 - **Clone active AI roster**
 - **Randomize active AI roster**
 - **Copy my car to AI**
@@ -578,6 +621,8 @@ The goal is to keep the logic clear:
 - the local pool still matters either way
 
 When Local is selected, the Online area can visually show that it is **OFF** for the current preference while still allowing configuration.
+
+The login flow can use a bundled browser runtime if your release package includes one.
 
 ---
 
@@ -758,19 +803,32 @@ You can:
 
 ## Download workers
 
-The app supports two worker modes:
+The app supports three worker modes:
 
+- **Session Total**
 - **Auto**
 - **Manual**
 
+### Session Total
+
+This is now the default worker mode for new configs.
+
+It automatically sets:
+
+- **manifests** = exact number of users in the current session
+- **downloads** = exact number of queued download items
+- **saves** = exact number of queued save items
+
+This mode is meant for users who want the app to use the full current session size instead of the normal auto-tuned caps.
+
 ### Auto
 
-Recommended for most users.
-The app adapts the work automatically.
+This is the adaptive mode.
+The app uses its own tuning rules and configured caps.
 
 ### Manual
 
-For advanced users who want fixed values.
+This is for advanced users who want fixed values.
 
 Manual controls:
 
@@ -779,6 +837,26 @@ Manual controls:
 - saves
 
 Allowed range: **1 to 100**
+
+### Saved choice
+
+The selected worker mode is stored in the normal settings file, so the app remembers whether you left it on **Session Total**, **Auto**, or **Manual**.
+
+---
+
+## Same-session roster changes
+
+The app can detect when the roster changes **inside the same session**.
+
+Instead of treating that like a full new session every time, the intended behavior is to refresh the current session more intelligently so it does not have to throw away and redownload everything that was already resolved for unchanged drivers.
+
+In practical terms, the goal is:
+
+- keep what is already valid for the current session
+- only fetch what is actually new or newly missing
+- avoid unnecessary full-session redownloads when a few people join or leave
+
+This is especially useful in busy sessions where the roster can keep changing.
 
 ---
 
@@ -807,7 +885,7 @@ This can help preserve the paint set of a session for replay use later.
 
 ### AI tab
 
-- **Sync AI rosters now**
+- **Sync AI rosters**
 - **Clone active AI roster**
 - **Randomize active AI roster**
 - **Copy my car to AI**
@@ -891,6 +969,20 @@ Documents\iRacing\airosters
 
 This is the persistent browser profile the app uses for the online Trading Paints workflow.
 
+### Temporary working folder
+
+```text
+%TEMP%\NishizumiPaints
+```
+
+### Optional bundled browser folder
+
+Depending on your build/release layout, the EXE can also use a browser kept next to the app, commonly in a folder such as:
+
+```text
+embedded_browser
+```
+
 ---
 
 ## Troubleshooting
@@ -904,6 +996,7 @@ Check these first:
 - if using a secondary account, the **TP manifest member ID override** is filled correctly
 - the account is allowed to access the showroom normally
 - the activity log does not show an online auth/profile error
+- if your EXE package uses a bundled browser, make sure the EXE was not separated from it
 
 ### I connected a smurf account but online fallback still fails
 
@@ -935,6 +1028,11 @@ Check:
 - the SDK is available
 - you are in a valid session
 - the log is visible
+
+### Why did the session rerun when people joined or left?
+
+A roster change inside the same session can trigger a refresh pass.
+The current goal is to keep that refresh as incremental as possible instead of treating the whole session like a brand new one.
 
 ### I want to start over from scratch
 
@@ -977,9 +1075,9 @@ Usually:
 - fill in the mule account's TP member ID override
 - enable **TP mule fast mode**
 - keep **Online** as the preferred source
+- leave **Session Total** as the worker mode if you want the app to scale exactly to the current session size
 
 ### Can I use console mode every day?
 
 Yes, but it is mainly for advanced users after the initial setup is already done.
 The normal window is recommended first.
-
