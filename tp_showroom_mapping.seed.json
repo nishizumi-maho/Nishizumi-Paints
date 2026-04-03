@@ -1,0 +1,1507 @@
+{
+  "schema_version": 1,
+  "generated_at_utc": "2026-04-03T08:10:00+00:00",
+  "generated_from": {
+    "iracing_source": "https://support.iracing.com/support/solutions/articles/31000172625-filepath-for-active-iracing-cars",
+    "autopromoted_from": "tp_showroom_missing_from_seed.json (score==100 only)"
+  },
+  "cars": {
+    "acuraarx06gtp": {
+      "mid": 262,
+      "slug": "Acura-ARX06-GTP",
+      "category": "Road",
+      "tp_name": "Acura ARX-06 GTP",
+      "iracing_name": "Acura ARX-06 GTP",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "acuransxevo22gt3": {
+      "mid": 291,
+      "slug": "Acura-NSX-GT3-EVO-22",
+      "category": "Road",
+      "tp_name": "Acura NSX GT3 EVO 22",
+      "iracing_name": "Acura NSX GT3 EVO 22",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "amvantagegt3": {
+      "mid": 304,
+      "slug": "Aston-Martin-Vantage-GT3-EVO",
+      "category": "Road",
+      "tp_name": "Aston Martin Vantage GT3 EVO",
+      "iracing_name": "Aston Martin Vantage GT3 EVO",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "amvantagegt4": {
+      "mid": 238,
+      "slug": "Aston-Martin-Vantage-GT4",
+      "category": "Road",
+      "tp_name": "Aston Martin Vantage GT4",
+      "iracing_name": "Aston Martin Vantage GT4",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "astonmartin\\dbr9": {
+      "mid": 155,
+      "slug": "Aston-Martin-DBR9-GT1",
+      "category": "Road",
+      "iracing_name": "Aston Martin DBR9 GT1",
+      "status": "mapped",
+      "source": "exact_rule_seed"
+    },
+    "audi90gto": {
+      "mid": 163,
+      "slug": "Audi-90-GTO",
+      "category": "Road",
+      "tp_name": "Audi 90 GTO",
+      "iracing_name": "Audi 90 GTO",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "audir18": {
+      "mid": 186,
+      "slug": "Audi-R18",
+      "category": "Road",
+      "tp_name": "Audi R18",
+      "iracing_name": "Audi R18",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "audir8lmsevo2gt3": {
+      "mid": 269,
+      "slug": "Audi-R8-LMS-EVO-II-GT3",
+      "category": "Road",
+      "tp_name": "Audi R8 LMS EVO II GT3",
+      "iracing_name": "Audi R8 LMS EVO II GT3",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "audirs3lms": {
+      "mid": 202,
+      "slug": "Audi-RS-3-LMS-TCR",
+      "category": "Road",
+      "tp_name": "Audi RS 3 LMS TCR",
+      "iracing_name": "Audi RS3 LMS TCR",
+      "status": "mapped",
+      "source": "manual_review_promoted"
+    },
+    "bmwlmdh": {
+      "mid": 251,
+      "slug": "BMW-M-Hybrid-V8",
+      "category": "Road",
+      "tp_name": "BMW M Hybrid V8",
+      "iracing_name": "BMW M Hybrid V8",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "bmwm4gt4": {
+      "mid": 213,
+      "slug": "BMW-M4-F82-GT4--2018",
+      "category": "Road",
+      "tp_name": "BMW M4 F82 GT4 - 2018",
+      "iracing_name": "BMW M4 F82 GT4 - 2018",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "bmwm8gte": {
+      "mid": 194,
+      "slug": "BMW-M8-GTE",
+      "category": "Road",
+      "tp_name": "BMW M8 GTE",
+      "iracing_name": "BMW M8 GTE",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "bmwrn2csr": {
+      "mid": 292,
+      "slug": "BMW-M2-CS-Racing",
+      "category": "Road",
+      "tp_name": "BMW M2 CS Racing",
+      "iracing_name": "BMW M2 CSR",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "bmwz4gt3": {
+      "mid": 147,
+      "slug": "Legacy-BMW-Z4-GT3",
+      "category": "Road",
+      "tp_name": "[Legacy] BMW Z4 GT3",
+      "iracing_name": "[Legacy] BMW Z4 GT3",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "c6r": {
+      "mid": 103,
+      "slug": "Chevrolet-Corvette-C6R-GT1",
+      "category": "Road",
+      "tp_name": "Chevrolet Corvette C6.R GT1",
+      "iracing_name": "Chevrolet Corvette C6.R GT1",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "c7vettedp": {
+      "mid": 157,
+      "slug": "Chevrolet-Corvette-C7-DP",
+      "category": "Road",
+      "tp_name": "Chevrolet Corvette C7 DP",
+      "iracing_name": "Chevrolet Corvette C7 Daytona Prototype",
+      "status": "mapped",
+      "source": "manual_review_promoted"
+    },
+    "c8rvettegte": {
+      "mid": 217,
+      "slug": "Chevrolet-Corvette-C8R-GTE",
+      "category": "Road",
+      "tp_name": "Chevrolet Corvette C8.R GTE",
+      "iracing_name": "Chevrolet Corvette C8.R GTE",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "cadillacctsvr": {
+      "mid": 134,
+      "slug": "Cadillac-CTSV-Racecar",
+      "category": "Road",
+      "tp_name": "Cadillac CTS-V Racecar",
+      "iracing_name": "Cadillac CTS-V Racecar",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "cadillacvseriesgtp": {
+      "mid": 260,
+      "slug": "Cadillac-VSeriesR-GTP",
+      "category": "Road",
+      "tp_name": "Cadillac V-Series.R GTP",
+      "iracing_name": "Cadillac V-Series.R GTP",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "chevycorvettez06rgt3": {
+      "mid": 278,
+      "slug": "Chevrolet-Corvette-Z06-GT3R",
+      "category": "Road",
+      "tp_name": "Chevrolet Corvette Z06 GT3.R",
+      "iracing_name": "Chevrolet Corvette Z06 GT3.R",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "crosscartn11": {
+      "mid": 305,
+      "slug": "FIA-Cross-Car",
+      "category": "Road",
+      "tp_name": "FIA Cross Car",
+      "iracing_name": "FIA Cross Car",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "dallara": {
+      "mid": 108,
+      "slug": "Legacy-Dallara-IR05",
+      "category": "Road",
+      "tp_name": "[Legacy] Dallara IR-05",
+      "iracing_name": "[Legacy] Dallara IR-05",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "dallaradw12": {
+      "mid": 148,
+      "slug": "Legacy-Dallara-DW12",
+      "category": "Road",
+      "tp_name": "[Legacy] Dallara DW12",
+      "iracing_name": "[Legacy] Dallara DW12",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "dallaraf3": {
+      "mid": 193,
+      "slug": "Dallara-F3",
+      "category": "Road",
+      "tp_name": "Dallara F3",
+      "iracing_name": "Dallara F3",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "dallarail15": {
+      "mid": 303,
+      "slug": "Dallara-IL15",
+      "category": "Road",
+      "tp_name": "Dallara IL-15",
+      "iracing_name": "Dallara IL-15 (INDY NXT)",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "dallarair01": {
+      "mid": 219,
+      "slug": "Dallara-iR01",
+      "category": "Road",
+      "tp_name": "Dallara iR-01",
+      "iracing_name": "Dallara iR-01",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "dallarair18": {
+      "mid": 187,
+      "slug": "Dallara-IR18",
+      "category": "Road",
+      "tp_name": "Dallara IR18",
+      "iracing_name": "Dallara IR18",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "dallarap217": {
+      "mid": 218,
+      "slug": "Dallara-P217",
+      "category": "Road",
+      "tp_name": "Dallara P217",
+      "iracing_name": "Dallara P217",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "dirtlatemodel\\350": {
+      "mid": 166,
+      "slug": "Dirt-Late-Models",
+      "category": "Oval",
+      "iracing_name": "Limited Dirt Late Model",
+      "status": "mapped",
+      "source": "exact_rule_seed"
+    },
+    "dirtlatemodel\\358": {
+      "mid": 166,
+      "slug": "Dirt-Late-Models",
+      "category": "Oval",
+      "iracing_name": "Pro Dirt Late Model",
+      "status": "mapped",
+      "source": "exact_rule_seed"
+    },
+    "dirtlatemodel\\438": {
+      "mid": 166,
+      "slug": "Dirt-Late-Models",
+      "category": "Oval",
+      "iracing_name": "Super Dirt Late Model",
+      "status": "mapped",
+      "source": "exact_rule_seed"
+    },
+    "dirtmicrosprint\\nonwinged": {
+      "mid": 277,
+      "slug": "Dirt-Micro-Sprint-Cars--NonWinged",
+      "category": "Oval",
+      "iracing_name": "Dirt Micro Sprint Car - Non-Winged",
+      "status": "mapped",
+      "source": "exact_rule_seed"
+    },
+    "dirtmicrosprint\\winged": {
+      "mid": 276,
+      "slug": "Dirt-Micro-Sprint-Cars--Winged",
+      "category": "Oval",
+      "iracing_name": "Dirt Micro Sprint Car - Winged",
+      "status": "mapped",
+      "source": "exact_rule_seed"
+    },
+    "dirtmidget": {
+      "mid": 185,
+      "slug": "Dirt-Midget",
+      "category": "Oval",
+      "tp_name": "Dirt Midget",
+      "iracing_name": "Dirt Midget",
+      "status": "mapped",
+      "source": "manual_review_promoted"
+    },
+    "dirtministock": {
+      "mid": 286,
+      "slug": "Mini-Stocks",
+      "category": "Oval",
+      "tp_name": "Mini Stocks",
+      "iracing_name": "Dirt Mini Stock",
+      "status": "mapped",
+      "source": "manual_review_promoted"
+    },
+    "dirtmodified\\358": {
+      "mid": 221,
+      "slug": "Dirt-Modifieds",
+      "category": "Oval",
+      "iracing_name": "Dirt 358 Modified",
+      "status": "mapped",
+      "source": "exact_rule_seed"
+    },
+    "dirtmodified\\bigblock": {
+      "mid": 221,
+      "slug": "Dirt-Modifieds",
+      "category": "Oval",
+      "iracing_name": "Dirt Big Block Modified",
+      "status": "mapped",
+      "source": "exact_rule_seed"
+    },
+    "dirtsprint\\nonwinged\\360": {
+      "mid": 176,
+      "slug": "Dirt-Sprint-Cars--NonWinged",
+      "category": "Oval",
+      "iracing_name": "Dirt Sprint Car Non-Winged - 360",
+      "status": "mapped",
+      "source": "exact_rule_seed"
+    },
+    "dirtsprint\\nonwinged\\410": {
+      "mid": 176,
+      "slug": "Dirt-Sprint-Cars--NonWinged",
+      "category": "Oval",
+      "iracing_name": "Dirt Sprint Car Non-Winged - 410",
+      "status": "mapped",
+      "source": "exact_rule_seed"
+    },
+    "dirtsprint\\winged\\305": {
+      "mid": 170,
+      "slug": "Dirt-Sprint-Cars",
+      "category": "Oval",
+      "iracing_name": "Dirt Sprint Car - 305",
+      "status": "mapped",
+      "source": "exact_rule_seed"
+    },
+    "dirtsprint\\winged\\360": {
+      "mid": 170,
+      "slug": "Dirt-Sprint-Cars",
+      "category": "Oval",
+      "iracing_name": "Dirt Sprint Car - 360",
+      "status": "mapped",
+      "source": "exact_rule_seed"
+    },
+    "dirtsprint\\winged\\410": {
+      "mid": 170,
+      "slug": "Dirt-Sprint-Cars",
+      "category": "Oval",
+      "iracing_name": "Dirt Sprint Car - 410",
+      "status": "mapped",
+      "source": "exact_rule_seed"
+    },
+    "dirtstreetstock": {
+      "mid": 174,
+      "slug": "Dirt-Street-Stock",
+      "category": "Oval",
+      "tp_name": "Dirt Street Stock",
+      "iracing_name": "Dirt Street Stock",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "dirtumpmod": {
+      "mid": 181,
+      "slug": "Dirt-UMP-Modified",
+      "category": "Oval",
+      "tp_name": "Dirt UMP Modified",
+      "iracing_name": "Dirt UMP Modified",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "ferrari296challenge": {
+      "mid": 301,
+      "slug": "Ferrari-296-Challenge",
+      "category": "Road",
+      "tp_name": "Ferrari 296 Challenge",
+      "iracing_name": "Ferrari 296 Challenge",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "ferrari296gt3": {
+      "mid": 264,
+      "slug": "Ferrari-296-GT3",
+      "category": "Road",
+      "tp_name": "Ferrari 296 GT3",
+      "iracing_name": "Ferrari 296 GT3",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "ferrari488gt3": {
+      "mid": 182,
+      "slug": "Legacy-Ferrari-488-GT3",
+      "category": "Road",
+      "tp_name": "[Legacy] Ferrari 488 GT3",
+      "iracing_name": "[Legacy] Ferrari 488 GT3",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "ferrari488gte": {
+      "mid": 179,
+      "slug": "Ferrari-488-GTE",
+      "category": "Road",
+      "tp_name": "Ferrari 488 GTE",
+      "iracing_name": "Ferrari 488 GTE",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "ferrari499p": {
+      "mid": 293,
+      "slug": "Ferrari-499P",
+      "category": "Road",
+      "tp_name": "Ferrari 499P",
+      "iracing_name": "Ferrari 499P",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "ferrarievogt3": {
+      "mid": 233,
+      "slug": "Ferrari-488-GT3-Evo-2020",
+      "category": "Road",
+      "tp_name": "Ferrari 488 GT3 Evo 2020",
+      "iracing_name": "Ferrari 488 GT3 Evo 2020",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "fordfiestarswrc": {
+      "mid": 183,
+      "slug": "Ford-Fiesta-RS-WRC",
+      "category": "Road",
+      "tp_name": "Ford Fiesta RS WRC",
+      "iracing_name": "Ford Fiesta RS WRC",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "fordgt": {
+      "mid": 133,
+      "slug": "Ford-GT-GT2",
+      "category": "Road",
+      "tp_name": "Ford GT GT2",
+      "iracing_name": "Ford GT GT2",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "fordgt2017": {
+      "mid": 180,
+      "slug": "Ford-GTE",
+      "category": "Road",
+      "tp_name": "Ford GTE",
+      "iracing_name": "Ford GTE",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "fordgt\\gt3": {
+      "mid": 151,
+      "slug": "Ford-GT-GT3",
+      "category": "Road",
+      "iracing_name": "Ford GT GT3",
+      "status": "mapped",
+      "source": "exact_rule_seed"
+    },
+    "fordmustanggt3": {
+      "mid": 279,
+      "slug": "Ford-Mustang-GT3",
+      "category": "Road",
+      "tp_name": "Ford Mustang GT3",
+      "iracing_name": "Ford Mustang GT3",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "fordmustanggt4": {
+      "mid": 302,
+      "slug": "Ford-Mustang-GT4",
+      "category": "Road",
+      "tp_name": "Ford Mustang GT4",
+      "iracing_name": "Ford Mustang GT4",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "fordv8sc": {
+      "mid": 122,
+      "slug": "Legacy-V8-Supercar-Ford-Falcon--2009",
+      "category": "Road",
+      "tp_name": "[Legacy] V8 Supercar Ford Falcon - 2009",
+      "iracing_name": "[Legacy] V8 Supercar Ford Falcon - 2009",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "formulair04": {
+      "mid": 239,
+      "slug": "FIA-F4",
+      "category": "Road",
+      "tp_name": "FIA F4",
+      "iracing_name": "FIA F4",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "formulamazda": {
+      "mid": 115,
+      "slug": "Legacy-Pro-Mazda",
+      "category": "Road",
+      "tp_name": "[Legacy] Pro Mazda",
+      "iracing_name": "[Legacy] Pro Mazda",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "formularenault20": {
+      "mid": 161,
+      "slug": "Formula-Renault-20",
+      "category": "Road",
+      "tp_name": "Formula Renault 2.0",
+      "iracing_name": "Formula Renault 2.0",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "formularenault35": {
+      "mid": 192,
+      "slug": "Formula-Renault-35",
+      "category": "Road",
+      "tp_name": "Formula Renault 3.5",
+      "iracing_name": "Formula Renault 3.5",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "formulavee": {
+      "mid": 232,
+      "slug": "Formula-Vee",
+      "category": "Road",
+      "tp_name": "Formula Vee",
+      "iracing_name": "Formula Vee",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "fr500s": {
+      "mid": 253,
+      "slug": "Ford-Mustang-FR500S",
+      "category": "Road",
+      "tp_name": "Ford Mustang FR500S",
+      "iracing_name": "Ford Mustang FR500S",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "hondacivictyper": {
+      "mid": 236,
+      "slug": "Honda-Civic-Type-R-TCR",
+      "category": "Road",
+      "tp_name": "Honda Civic Type R TCR",
+      "iracing_name": "Honda Civic Type R TCR",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "hpdarx01c": {
+      "mid": 132,
+      "slug": "HPD-ARX01c",
+      "category": "Road",
+      "tp_name": "HPD ARX-01c",
+      "iracing_name": "HPD ARX-01c",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "hyundaielantracn7": {
+      "mid": 237,
+      "slug": "Hyundai-Elantra-N-TCR",
+      "category": "Road",
+      "tp_name": "Hyundai Elantra N TCR",
+      "iracing_name": "Hyundai Elantra N TCR",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "hyundaivelostern": {
+      "mid": 241,
+      "slug": "Hyundai-Veloster-N-TCR",
+      "category": "Road",
+      "tp_name": "Hyundai Veloster N TCR",
+      "iracing_name": "Hyundai Veloster N TCR",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "indypropm18": {
+      "mid": 211,
+      "slug": "Indy-Pro-2000-PM18",
+      "category": "Road",
+      "tp_name": "Indy Pro 2000 PM-18",
+      "iracing_name": "Indy Pro 2000 PM-18",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "jettatdi": {
+      "mid": 116,
+      "slug": "VW-Jetta-TDI-Cup",
+      "category": "Road",
+      "tp_name": "VW Jetta TDI Cup",
+      "iracing_name": "VW Jetta TDI Cup",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "kiaoptima": {
+      "mid": 138,
+      "slug": "Kia-Optima",
+      "category": "Road",
+      "tp_name": "Kia Optima",
+      "iracing_name": "Kia Optima",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "lamborghinievogt3": {
+      "mid": 220,
+      "slug": "Lamborghini-Huracan-GT3-EVO",
+      "category": "Road",
+      "tp_name": "Lamborghini Huracan GT3 EVO",
+      "iracing_name": "Lamborghini Huracán GT3 EVO",
+      "status": "mapped",
+      "source": "manual_review_promoted"
+    },
+    "latemodel2023": {
+      "mid": 256,
+      "slug": "Late-Model-Stock",
+      "category": "Oval",
+      "tp_name": "Late Model Stock",
+      "iracing_name": "Late Model Stock",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "legends\\ford34c": {
+      "mid": 100,
+      "slug": "Legends-Ford-34-Coupe",
+      "category": "Oval",
+      "iracing_name": "Legends Ford '34 Coupe",
+      "status": "mapped",
+      "source": "exact_rule_seed"
+    },
+    "legends\\ford34c\\rookie": {
+      "mid": 100,
+      "slug": "Legends-Ford-34-Coupe",
+      "category": "Oval",
+      "tp_name": "Legends Ford 34 Coupe",
+      "iracing_name": "Legends Ford '34 Coupe - Rookie",
+      "status": "mapped",
+      "source": "exact_rule_keep"
+    },
+    "ligierjsp320": {
+      "mid": 259,
+      "slug": "Ligier-JS-P320",
+      "category": "Road",
+      "tp_name": "Ligier JS P320",
+      "iracing_name": "Ligier JS P320",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "lotus49": {
+      "mid": 139,
+      "slug": "Lotus-49",
+      "category": "Road",
+      "tp_name": "Lotus 49",
+      "iracing_name": "Lotus 49",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "lotus79": {
+      "mid": 249,
+      "slug": "Lotus-79",
+      "category": "Road",
+      "tp_name": "Lotus 79",
+      "iracing_name": "Lotus 79",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "mclaren570sgt4": {
+      "mid": 226,
+      "slug": "McLaren-570S-GT4",
+      "category": "Road",
+      "tp_name": "McLaren 570S GT4",
+      "iracing_name": "McLaren 570S GT4",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "mclaren720sgt3": {
+      "mid": 284,
+      "slug": "McLaren-720s-GT3-EVO",
+      "category": "Road",
+      "tp_name": "McLaren 720s GT3 EVO",
+      "iracing_name": "McLaren 720S GT3 EVO",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "mclarenmp430": {
+      "mid": 158,
+      "slug": "McLaren-MP430",
+      "category": "Road",
+      "tp_name": "McLaren MP4-30",
+      "iracing_name": "McLaren MP4-30",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "mercedesamgevogt3": {
+      "mid": 246,
+      "slug": "MercedesAMG-GT3-2020",
+      "category": "Road",
+      "tp_name": "Mercedes-AMG GT3 2020",
+      "iracing_name": "Mercedes-AMG GT3 2020",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "mercedesamggt3": {
+      "mid": 160,
+      "slug": "Legacy-MercedesAMG-GT3",
+      "category": "Road",
+      "tp_name": "[Legacy] Mercedes-AMG GT3",
+      "iracing_name": "[Legacy] Mercedes-AMG GT3",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "mercedesamggt4": {
+      "mid": 247,
+      "slug": "MercedesAMG-GT4",
+      "category": "Road",
+      "tp_name": "Mercedes-AMG GT4",
+      "iracing_name": "Mercedes-AMG GT4",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "mx5\\cup": {
+      "mid": 126,
+      "slug": "Legacy-Mazda-MX5-Cup--2010",
+      "category": "Road",
+      "iracing_name": "[Legacy] Mazda MX-5 Cup - 2010",
+      "status": "mapped",
+      "source": "exact_rule_seed"
+    },
+    "mx5\\mx52016": {
+      "mid": 159,
+      "slug": "Global-Mazda-MX5-Cup",
+      "category": "Road",
+      "iracing_name": "Global Mazda MX-5 Cup",
+      "status": "mapped",
+      "source": "exact_rule_seed"
+    },
+    "mx5\\roadster": {
+      "mid": 127,
+      "slug": "Legacy-Mazda-MX5-Roadster--2010",
+      "category": "Road",
+      "iracing_name": "[Legacy] Mazda MX-5 Roadster - 2010",
+      "status": "mapped",
+      "source": "exact_rule_seed"
+    },
+    "nissangtpzxt": {
+      "mid": 164,
+      "slug": "Nissan-GTP-ZXT",
+      "category": "Road",
+      "tp_name": "Nissan GTP ZX-T",
+      "iracing_name": "Nissan GTP ZXT",
+      "status": "mapped",
+      "source": "manual_review_promoted"
+    },
+    "porsche718gt4": {
+      "mid": 210,
+      "slug": "Porsche-718-Cayman-GT4-Clubsport-MR",
+      "category": "Road",
+      "tp_name": "Porsche 718 Cayman GT4 Clubsport MR",
+      "iracing_name": "Porsche 718 Cayman GT4 Clubsport MR",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "porsche911cup": {
+      "mid": 165,
+      "slug": "Legacy-Porsche-911-GT3-Cup-991",
+      "category": "Road",
+      "tp_name": "[Legacy] Porsche 911 GT3 Cup (991)",
+      "iracing_name": "[Legacy] Porsche 911 GT3 Cup (991)",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "porsche911rgt3": {
+      "mid": 230,
+      "slug": "Legacy-Porsche-911-GT3-R",
+      "category": "Road",
+      "tp_name": "[Legacy] Porsche 911 GT3 R",
+      "iracing_name": "[Legacy] Porsche 911 GT3 R",
+      "status": "mapped",
+      "source": "manual_review_promoted"
+    },
+    "porsche919": {
+      "mid": 188,
+      "slug": "Porsche-919",
+      "category": "Road",
+      "tp_name": "Porsche 919",
+      "iracing_name": "Porsche 919",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "porsche963gtp": {
+      "mid": 265,
+      "slug": "Porsche-963-GTP",
+      "category": "Road",
+      "tp_name": "Porsche 963 GTP",
+      "iracing_name": "Porsche 963 GTP",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "porsche991rsr": {
+      "mid": 190,
+      "slug": "Porsche-911-RSR",
+      "category": "Road",
+      "tp_name": "Porsche 911 RSR",
+      "iracing_name": "Porsche 911 RSR",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "porsche9922cup": {
+      "mid": 306,
+      "slug": "Porsche-911-Cup-9922",
+      "category": "Road",
+      "tp_name": "Porsche 911 Cup (992.2)",
+      "iracing_name": "Porsche 911 Cup (992.2)",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "porsche992cup": {
+      "mid": 165,
+      "slug": "Legacy-Porsche-911-GT3-Cup-991",
+      "category": "Road",
+      "tp_name": "[Legacy] Porsche 911 GT3 Cup (991)",
+      "iracing_name": "[Legacy] Porsche 911 GT3 Cup (992.1)",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "porsche992rgt3": {
+      "mid": 261,
+      "slug": "Porsche-911-GT3-R-992",
+      "category": "Road",
+      "tp_name": "Porsche 911 GT3 R (992)",
+      "iracing_name": "Porsche 911 GT3 R (992)",
+      "status": "mapped",
+      "source": "manual_review_promoted"
+    },
+    "porschemissionr": {
+      "mid": 250,
+      "slug": "Porsche-Mission-R",
+      "category": "Road",
+      "tp_name": "Porsche Mission R",
+      "iracing_name": "Porsche Mission R",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "protrucks\\pro2lite": {
+      "mid": 206,
+      "slug": "Lucas-Oil-Off-Road-Pro-2-Lite",
+      "category": "Road",
+      "iracing_name": "Lucas Oil Off Road Pro 2 Lite",
+      "status": "mapped",
+      "source": "exact_rule_seed"
+    },
+    "protrucks\\pro2truck": {
+      "mid": 197,
+      "slug": "Lucas-Oil-Off-Road-Pro-2-Truck",
+      "category": "Road",
+      "iracing_name": "Lucas Oil Off Road Pro 2 Truck",
+      "status": "mapped",
+      "source": "exact_rule_seed"
+    },
+    "protrucks\\pro4truck": {
+      "mid": 198,
+      "slug": "Lucas-Oil-Off-Road-Pro-4-Truck",
+      "category": "Road",
+      "iracing_name": "Lucas Oil Off Road Pro 4 Truck",
+      "status": "mapped",
+      "source": "exact_rule_seed"
+    },
+    "radical\\sr10": {
+      "mid": 245,
+      "slug": "Radical-SR10",
+      "category": "Road",
+      "iracing_name": "Radical SR10",
+      "status": "mapped",
+      "source": "exact_rule_seed"
+    },
+    "radical\\sr8": {
+      "mid": 110,
+      "slug": "Radical-SR8",
+      "category": "Road",
+      "iracing_name": "Radical SR8",
+      "status": "mapped",
+      "source": "exact_rule_seed"
+    },
+    "raygr22": {
+      "mid": 255,
+      "slug": "Ray-FF1600",
+      "category": "Road",
+      "tp_name": "Ray FF1600",
+      "iracing_name": "Ray FF1600",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "renaultcliocup": {
+      "mid": 254,
+      "slug": "Renault-Clio",
+      "category": "Road",
+      "tp_name": "Renault Clio",
+      "iracing_name": "Renault Clio",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "rileydp": {
+      "mid": 111,
+      "slug": "Legacy-Riley-MkXX-Daytona-Prototype--2008",
+      "category": "Road",
+      "tp_name": "[Legacy] Riley MkXX Daytona Prototype - 2008",
+      "iracing_name": "[Legacy] Riley MkXX Daytona Prototype - 2008",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "rt2000": {
+      "mid": 209,
+      "slug": "Skip-Barber-Formula-2000",
+      "category": "Road",
+      "tp_name": "Skip Barber Formula 2000",
+      "iracing_name": "Skip Barber Formula 2000",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "rufrt12r\\awd": {
+      "mid": 145,
+      "slug": "Ruf-RT-12R-AWD",
+      "category": "Road",
+      "iracing_name": "Ruf RT 12R AWD",
+      "status": "mapped",
+      "source": "exact_rule_seed"
+    },
+    "rufrt12r\\rwd": {
+      "mid": 142,
+      "slug": "Ruf-RT-12R-RWD",
+      "category": "Road",
+      "iracing_name": "Ruf RT 12R RWD",
+      "status": "mapped",
+      "source": "exact_rule_seed"
+    },
+    "rufrt12r\\track": {
+      "mid": 143,
+      "slug": "Ruf-RT-12R-Track",
+      "category": "Road",
+      "iracing_name": "Ruf RT 12R Track",
+      "status": "mapped",
+      "source": "exact_rule_seed"
+    },
+    "rufrt12r\\track\\cspec": {
+      "mid": 141,
+      "slug": "Ruf-RT-12R-CSpec",
+      "category": "Road",
+      "iracing_name": "Ruf RT 12R C-Spec",
+      "status": "mapped",
+      "source": "exact_rule_seed"
+    },
+    "silvercrown": {
+      "mid": 113,
+      "slug": "Silver-Crown",
+      "category": "Oval",
+      "tp_name": "Silver Crown",
+      "iracing_name": "Silver Crown",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "skmodified": {
+      "mid": 201,
+      "slug": "Modifieds--Asphalt",
+      "category": "Oval",
+      "tp_name": "Modifieds - Asphalt",
+      "iracing_name": "Modified - SK",
+      "status": "mapped",
+      "source": "manual_review_promoted"
+    },
+    "skmodified\\tour": {
+      "mid": 201,
+      "slug": "Modifieds--Asphalt",
+      "category": "Oval",
+      "iracing_name": "NASCAR Whelen Tour Modified",
+      "status": "mapped",
+      "source": "exact_rule_seed"
+    },
+    "solstice": {
+      "mid": 102,
+      "slug": "Pontiac-Solstice",
+      "category": "Road",
+      "tp_name": "Pontiac Solstice",
+      "iracing_name": "Pontiac Solstice",
+      "status": "mapped",
+      "source": "manual_review_promoted"
+    },
+    "solstice\\rookie": {
+      "mid": 120,
+      "slug": "Pontiac-Solstice--Rookie",
+      "category": "Road",
+      "tp_name": "Pontiac Solstice - Rookie",
+      "iracing_name": "Pontiac Solstice - Rookie",
+      "status": "mapped",
+      "source": "exact_rule_keep"
+    },
+    "specracer": {
+      "mid": 235,
+      "slug": "SCCA-Spec-Racer-Ford",
+      "category": "Road",
+      "tp_name": "SCCA Spec Racer Ford",
+      "iracing_name": "SCCA Spec Racer Ford",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "sprint": {
+      "mid": 129,
+      "slug": "Sprint-Car",
+      "category": "Oval",
+      "tp_name": "Sprint Car",
+      "iracing_name": "Sprint Car",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "stockcarbrasil\\corolla": {
+      "mid": 243,
+      "slug": "Stock-Car-Brasil-Toyota-Corolla",
+      "category": "Road",
+      "iracing_name": "Stock Car Pro Series Toyota Corolla",
+      "status": "mapped",
+      "source": "exact_rule_seed"
+    },
+    "stockcarbrasil\\cruze": {
+      "mid": 242,
+      "slug": "Stock-Car-Brasil-Chevrolet-Cruze",
+      "category": "Road",
+      "iracing_name": "Stock Car Pro Series Chevrolet Cruze",
+      "status": "mapped",
+      "source": "exact_rule_seed"
+    },
+    "stockcars2\\arcachevy25": {
+      "mid": 294,
+      "slug": "ARCA-Chevrolet-SS",
+      "category": "Oval",
+      "iracing_name": "ARCA Chevrolet SS",
+      "status": "mapped",
+      "source": "exact_rule_seed"
+    },
+    "stockcars2\\arcaford25": {
+      "mid": 295,
+      "slug": "ARCA-Ford-Mustang",
+      "category": "Oval",
+      "iracing_name": "ARCA Ford Mustang",
+      "status": "mapped",
+      "source": "exact_rule_seed"
+    },
+    "stockcars2\\arcatoyota25": {
+      "mid": 296,
+      "slug": "ARCA-Toyota-Camry",
+      "category": "Oval",
+      "iracing_name": "ARCA Toyota Camry",
+      "status": "mapped",
+      "source": "exact_rule_seed"
+    },
+    "stockcars2\\camaro2019": {
+      "mid": 203,
+      "slug": "NASCAR-OReilly-Chevrolet-Camaro",
+      "category": "Oval",
+      "iracing_name": "NASCAR Xfinity Chevrolet Camaro",
+      "status": "mapped",
+      "source": "exact_rule_seed"
+    },
+    "stockcars2\\camry2015": {
+      "mid": 156,
+      "slug": "Legacy-NASCAR-Xfinity-Toyota-Camry--2015",
+      "category": "Oval",
+      "iracing_name": "[Legacy] NASCAR Xfinity Toyota Camry - 2015",
+      "status": "mapped",
+      "source": "exact_rule_seed"
+    },
+    "stockcars2\\chevy": {
+      "mid": 258,
+      "slug": "Legacy-ARCA-Menards-Chevrolet-Impala",
+      "category": "Oval",
+      "iracing_name": "[Legacy] ARCA Menards Chevrolet Impala",
+      "status": "mapped",
+      "source": "exact_rule_seed"
+    },
+    "stockcars2\\chevy\\cot": {
+      "mid": 130,
+      "slug": "Legacy-NASCAR-Nationwide-Chevrolet-Impala--2012",
+      "category": "Oval",
+      "tp_name": "[Legacy] NASCAR Nationwide Chevrolet Impala - 2012",
+      "iracing_name": "[Legacy] NASCAR Nationwide Chevrolet Impala - 2012",
+      "status": "mapped",
+      "source": "exact_rule_fix"
+    },
+    "stockcars2\\chevy\\gen4cup": {
+      "mid": 298,
+      "slug": "Gen-4-Chevrolet-Monte-Carlo--2003-SS",
+      "category": "Oval",
+      "iracing_name": "[Legacy] Gen 4 Cup",
+      "status": "mapped",
+      "source": "exact_rule_seed"
+    },
+    "stockcars2\\mustang2019": {
+      "mid": 204,
+      "slug": "NASCAR-OReilly-Ford-Mustang",
+      "category": "Oval",
+      "iracing_name": "NASCAR Xfinity Ford Mustang",
+      "status": "mapped",
+      "source": "exact_rule_seed"
+    },
+    "stockcars2\\nwcamaro2014": {
+      "mid": 149,
+      "slug": "Legacy-NASCAR-Xfinity-Chevrolet-Camaro--2014",
+      "category": "Oval",
+      "iracing_name": "[Legacy] NASCAR Xfinity Chevrolet Camaro - 2014",
+      "status": "mapped",
+      "source": "exact_rule_seed"
+    },
+    "stockcars2\\nwford2013": {
+      "mid": 140,
+      "slug": "Legacy-NASCAR-Xfinity-Ford-Mustang--2016",
+      "category": "Oval",
+      "iracing_name": "[Legacy] NASCAR Xfinity Ford Mustang - 2016",
+      "status": "mapped",
+      "source": "exact_rule_seed"
+    },
+    "stockcars2\\supra2019": {
+      "mid": 205,
+      "slug": "NASCAR-OReilly-Toyota-Supra",
+      "category": "Oval",
+      "iracing_name": "NASCAR Xfinity Toyota Supra",
+      "status": "mapped",
+      "source": "exact_rule_seed"
+    },
+    "stockcars\\buicklesabre87": {
+      "mid": 240,
+      "slug": "NASCAR-Legends-Buick-LeSabre--1987",
+      "category": "Oval",
+      "iracing_name": "NASCAR Legends Buick LeSabre - 1987",
+      "status": "mapped",
+      "source": "exact_rule_seed"
+    },
+    "stockcars\\camarozl12018": {
+      "mid": 191,
+      "slug": "NASCAR-Cup-Series-Chevrolet-Camaro-ZL1-Gen-6",
+      "category": "Oval",
+      "iracing_name": "NASCAR Cup Series Chevrolet Camaro ZL1",
+      "status": "mapped",
+      "source": "exact_rule_seed"
+    },
+    "stockcars\\camarozl12022": {
+      "mid": 227,
+      "slug": "NASCAR-Cup-Series-Next-Gen-Chevrolet-Camaro-ZL1",
+      "category": "Oval",
+      "iracing_name": "NASCAR Cup Series Next Gen Chevrolet Camaro ZL1",
+      "status": "mapped",
+      "source": "exact_rule_seed"
+    },
+    "stockcars\\chevymontecarlo03": {
+      "mid": 297,
+      "slug": "Gen-4-Chevrolet-Monte-Carlo--2003",
+      "category": "Oval",
+      "iracing_name": "NASCAR Gen 4 Chevrolet Monte Carlo - 2003",
+      "status": "mapped",
+      "source": "exact_rule_seed"
+    },
+    "stockcars\\chevymontecarlo87": {
+      "mid": 215,
+      "slug": "NASCAR-Legends-Chevrolet-Monte-Carlo--1987",
+      "category": "Oval",
+      "iracing_name": "NASCAR Legends Chevrolet Monte Carlo - 1987",
+      "status": "mapped",
+      "source": "exact_rule_seed"
+    },
+    "stockcars\\chevyss": {
+      "mid": 136,
+      "slug": "Legacy-NASCAR-Cup-Chevrolet-SS--2013",
+      "category": "Oval",
+      "iracing_name": "[Legacy] NASCAR Cup Chevrolet SS - 2013",
+      "status": "mapped",
+      "source": "exact_rule_seed"
+    },
+    "stockcars\\fordfusion": {
+      "mid": 137,
+      "slug": "Legacy-NASCAR-Cup-Ford-Fusion--2016",
+      "category": "Oval",
+      "iracing_name": "[Legacy] NASCAR Cup Ford Fusion - 2016",
+      "status": "mapped",
+      "source": "exact_rule_seed"
+    },
+    "stockcars\\fordmustang2019": {
+      "mid": 199,
+      "slug": "NASCAR-Cup-Series-Ford-Mustang-Gen-6",
+      "category": "Oval",
+      "iracing_name": "NASCAR Cup Series Ford Mustang",
+      "status": "mapped",
+      "source": "exact_rule_seed"
+    },
+    "stockcars\\fordmustang2022": {
+      "mid": 228,
+      "slug": "NASCAR-Cup-Series-Next-Gen-Ford-Mustang",
+      "category": "Oval",
+      "iracing_name": "NASCAR Cup Series Next Gen Ford Mustang",
+      "status": "mapped",
+      "source": "exact_rule_seed"
+    },
+    "stockcars\\fordtaurus03": {
+      "mid": 299,
+      "slug": "Gen-4-Ford-Taurus--2003",
+      "category": "Oval",
+      "iracing_name": "NASCAR Gen 4 Ford Taurus - 2003",
+      "status": "mapped",
+      "source": "exact_rule_seed"
+    },
+    "stockcars\\fordthunderbird87": {
+      "mid": 216,
+      "slug": "NASCAR-Legends-Ford-Thunderbird--1987",
+      "category": "Oval",
+      "iracing_name": "NASCAR Legends Ford Thunderbird - 1987",
+      "status": "mapped",
+      "source": "exact_rule_seed"
+    },
+    "stockcars\\impala": {
+      "mid": 104,
+      "slug": "Legacy-NASCAR-Cup-Chevrolet-Impala-COT--2009",
+      "category": "Oval",
+      "iracing_name": "[Legacy] NASCAR Cup Chevrolet Impala COT - 2009",
+      "status": "mapped",
+      "source": "exact_rule_seed"
+    },
+    "stockcars\\pontiacgrandprix87": {
+      "mid": 266,
+      "slug": "NASCAR-Legends-Pontiac-Grand-Prix--1987",
+      "category": "Oval",
+      "iracing_name": "NASCAR Legends Pontiac Grand Prix - 1987",
+      "status": "mapped",
+      "source": "exact_rule_seed"
+    },
+    "stockcars\\toyotacamry": {
+      "mid": 146,
+      "slug": "NASCAR-Cup-Series-Toyota-Camry-Gen-6",
+      "category": "Oval",
+      "iracing_name": "NASCAR Cup Series Toyota Camry",
+      "status": "mapped",
+      "source": "exact_rule_seed"
+    },
+    "stockcars\\toyotacamry2022": {
+      "mid": 229,
+      "slug": "NASCAR-Cup-Series-Next-Gen-Toyota-Camry",
+      "category": "Oval",
+      "iracing_name": "NASCAR Cup Series Next Gen Toyota Camry",
+      "status": "mapped",
+      "source": "exact_rule_seed"
+    },
+    "streetstock": {
+      "mid": 128,
+      "slug": "Street-Stock--Panther-C1",
+      "category": "Oval",
+      "tp_name": "Street Stock - Panther C1",
+      "iracing_name": "Street Stock",
+      "status": "mapped",
+      "source": "manual_review_promoted"
+    },
+    "streetstock\\streetstock2": {
+      "mid": 280,
+      "slug": "Street-Stock--Casino-M2",
+      "category": "Oval",
+      "iracing_name": "Street Stock - Casino",
+      "status": "mapped",
+      "source": "exact_rule_seed"
+    },
+    "streetstock\\streetstock3": {
+      "mid": 281,
+      "slug": "Street-Stock--Eagle-T3",
+      "category": "Oval",
+      "iracing_name": "Street Stock - Eagle",
+      "status": "mapped",
+      "source": "exact_rule_seed"
+    },
+    "subaruwrxsti": {
+      "mid": 189,
+      "slug": "Subaru-WRX-STI",
+      "category": "Road",
+      "tp_name": "Subaru WRX STI",
+      "iracing_name": "Subaru WRX STI",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "supercars\\fordmustanggen3": {
+      "mid": 289,
+      "slug": "Supercars-Ford-Mustang-Gen-3",
+      "category": "Road",
+      "iracing_name": "Supercars Ford Mustang Gen 3",
+      "status": "mapped",
+      "source": "exact_rule_seed"
+    },
+    "superformulalights324": {
+      "mid": 270,
+      "slug": "Super-Formula-Lights",
+      "category": "Road",
+      "tp_name": "Super Formula Lights",
+      "iracing_name": "Super Formula Lights",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "superformulasf23\\honda": {
+      "mid": 268,
+      "slug": "Super-Formula-SF23",
+      "category": "Road",
+      "iracing_name": "Super Formula SF23 - Honda",
+      "status": "mapped",
+      "source": "exact_rule_seed"
+    },
+    "superformulasf23\\toyota": {
+      "mid": 268,
+      "slug": "Super-Formula-SF23",
+      "category": "Road",
+      "iracing_name": "Super Formula SF23 - Toyota",
+      "status": "mapped",
+      "source": "exact_rule_seed"
+    },
+    "superlatemodel": {
+      "mid": 225,
+      "slug": "Super-Late-Model",
+      "category": "Oval",
+      "tp_name": "Super Late Model",
+      "iracing_name": "Super Late Model",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "toyotagr86": {
+      "mid": 252,
+      "slug": "Toyota-GR86",
+      "category": "Road",
+      "tp_name": "Toyota GR86",
+      "iracing_name": "Toyota GR86",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "trucks\\fordf150": {
+      "mid": 214,
+      "slug": "NASCAR-Truck-Ford-F150",
+      "category": "Oval",
+      "iracing_name": "NASCAR Truck Ford F150",
+      "status": "mapped",
+      "source": "exact_rule_seed"
+    },
+    "trucks\\silverado": {
+      "mid": 107,
+      "slug": "Legacy-NASCAR-Truck-Chevrolet-Silverado--2008",
+      "category": "Oval",
+      "iracing_name": "[Legacy] NASCAR Truck Chevrolet Silverado - 2008",
+      "status": "mapped",
+      "source": "exact_rule_seed"
+    },
+    "trucks\\silverado2019": {
+      "mid": 200,
+      "slug": "NASCAR-Truck-Chevrolet-Silverado",
+      "category": "Oval",
+      "iracing_name": "NASCAR Truck Chevrolet Silverado",
+      "status": "mapped",
+      "source": "exact_rule_seed"
+    },
+    "trucks\\toyotatundra2022": {
+      "mid": 244,
+      "slug": "NASCAR-Truck-Toyota-Tundra-TRD-Pro",
+      "category": "Oval",
+      "iracing_name": "NASCAR Truck Toyota Tundra TRD Pro",
+      "status": "mapped",
+      "source": "exact_rule_seed"
+    },
+    "usf2000usf17": {
+      "mid": 212,
+      "slug": "USF-2000",
+      "category": "Road",
+      "tp_name": "USF 2000",
+      "iracing_name": "USF 2000",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "v8supercars\\ford2014": {
+      "mid": 152,
+      "slug": "Legacy-V8-Supercar-Ford-FG-Falcon--2014",
+      "category": "Road",
+      "iracing_name": "[Legacy] V8 Supercar Ford FG Falcon - 2014",
+      "status": "mapped",
+      "source": "exact_rule_seed"
+    },
+    "v8supercars\\fordmustanggt": {
+      "mid": 208,
+      "slug": "Legacy-Supercars-Ford-Mustang-GT",
+      "category": "Road",
+      "iracing_name": "Supercars Ford Mustang GT",
+      "status": "mapped",
+      "source": "exact_rule_seed"
+    },
+    "v8supercars\\holden2014": {
+      "mid": 150,
+      "slug": "Legacy-V8-Supercar-Holden-VF-Commodore--2014",
+      "category": "Road",
+      "iracing_name": "[Legacy] V8 Supercar Holden VF Commodore - 2014",
+      "status": "mapped",
+      "source": "exact_rule_seed"
+    },
+    "v8supercars\\holden2019": {
+      "mid": 207,
+      "slug": "Legacy-Supercars-Holden-ZB-Commodore",
+      "category": "Road",
+      "iracing_name": "Supercars Holden ZB Commodore",
+      "status": "mapped",
+      "source": "exact_rule_seed"
+    },
+    "vwbeetlegrc": {
+      "mid": 184,
+      "slug": "VW-Beetle",
+      "category": "Road",
+      "tp_name": "VW Beetle",
+      "iracing_name": "VW Beetle",
+      "status": "mapped",
+      "source": "autopromoted_missing_score100"
+    },
+    "vwbeetlegrc\\lite": {
+      "mid": 231,
+      "slug": "VW-Beetle--Lite",
+      "category": "Road",
+      "iracing_name": "VW Beetle Lite",
+      "status": "mapped",
+      "source": "exact_rule_seed"
+    },
+    "audir8gt3": {
+      "mid": 162,
+      "slug": "Legacy-Audi-R8-LMS",
+      "category": "Road",
+      "tp_name": "[Legacy] Audi R8 LMS",
+      "iracing_name": "[Legacy] Audi R8 LMS GT3",
+      "status": "mapped",
+      "source": "manual_cli_review"
+    },
+    "bmwm4evogt4": {
+      "mid": 285,
+      "slug": "BMW-M4-G82-GT4-Evo",
+      "category": "Road",
+      "tp_name": "BMW M4 G82 GT4 Evo",
+      "iracing_name": "BMW M4 G82 GT4",
+      "status": "mapped",
+      "source": "manual_cli_review"
+    },
+    "bmwm4gt3": {
+      "mid": 224,
+      "slug": "BMW-M4-GT3-EVO",
+      "category": "Road",
+      "tp_name": "BMW M4 GT3 EVO",
+      "iracing_name": "BMW M4 GT3",
+      "status": "mapped",
+      "source": "manual_cli_review"
+    },
+    "mclarenmp4": {
+      "mid": 135,
+      "slug": "McLaren-MP412C-GT3",
+      "category": "Road",
+      "tp_name": "McLaren MP4-12C GT3",
+      "iracing_name": "[Legacy] McLaren MP4-12C GT3",
+      "status": "mapped",
+      "source": "manual_cli_review"
+    },
+    "ministock": {
+      "mid": 286,
+      "slug": "Mini-Stocks",
+      "category": "Oval",
+      "tp_name": "Mini Stocks",
+      "iracing_name": "Mini Stock",
+      "status": "mapped",
+      "source": "manual_cli_review"
+    }
+  },
+  "unsupported": {
+    "mercedesw12": {
+      "iracing_name": "Mercedes-AMG W12 E Performance",
+      "status": "unsupported_in_tp"
+    },
+    "mercedesw13": {
+      "iracing_name": "Mercedes-AMG W13 E Performance",
+      "status": "unsupported_in_tp"
+    },
+    "williamsfw31": {
+      "iracing_name": "Williams FW31",
+      "status": "unsupported_in_tp"
+    },
+    "cars": {
+      "iracing_name": "Official Car Name",
+      "status": "unsupported_in_tp",
+      "source": "manual_cli_review"
+    }
+  }
+}
