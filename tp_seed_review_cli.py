@@ -3,7 +3,7 @@
 """Incremental CLI reviewer for Trading Paints showroom mapping seeds.
 
 Usage example:
-    python tp_seed_review_cli.py --seed tp_showroom_mapping.seed.autopromoted.json
+    python tp_seed_review_cli.py --seed tp_showroom_mapping.seed.json
 
 What it does:
 - loads an existing TP showroom seed used by Nishizumi Paints
