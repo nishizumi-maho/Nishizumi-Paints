@@ -89,6 +89,18 @@ Benefits:
 
 Important detail: you can be **racing on one iRacing account** while the app is **logged in to another Trading Paints account** for the online fallback workflow. That is the intended mule-account setup.
 
+**You can create a secondary account for FREE by subscribing to iRacing through a new Steam account.**
+
+Create a new Steam account.
+Subscribe to iRacing for 1 month.
+Go to the iRacing member site and complete the account validation.
+Log in to Trading Paints using this new iRacing account.
+Save your iRacing ID.
+Request a refund on Steam.
+
+You don’t need to open or play the game on the secondary account. The only goal is to create the account, link it to Trading Paints, and save the iRacing ID.
+Even after the refund is processed and the subscription expires, you can still access the iRacing ID through the member site. However, it’s much easier to retrieve and save the ID before submitting the refund request.
+
 ### Is it safe to log in through the app
 
 The app does **not** ask you to type your Trading Paints password into a custom text field inside Nishizumi Paints.
