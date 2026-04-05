@@ -17,16 +17,17 @@ The app is designed so a normal user can:
 This README reflects the current app flow and interface, including:
 
 - startup mode selection (**normal window** or **console/headless**)
-- the **Quick Start** wizard
-- separate **AI** and **Random** tabs
+- the **Quick Start** wizard, including automatic **iRacing Documents** folder detection and confirmation
+- five visible tabs: **Session**, **General**, **AI**, **Random**, and **Logs**
 - the **Online Trading Paints** fallback workflow
 - support for a **secondary / smurf / mule** Trading Paints account
 - the **TP manifest member ID override** field
-- **TP mule fast mode**
+- separate **FAST MODE** and **MULE MODE** options
+- a **Disconnect** action for the saved Trading Paints login
 - optional **showroom total-page detection**
 - a **local random paints pool** that still matters even when Online is selected
-- a **bundled / embedded browser runtime** workflow for Trading Paints login
-- the new **Session Total** worker mode
+- a **bundled or installed Chromium-based browser** workflow for Trading Paints login
+- the **Session Total** worker mode, now the default for new configs
 - **incremental same-session roster refreshes** instead of redownloading the whole session
 - separate **car / suit / helmet** session states
 - support for **helmet** and **suit** fallback handling
@@ -165,7 +166,7 @@ If you want the best beginner-friendly setup: use the normal window mode, go thr
 - [Logs tab](#logs-tab)
 - [Trading Paints login flow](#trading-paints-login-flow)
 - [TP manifest member ID override](#tp-manifest-member-id-override)
-- [TP mule fast mode](#tp-mule-fast-mode)
+- [FAST MODE and MULE MODE](#fast-mode-and-mule-mode)
 - [Optional showroom total-page detection](#optional-showroom-total-page-detection)
 - [How the local random paints pool works](#how-the-local-random-paints-pool-works)
 - [AI support](#ai-support)
@@ -380,6 +381,8 @@ The app can still fall back to installed Chromium-based browsers such as:
 - Microsoft Edge
 - Brave
 - Chromium
+- Brave
+- Chromium
 
 ### Practical recommendation
 
@@ -395,17 +398,20 @@ The intended normal flow is:
 
 1. choose **normal window** or **console**
 2. go through the **Quick Start** wizard
-3. choose Local or Online fallback preference
-4. connect Trading Paints if using Online
-5. finish setup
-6. leave the app running and go race
+3. confirm the **iRacing Documents** folder the app found automatically, or choose it manually
+4. choose what kinds of missing paints should be randomized
+5. choose Local or Online as the preferred source
+6. connect Trading Paints if using Online
+7. finish setup
+8. leave the app running and go race
 
 For most users, the best first setup is:
 
 - **normal window** first
+- confirm the detected **iRacing Documents** folder
 - **Online** preferred source
 - **secondary mule account** if available
-- **TP mule fast mode** enabled only for that secondary account
+- leave **FAST MODE** enabled unless you are intentionally switching to dedicated **MULE MODE** behavior
 
 ---
 
@@ -418,16 +424,18 @@ It appears on first setup and is meant to help a non-technical user finish the i
 The wizard walks through:
 
 1. **Startup mode guidance**
-2. **Missing paint fallback targets**
-3. **Preferred source**
+2. **Check the iRacing Documents folder**
+3. **Missing paint fallback targets**
 4. **Trading Paints login**
 5. **Ready / final recommendations**
 
 ### Important Quick Start behavior
 
+- the wizard automatically searches for the **iRacing Documents** folder and asks you to confirm it before you can finish
+- if automatic search does not find the folder, you can choose it manually from the wizard
+- the **Random cars**, **Random helmets**, and **Random suits** options for both **Real Drivers** and **AI** start enabled by default
 - if you choose **Online**, you cannot finish Quick Start until the Trading Paints login succeeds
-- if you connect a **smurf / mule** account there, the app automatically enables **TP mule fast mode** for that profile
-- after a successful smurf login, the app asks for the **secondary Trading Paints member ID**
+- if you connect a **smurf / mule** account there, the app can prompt for the secondary Trading Paints member ID after login
 - if the login succeeds during Quick Start, the app waits and only restarts **after** the wizard is finished
 
 ---
@@ -460,13 +468,15 @@ GUI and console/headless use the same settings file.
 
 ## User interface overview
 
-The current UI has **five tabs**:
+The current UI has **five visible tabs**:
 
 - **Session**
 - **General**
 - **AI**
 - **Random**
 - **Logs**
+
+There is **no visible Experimental tab** in the current UI. The options that matter for normal use live in the regular tabs, mainly **Random** and **General**.
 
 The idea is:
 
@@ -518,7 +528,7 @@ The separate **car / suit / helmet** columns are there so the user can see exact
 
 ## General tab
 
-The **General** tab now contains the broad app settings, the action buttons, download worker settings, and the **Local random paints pool** controls.
+The **General** tab now contains the broad app settings, the action buttons, the detected **iRacing Documents** folder controls, the download worker settings, and the **Local random paints pool** controls.
 
 ### General settings
 
@@ -527,6 +537,18 @@ The **General** tab now contains the broad app settings, the action buttons, dow
 - **Keep running in background on close**
 - **Auto refresh paints**
 - **Check for updates automatically**
+
+### iRacing Documents folder
+
+The app stores and uses a configurable **iRacing Documents** root instead of assuming only one fixed path forever.
+
+Controls include:
+
+- the current detected/saved path in a read-only field
+- **Change...**
+- **Default**
+
+When you confirm a new location, the app restarts so the new path is applied cleanly.
 
 ### Session settings
 
@@ -591,14 +613,22 @@ The **AI** tab now contains only AI-related actions that are not the general ran
 
 ## Random tab
 
-The **Random** tab is now meant to feel more like a guided setup flow.
+The **Random** tab is meant to feel like a guided setup flow.
 
 ### Step 1 • Who should get fallback paints?
 
-- **Fallback for drivers without a TP paint**
-- **Fallback for AI drivers without a TP paint**
+The current visible controls are grouped as:
 
-These are both enabled by default.
+- **Random cars**
+- **Random helmets**
+- **Random suits**
+
+Each group has separate toggles for:
+
+- **Real Drivers**
+- **AI**
+
+On a fresh config, all of these fallback targets start enabled by default.
 
 ### Step 2 • Preferred source
 
@@ -607,22 +637,26 @@ Options:
 - **Local**
 - **Online**
 
-The preferred source now defaults to **Online**.
-
-If the user switches to **Local**, the app can show a final reminder encouraging the user to consider **Online**, because it usually gives better variety.
+The preferred source defaults to **Online**.
 
 ### Step 3 • Online Trading Paints
 
-This area stays visible even when Local is the selected preference.
-The goal is to keep the logic clear:
+This area stays visible even when **Local** is the selected preference so you can prepare the online settings in advance.
 
-- Local can be the selected preference
-- Online settings can still be prepared in advance
-- the local pool still matters either way
+The Online area contains:
 
-When Local is selected, the Online area can visually show that it is **OFF** for the current preference while still allowing configuration.
+- connection status
+- **Connect Trading Paints**
+- **I logged in**
+- **Disconnect**
+- **Showroom**
+- **Auth profile**
+- the **TP manifest member ID override** field
+- **Use FAST MODE**
+- **Use MULE MODE (Secondary account only!!!)**
+- **Detect showroom total pages (slower)**
 
-The login flow can use a bundled browser runtime if your release package includes one.
+When **Local** is selected, the Online area can still stay configured but visibly show that it is not the active preference right now.
 
 ---
 
@@ -655,10 +689,12 @@ You can connect Trading Paints from the **Random** tab or through **Quick Start*
 
 ### Account choice popup
 
-The app now asks whether you want to connect:
+The app asks whether you want to connect:
 
 - **Primary account**
 - **Smurf / mule account**
+
+If you choose **Primary account** while **MULE MODE** is enabled, Nishizumi Paints turns **MULE MODE** off automatically for protection before continuing.
 
 ### Browser instruction popup
 
@@ -666,9 +702,10 @@ Then the app explains that the browser will open and that you should:
 
 1. log in to Trading Paints
 2. wait until site authentication finishes
-3. minimize the browser
-4. come back to Nishizumi Paints
-5. click **I logged in**
+3. come back to Nishizumi Paints
+4. click **I logged in**
+
+The login flow can use a bundled browser runtime if the release includes one, or a supported installed Chromium-based browser if it does not.
 
 ### Success popup
 
@@ -678,11 +715,17 @@ When the login is confirmed successfully, the app shows:
 
 ### Smurf / mule account extra step
 
-If the connected account is a secondary smurf/mule account, the app then asks for the **Trading Paints member ID** of that account.
+If the connected account is a secondary smurf/mule account, the app can then ask for the **Trading Paints member ID** of that account.
 
-This is important because the app cannot automatically infer the secondary member ID from your main iRacing local user.
+This matters because the app cannot infer that secondary member ID from the main iRacing account currently racing in the session.
 
-If the user skips this or enters the wrong value, online fallback may later fail and the log will tell them to fix the member ID override.
+### Disconnect action
+
+The current UI also includes a **Disconnect** button in the Random tab and in Quick Start.
+
+It clears the saved Trading Paints browser/profile data on the PC so the app no longer treats that account as connected.
+
+That button stays disabled when no confirmed Trading Paints account is currently connected.
 
 ---
 
@@ -709,26 +752,43 @@ If the member ID is wrong, the app may switch paints on the connected account bu
 
 ---
 
-## TP mule fast mode
+## FAST MODE and MULE MODE
 
-This option should be used **only** when the connected Trading Paints account is a **secondary mule account**.
+The current build exposes two separate speed-related options in the Online Trading Paints area.
+
+### FAST MODE
+
+**FAST MODE** is enabled by default on new configs.
+
+It can be used with either:
+
+- a **primary account**
+- a **secondary mule account**
 
 What it does:
 
-- skips original-scheme capture
-- skips final original-scheme restore
-- skips slow dashboard confirmation loops
+- keeps the backup/restore protection flow
+- saves the current paint state
+- restores the original paint at the end
+- skips the slow dashboard verification loop after each fallback swap to gain speed
+
+This is the safer faster option for most users.
+
+### MULE MODE
+
+**MULE MODE** is only for a dedicated **secondary mule account**.
+
+What it does:
+
+- skips the protection/restore checks
 - polls the manifest more directly after each `setScheme`
+- leaves that account on the last loaded paint instead of restoring the original one
 
-This makes the online fallback faster and cleaner for a mule account.
+This is faster and simpler for a dedicated mule account, but it is intentionally more aggressive.
 
-### Do not use mule fast mode on your normal main account unless you fully understand the behavior
+### Important rule
 
-Why:
-
-- in mule fast mode, the app does not restore the original paint at the end
-- that is fine for a dedicated mule account
-- that is usually **not** what a normal user wants on their main account
+Do **not** enable both at the same time. Use **FAST MODE** or **MULE MODE**, not both together.
 
 ---
 
@@ -838,6 +898,8 @@ Manual controls:
 
 Allowed range: **1 to 100**
 
+Fresh configs start the manual fields at **100 / 100 / 100**, but those values only matter if you actually switch the worker mode to **Manual**.
+
 ### Saved choice
 
 The selected worker mode is stored in the normal settings file, so the app remembers whether you left it on **Session Total**, **Auto**, or **Manual**.
@@ -876,6 +938,7 @@ This can help preserve the paint set of a session for replay use later.
 - **Refresh paints**
 - **Paint folder**
 - **Check updates**
+- **Change...** and **Default** for the iRacing Documents folder
 
 ### General > Local random paints pool
 
@@ -897,9 +960,13 @@ This can help preserve the paint set of a session for replay use later.
 
 - **Connect Trading Paints**
 - **I logged in**
+- **Disconnect**
 - **Showroom**
 - **Auth profile**
 - **OK** for member ID override
+- **Use FAST MODE**
+- **Use MULE MODE (Secondary account only!!!)**
+- **Detect showroom total pages (slower)**
 
 ### Logs tab
 
@@ -938,8 +1005,10 @@ Important behavior:
 ### Local paint folder
 
 ```text
-Documents\iRacing\paint
+<selected iRacing Documents folder>\paint
 ```
+
+By default the app tries to auto-detect the iRacing Documents root. You can also change it later from the **General** tab.
 
 ### Random pool folder
 
@@ -950,7 +1019,7 @@ Documents\iRacing\paint
 ### AI rosters folder
 
 ```text
-Documents\iRacing\airosters
+<selected iRacing Documents folder>\airosters
 ```
 
 ### AI livery folder
@@ -967,7 +1036,11 @@ Documents\iRacing\airosters
 
 ### Trading Paints auth profile
 
-This is the persistent browser profile the app uses for the online Trading Paints workflow.
+```text
+%APPDATA%\Nishizumi-Paints\TPAuthProfile
+```
+
+This is the persistent browser/profile folder the app uses for the online Trading Paints workflow.
 
 ### Temporary working folder
 
