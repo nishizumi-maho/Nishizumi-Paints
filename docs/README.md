@@ -14,7 +14,7 @@ The app is designed so a normal user can:
 - join sessions in iRacing
 - let the app handle paint downloading and fallback automatically
 
-This README reflects the current app flow and interface, including:
+This README reflects the current app flow and interface in the current 3.9.3 script, including:
 
 - startup mode selection (**normal window** or **console/headless**)
 - the **Quick Start** wizard, including automatic **iRacing Documents** folder detection and confirmation
@@ -425,20 +425,20 @@ The wizard walks through:
 
 1. **Startup mode guidance**
 2. **Check the iRacing Documents folder**
-3. **Missing paint fallback targets**
-4. **Trading Paints login**
-5. **Ready / final recommendations**
+3. **Download worker mode**
+4. **Missing paint fallback**
+5. **Trading Paints login**
+6. **Ready / final recommendations**
 
 ### Important Quick Start behavior
 
 - the wizard automatically searches for the **iRacing Documents** folder and asks you to confirm it before you can finish
 - if automatic search does not find the folder, you can choose it manually from the wizard
+- the wizard includes a simple **Session Total vs Auto** worker-mode choice, with **Session Total** presented as the default and fastest option
 - the **Random cars**, **Random helmets**, and **Random suits** options for both **Real Drivers** and **AI** start enabled by default
 - if you choose **Online**, you cannot finish Quick Start until the Trading Paints login succeeds
 - if you connect a **smurf / mule** account there, the app can prompt for the secondary Trading Paints member ID after login
 - if the login succeeds during Quick Start, the app waits and only restarts **after** the wizard is finished
-
----
 
 ## Startup mode selector
 
@@ -454,17 +454,14 @@ It lets you choose:
 - **Normal window** is recommended for initial setup
 - **Console / headless** is for advanced users after the app is already configured
 
-The app also reminds the user that the startup selector can be shown again by:
+The app reminds the user that the startup selector can be shown again by:
 
 - holding **Shift** while opening the app
-- using `--gui`
-- resetting the program settings
+- resetting the saved app settings so the first-run flow appears again
 
 ### Shared settings
 
 GUI and console/headless use the same settings file.
-
----
 
 ## User interface overview
 
@@ -492,9 +489,10 @@ The idea is:
 
 The **Session** tab shows the live session and the per-driver status.
 
+Above the list, the app shows a short **current session** summary and a live status summary.
+
 The current driver list includes columns such as:
 
-- overall state
 - **car** state
 - **suit** state
 - **helmet** state
@@ -503,6 +501,8 @@ The current driver list includes columns such as:
 - license
 - safety rating
 - name
+
+There is **not** a separate overall-state column in the current table. Instead, the important status is shown directly in the **car / suit / helmet** columns with colored text.
 
 ### Important fallback labels
 
@@ -524,11 +524,9 @@ Other states can include:
 
 The separate **car / suit / helmet** columns are there so the user can see exactly which asset type is missing, queued, downloaded, or resolved by fallback.
 
----
-
 ## General tab
 
-The **General** tab now contains the broad app settings, the action buttons, the detected **iRacing Documents** folder controls, the download worker settings, and the **Local random paints pool** controls.
+The **General** tab now contains the broad app settings, the action buttons, the detected **iRacing Documents** folder controls, the download worker settings, the online fallback performance controls, and the **Local random paints pool** controls.
 
 ### General settings
 
@@ -555,6 +553,7 @@ When you confirm a new location, the app restarts so the new path is applied cle
 - **Update my own paints**
 - **Keep my livery locally**
 - **Delete live session paints**
+- **Do not apply random paints in team events**
 
 ### Download settings
 
@@ -563,10 +562,22 @@ When you confirm a new location, the app restarts so the new path is applied cle
 - **Manual downloads**
 - **Manual saves**
 
+### Online fallback performance
+
+The current General tab also includes a dedicated **Online fallback lanes** block with:
+
+- **Lane mode**
+- **Manual max lanes**
+- **Process cars, helmets, and suits together online (advanced)**
+- **Retry timed-out online fallbacks at the end before local fallback**
+
+This is where the user controls how aggressively the app runs concurrent online showroom fallback work.
+
 ### Actions
 
 - **Clear downloaded**
 - **Refresh paints**
+- **Trigger global reload**
 - **Paint folder**
 - **Check updates**
 
@@ -582,11 +593,12 @@ Controls include:
 
 - **Recycle downloaded TP car paints into the local random pool**
 - **Max size (GB)**
+- per-category size caps for **Cars**, **Helmets**, and **Suits**
 - **Open pool**
 - **Clean pool now**
 - **Rebuild from current files**
 
----
+The category caps are normalized automatically so their combined size stays inside the total pool size.
 
 ## AI tab
 
@@ -595,6 +607,19 @@ The **AI** tab now contains only AI-related actions that are not the general ran
 ### AI sync
 
 - **Sync TP AI rosters**
+- the **iRacing member ID for AI collections** field and its **OK** action
+
+If this member ID field is empty, the app can auto-fill it once from the first active iRacing account it sees through the SDK.
+
+### TP collection roster random fallback
+
+When the active AI roster is a synced Trading Paints collection, the AI tab also exposes:
+
+- **Do not download random AI cars**
+- **Do not download random AI helmets**
+- **Do not download random AI suits**
+
+These options help avoid replacing collection paints with random fallback assets.
 
 ### AI actions
 
@@ -608,8 +633,6 @@ The **AI** tab now contains only AI-related actions that are not the general ran
 
 - **AI rosters**
 - **AI livery folder**
-
----
 
 ## Random tab
 
@@ -658,8 +681,6 @@ The Online area contains:
 
 When **Local** is selected, the Online area can still stay configured but visibly show that it is not the active preference right now.
 
----
-
 ## Logs tab
 
 The **Logs** tab now contains:
@@ -668,6 +689,7 @@ The **Logs** tab now contains:
 - **Verbose logs**
 - **Show TP monitor**
 - **Export log**
+- **Reset TP monitor**
 - **Reset app settings**
 
 ### Reset app settings
@@ -680,8 +702,6 @@ After resetting settings, the app should show the startup flow again, including:
 
 - startup mode selection
 - first-time Quick Start
-
----
 
 ## Trading Paints login flow
 
@@ -904,6 +924,25 @@ Fresh configs start the manual fields at **100 / 100 / 100**, but those values o
 
 The selected worker mode is stored in the normal settings file, so the app remembers whether you left it on **Session Total**, **Auto**, or **Manual**.
 
+### Online fallback lanes
+
+Separate from the normal download workers, the General tab also has an **Online fallback lanes** area for the Trading Paints showroom path.
+
+Options include:
+
+- **Safe**
+- **Session Total**
+- **Manual**
+- **Manual max lanes**
+- **Process cars, helmets, and suits together online (advanced)**
+- **Retry timed-out online fallbacks at the end before local fallback**
+
+In simple terms:
+
+- **Safe** = one online car lane at a time
+- **Session Total** = one car lane per active car group
+- **Manual** = you cap the concurrent online car lanes yourself
+
 ---
 
 ## Same-session roster changes
@@ -936,6 +975,7 @@ This can help preserve the paint set of a session for replay use later.
 
 - **Clear downloaded**
 - **Refresh paints**
+- **Trigger global reload**
 - **Paint folder**
 - **Check updates**
 - **Change...** and **Default** for the iRacing Documents folder
@@ -946,8 +986,16 @@ This can help preserve the paint set of a session for replay use later.
 - **Clean pool now**
 - **Rebuild from current files**
 
+### General > Online fallback lanes
+
+- **Lane mode**
+- **Manual max lanes**
+- **Process cars, helmets, and suits together online (advanced)**
+- **Retry timed-out online fallbacks at the end before local fallback**
+
 ### AI tab
 
+- **OK** for the AI collections member ID field
 - **Sync AI rosters**
 - **Clone active AI roster**
 - **Randomize active AI roster**
@@ -973,8 +1021,6 @@ This can help preserve the paint set of a session for replay use later.
 - **Export log**
 - **Reset TP monitor**
 - **Reset app settings**
-
----
 
 ## Command-line options
 
@@ -1034,6 +1080,12 @@ By default the app tries to auto-detect the iRacing Documents root. You can also
 %APPDATA%\Nishizumi-Paints\ReplayPacks
 ```
 
+### Session exports folder
+
+```text
+%APPDATA%\Nishizumi-Paints\Exports
+```
+
 ### Trading Paints auth profile
 
 ```text
@@ -1055,6 +1107,8 @@ Depending on your build/release layout, the EXE can also use a browser kept next
 ```text
 embedded_browser
 ```
+
+Other supported local layouts can also include folders such as `browser`, `chrome`, `chrome_runtime`, `chrome-portable`, or `ms-playwright`, as long as they contain a compatible Chromium-based runtime the app can launch.
 
 ---
 
