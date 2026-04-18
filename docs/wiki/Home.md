@@ -1,5 +1,7 @@
 # Nishizumi Paints Wiki
 
+This folder is the versioned source for the Nishizumi Paints manual. It is written so it can also be mirrored into the GitHub wiki when the repository wiki has been initialized.
+
 Nishizumi Paints is a Windows desktop application for iRacing that automates Trading Paints downloads and fills missing liveries with configurable random fallback sources.
 
 ## What the app does
