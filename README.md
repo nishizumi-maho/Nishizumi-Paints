@@ -3,7 +3,9 @@
 Nishizumi Paints is a Windows desktop companion for iRacing that downloads Trading Paints liveries, applies them automatically, and fills missing car, helmet, and suit assets with configurable random fallback sources.
 
 [Download the latest release](https://github.com/nishizumi-maho/Nishizumi-Paints/releases/latest)
+;
 [Read the full manual](./docs/wiki/Home.md)
+;
 [View the changelog](./CHANGELOG.md)
 [Read the unofficial Trading Paints API notes](./trading_paints_unofficial_api_sdk.md)
 [Security policy](./SECURITY.md)
