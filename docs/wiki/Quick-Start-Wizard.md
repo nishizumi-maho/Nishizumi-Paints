@@ -1,44 +1,68 @@
 # Quick Start Wizard
 
-The Quick Start wizard is the recommended first-run path.
+The Quick Start wizard is the intended first-run path for the app. It is designed to get a new user into a safe working state without having to understand every advanced option first.
 
 ## What it configures
 
-- UI mode: Easy or Advanced
+- Easy mode or Advanced mode
 - iRacing Documents folder
-- AI member ID support
-- random fallback scope
-- startup/background defaults
+- AI member ID
+- random fallback scope for cars, helmets, and suits
+- startup and background behavior
+- default fallback mode and safe worker defaults
 
 ## Easy mode versus Advanced mode
 
 ### Easy mode
 
-Use Easy mode if you want:
+Choose Easy mode when the goal is:
 
-- the app to work with minimal decisions
-- the essential random fallback controls visible immediately
-- fewer tabs and less visual clutter
+- quick setup
+- minimal visual clutter
+- safe defaults
+- keeping only the most important monitoring and random fallback controls visible
+
+Easy mode still gives access to the core fallback behavior. The app does not become weaker; it simply hides most of the advanced panels.
 
 ### Advanced mode
 
-Use Advanced mode if you want:
+Choose Advanced mode when the goal is:
 
-- per-driver overrides
-- collection pool management
-- detailed online fallback controls
-- session-level diagnosis and logs
+- full control over live-session behavior
+- detailed worker and lane settings
+- collection pool configuration
+- per-driver override management
+- logs and diagnosis
 
-You can switch between Easy and Advanced mode later from the app itself.
+You can switch between the two modes later from inside the app, so the wizard choice is not permanent.
 
-## iRacing Documents confirmation
+## iRacing Documents detection
 
-The wizard tries to detect the correct iRacing Documents folder automatically. Confirm it before finishing setup, because the paint, replay, and AI roster paths depend on it.
+The wizard attempts to auto-detect the iRacing Documents folder. This matters because the app uses that location for:
+
+- live-session paint output
+- AI rosters
+- replay-pack features
+- session cleanup
+
+If the folder is wrong, the app can still run, but the saved paints will go to the wrong place.
 
 ## AI member ID
 
-The wizard now includes the iRacing member ID field used by AI workflows so users do not have to dig for it later in Advanced mode.
+The app uses an iRacing member ID to discover AI-related collection content and to keep the AI tab ready immediately after setup. The wizard asks for that value up front so the user does not need to dig for it later.
 
-## Review timing
+## Safe defaults applied by the wizard
 
-The showroom mapping review prompt is delayed until after Quick Start completes so new users are not interrupted mid-setup.
+The current 6.0.0 flow defaults to:
+
+- Start with Windows enabled
+- Keep running in background on close enabled
+- auto-refresh enabled
+- public online fallback available
+- random helmets enabled
+- random suits enabled
+- safe worker mode available for general downloading
+
+## Mapping review timing
+
+The showroom mapping review prompt is intentionally delayed until after Quick Start completes. New users should not be interrupted by the mapping workflow before the base setup is finished.

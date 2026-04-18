@@ -9,6 +9,9 @@ build/
 dist/
 installer/output/
 NishizumiPaints.spec
+.playwright-cli/
+wiki_tmp/
+FILES TO SEND/
 
 nishizumi_paints_showroom_downloads/
 embedded_browser/

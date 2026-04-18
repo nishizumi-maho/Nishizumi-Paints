@@ -1,22 +1,40 @@
 # Showroom Tab
 
-The Showroom tab is the manual download area.
+The Showroom tab is the manual import area. It exists for users who want to seed the local pools or export public assets without waiting for a live session to need them.
 
-It is meant for users who want to seed the RandomPool or export public assets outside the live session workflow.
+## Supported manual inputs
 
-## Supported manual sources
+### Trading Paints car ID
 
-### TP car ID
+Enter a public Trading Paints car ID to download public showroom paints for that vehicle.
 
-You can enter a public Trading Paints car ID and download matching public showroom paints.
+This mode is useful when:
 
-### Showroom links
+- you know the Trading Paints vehicle page
+- you want multiple random public paints for one car
+- you want to seed the RandomPool for a specific series before racing
 
-You can paste one or more direct showroom links and let the app fetch those assets.
+### Showroom links or scheme IDs
 
-### Collection URL or ID
+Paste one or more direct showroom links, or even raw scheme IDs, and the app will inspect each one.
 
-You can enter a Trading Paints collection URL or raw collection ID and download every public compatible asset from that collection.
+The app uses the showroom view page to infer:
+
+- whether the scheme is a car, helmet, or suit
+- the scheme title
+- the correct source link
+- the matching iRacing vehicle when possible
+
+### Collection URL or collection ID
+
+Enter a Trading Paints collection URL or raw collection ID and the app will load the collection JSON directly.
+
+The collection importer is meant for:
+
+- curated leagues
+- themed packs
+- seeding the RandomPool or collection pool with mixed vehicles
+- importing public helmets and suits in the same collection flow
 
 ## Destinations
 
@@ -25,6 +43,17 @@ The Showroom tools can save to:
 - the RandomPool
 - a custom folder
 
-## Public-only behavior
+That distinction matters because RandomPool imports are meant for app reuse, while custom-folder exports are just manual downloads for the user.
 
-The no-browser release is centered on public showroom access. Public non-PRO assets are the intended direct-download path here.
+## Public no-browser behavior
+
+The 6.0.0 no-browser release is centered on public showroom access:
+
+- no embedded browser is required for the normal showroom importer
+- no Trading Paints login is required for the main public path
+- public non-numbered, non-PRO assets are the intended direct-download target
+
+## Relationship to RandomPool and collection pool
+
+- importing to RandomPool makes the assets available to later local fallback
+- importing a collection can also populate the collection-specific cache so the app can reuse curated sets later

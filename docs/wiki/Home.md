@@ -1,58 +1,86 @@
 # Nishizumi Paints Wiki
 
-This folder is the versioned source for the Nishizumi Paints manual. It is written so it can also be mirrored into the GitHub wiki when the repository wiki has been initialized.
+This folder is the versioned source of the Nishizumi Paints manual. It is written to stand on its own inside the repository and can also be mirrored to a GitHub wiki later.
 
-Nishizumi Paints is a Windows desktop application for iRacing that automates Trading Paints downloads and fills missing liveries with configurable random fallback sources.
+Nishizumi Paints is a Windows desktop companion for iRacing. It watches live sessions, downloads normal Trading Paints liveries, fills gaps with configurable random fallback sources, manages AI rosters, and keeps the whole workflow usable for both casual and advanced users.
 
 ## What the app does
 
-- Monitors live iRacing sessions
-- Downloads normal Trading Paints liveries when they exist
-- Applies manual overrides per driver
-- Fills missing cars, helmets, and suits from the public showroom
-- Uses a local RandomPool as a final offline-style fallback
-- Syncs AI rosters
-- Supports Easy mode, Advanced mode, tray/background use, and headless monitoring
+- monitors the iRacing SDK and reacts to session changes
+- downloads real Trading Paints assets when they exist
+- applies public-showroom fallback for cars, helmets, and suits when they do not
+- keeps a local RandomPool for reusable fallback assets
+- supports per-driver overrides and quick randomization from the Session tab
+- syncs AI rosters and AI livery assets
+- runs in Easy mode, Advanced mode, tray/background mode, and headless mode
 
 ## Recommended reading order
 
 1. [Installation and Updating](Installation-and-Updating)
 2. [Quick Start Wizard](Quick-Start-Wizard)
-3. [Session Tab](Session-Tab)
-4. [Random Tab](Random-Tab)
-5. [Showroom Tab](Showroom-Tab)
-6. [Background and Headless Modes](Background-and-Headless-Modes)
-7. [Troubleshooting](Troubleshooting)
+3. [General Tab](General-Tab)
+4. [Session Tab](Session-Tab)
+5. [Random Tab](Random-Tab)
+6. [Showroom Tab](Showroom-Tab)
+7. [Online Fallback System](Online-Fallback-System)
+8. [Local RandomPool](Local-RandomPool)
+9. [Showroom Mapping and Collections](Showroom-Mapping-and-Collections)
+10. [AI Tab](AI-Tab)
+11. [Background and Headless Modes](Background-and-Headless-Modes)
+12. [Troubleshooting](Troubleshooting)
 
-## Main concepts
+## Core concepts
 
-### Normal Trading Paints download
+### Normal Trading Paints downloads
 
-If a driver already has a usable Trading Paints asset for the current car and session, Nishizumi Paints downloads and installs it normally.
+If a driver already has a usable Trading Paints paint for the current car and session, Nishizumi Paints downloads it through the normal manifest flow and installs it into the iRacing paint folder.
 
-### Online fallback
+### Public online fallback
 
-If a driver does not have a usable Trading Paints asset, the app can fetch public showroom paints directly. In the current 6.0.0 release, this is the main no-browser online fallback path.
+If a driver does not have a usable Trading Paints paint, the app can fetch a public showroom paint directly. In 6.0.0 this is the main no-browser online fallback path, including cars, helmets, and suits.
 
 ### RandomPool
 
-The local RandomPool is a cache of reusable fallback assets. It can be filled manually from the Showroom tab or by optional recycling of downloaded session paints.
+The RandomPool is the local reusable fallback cache. It can be filled manually from the Showroom tab, from collection imports, or from optional recycling of session paints.
 
-### Fixed driver override
+### Collection pool
 
-From the Session tab, you can force a specific car, helmet, or suit for a single driver. That override is remembered and wins over normal fallback logic.
+The app can also cache paints from Trading Paints collections. This is useful for curated themed sets that should be reused locally without relying on a live session fetch.
 
-## User interface overview
+### Per-driver memory
 
-- **Easy mode** keeps the app focused on the essential monitor, status, and fallback controls.
-- **Advanced mode** exposes the full tab set:
-  - Session
-  - General
-  - AI
-  - Random
-  - Showroom
-  - Logs
+The Session tab can remember fixed overrides for a driver. It can also forget them. Forgetting now restores a driver back to the real Trading Paints paint if the driver had one and only clears fallback memory when the driver did not.
 
-## Version notes
+## User-interface modes
 
-Version 6.0.0 is the release that consolidates the no-browser/public-showroom workflow, adds the installer, and introduces the Easy mode split.
+### Easy mode
+
+Easy mode keeps only the basic screen visible:
+
+- current status
+- startup/background behavior
+- basic random fallback controls
+- the minimum options needed for a new or casual user
+
+### Advanced mode
+
+Advanced mode exposes the full tab set:
+
+- Session
+- General
+- AI
+- Random
+- Showroom
+- Logs
+
+You can switch between Easy mode and Advanced mode at any time from inside the app.
+
+## Architecture references
+
+For code-oriented documentation, also read:
+
+- [Architecture Overview](Architecture-Overview)
+- [Runtime Paths and Files](Runtime-Paths-and-Files)
+- [Session and Download Pipeline](Session-and-Download-Pipeline)
+- [Source Code Map](Source-Code-Map)
+- [`trading_paints_unofficial_api_sdk.md`](../../trading_paints_unofficial_api_sdk.md)

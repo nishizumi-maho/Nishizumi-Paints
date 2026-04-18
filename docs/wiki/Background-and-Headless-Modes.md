@@ -1,35 +1,47 @@
 # Background and Headless Modes
 
-Nishizumi Paints supports two low-friction ways to stay active while not occupying the full UI.
+Nishizumi Paints is designed to keep monitoring without forcing the user to keep a large window open the whole time.
 
-## Background tray mode
+## Tray behavior
 
-If **Keep running in background on close** is enabled:
+When the app is running in the tray:
 
-- closing the window hides it instead of stopping the app
-- the tray icon stays available in the Windows notification area
-- right-click opens the tray menu
-- double-click restores the window
+- right-click opens a menu with `Open app` and `Exit`
+- double-click with the left mouse button restores the main window
 
-## Tray menu
+This makes background use practical for users who want the app always available but mostly out of sight.
 
-The tray icon menu provides:
+## Keep running in background on close
 
-- **Open app**
-- **Exit**
+This setting changes what happens when the user closes the main window:
+
+- enabled: close hides to the tray and the monitor keeps running
+- disabled: close actually shuts the app down
+
+This option is exposed both in Advanced mode and in the Easy mode General box so users do not need to switch modes just to control it.
+
+## Start with Windows
+
+The app can register itself in the per-user Windows startup entry. The installer can set the initial value, and the app can later update the same registry entry.
+
+## Start minimized
+
+This is useful for users who want the app to launch on sign-in and immediately stay out of the way.
+
+## Single-instance behavior
+
+The script includes a single-instance lock and a signal server so a second launch does not create a separate competing monitor process.
 
 ## Headless mode
 
-Headless mode is for users who want the monitor running without the standard GUI.
+The code also contains a headless control server and launch-mode handling. Headless mode is intended for users who want monitoring behavior without the full interactive window.
 
-It is useful for:
+That matters for:
 
-- always-on monitoring
-- lower-overhead operation
-- controlling a running monitor from a separate UI instance when needed
+- autostart scenarios
+- service-like usage
+- keeping the app available while relying mostly on logs and tray controls
 
-## Choosing the right mode
+## Interaction with Easy and Advanced mode
 
-- Use **Easy mode** if you want the main window but very little complexity.
-- Use **Background tray mode** if you still want the GUI available but mostly hidden.
-- Use **Headless mode** if you want the monitoring process without the normal interface.
+UI mode does not disable background or headless behavior. Easy mode only reduces visible complexity. The background monitor and tray logic still run the same core service underneath.

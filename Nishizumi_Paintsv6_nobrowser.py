@@ -72,6 +72,7 @@ TP_RECENT_SCHEMES_FILENAME = ".nishizumi_tp_recent_schemes.json"
 DRIVER_PAINT_OVERRIDES_FILENAME = ".nishizumi_driver_paint_overrides.json"
 TP_RECENT_SCHEMES_HISTORY_LIMIT = 256
 TP_SHOWROOM_MAPPING_FILENAME = "tp_showroom_mapping.seed.json"
+TP_SHOWROOM_MAPPING_RESOURCE = "data/tp_showroom_mapping.seed.json"
 TP_SHOWROOM_REVIEW_DIRNAME = "tp_showroom_review"
 TP_SHOWROOM_SCAN_IRACING_SOURCE = "https://support.iracing.com/support/solutions/articles/31000172625-filepath-for-active-iracing-cars"
 TP_SHOWROOM_SCAN_ROOTS = (
@@ -122,8 +123,8 @@ LOG_HISTORY_LIMIT = 2000
 LOG_QUEUE_LIMIT = 5000
 LOG_RENDER_BATCH_SIZE = 300
 LOG_HIDDEN_DRAIN_BATCH_SIZE = 1000
-APP_ICON_ICO = "nishizumi_paints_icon.ico"
-APP_ICON_PNG = "nishizumi_paints_icon.png"
+APP_ICON_ICO_RESOURCE = "assets/icons/nishizumi_paints_icon.ico"
+APP_ICON_PNG_RESOURCE = "assets/icons/nishizumi_paints_icon.png"
 INSTANCE_HOST = "127.0.0.1"
 INSTANCE_PORT = 45891
 INSTANCE_MUTEX_NAME = r"Local\NishizumiPaintsSingleInstance"
@@ -426,7 +427,7 @@ def canonicalize_car_directory(value: str | None) -> str:
 
 
 def bundled_tp_showroom_mapping_path() -> Path:
-    return resource_path(TP_SHOWROOM_MAPPING_FILENAME)
+    return resource_path(TP_SHOWROOM_MAPPING_RESOURCE)
 
 
 def user_tp_showroom_mapping_path() -> Path:
@@ -838,11 +839,11 @@ def show_launch_mode_dialog(saved_mode: str = "ask") -> tuple[str, bool] | None:
     except Exception:
         pass
     try:
-        ico_path = resource_path(APP_ICON_ICO)
+        ico_path = resource_path(APP_ICON_ICO_RESOURCE)
         if ico_path.exists():
             root.iconbitmap(default=str(ico_path))
         else:
-            png_path = resource_path(APP_ICON_PNG)
+            png_path = resource_path(APP_ICON_PNG_RESOURCE)
             if png_path.exists():
                 icon = tk.PhotoImage(file=str(png_path))
                 root.iconphoto(True, icon)
@@ -16499,7 +16500,7 @@ class WindowsTrayIcon:
             IMAGE_ICON = 1
             LR_LOADFROMFILE = 0x00000010
             LR_DEFAULTSIZE = 0x00000040
-            icon_path = str(resource_path(APP_ICON_ICO))
+            icon_path = str(resource_path(APP_ICON_ICO_RESOURCE))
             if os.path.exists(icon_path):
                 handle = self._user32.LoadImageW(0, icon_path, IMAGE_ICON, 0, 0, LR_LOADFROMFILE | LR_DEFAULTSIZE)
                 if handle:
@@ -16730,14 +16731,14 @@ class DownloaderUI:
             self.root.after(500, self.start_minimized)
     def _apply_window_icon(self) -> None:
         try:
-            ico_path = resource_path(APP_ICON_ICO)
+            ico_path = resource_path(APP_ICON_ICO_RESOURCE)
             if ico_path.exists():
                 self.root.iconbitmap(default=str(ico_path))
                 return
         except Exception:
             pass
         try:
-            png_path = resource_path(APP_ICON_PNG)
+            png_path = resource_path(APP_ICON_PNG_RESOURCE)
             if png_path.exists():
                 self._window_icon_image = self.tk.PhotoImage(file=str(png_path))
                 self.root.iconphoto(True, self._window_icon_image)
