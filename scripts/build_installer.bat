@@ -1,6 +1,6 @@
 @echo off
 setlocal EnableExtensions EnableDelayedExpansion
-cd /d "%~dp0"
+cd /d "%~dp0.."
 
 echo =========================================
 echo Nishizumi Paints - Installer Build
@@ -15,7 +15,7 @@ if not exist "%APP_EXE%" (
     echo [ERROR] App build was not found:
     echo        %APP_EXE%
     echo.
-    echo Run build_nobrowser_dir.bat first, then run this installer build again.
+    echo Run scripts\\build_nobrowser_dir.bat first, then run this installer build again.
     echo.
     pause
     exit /b 1

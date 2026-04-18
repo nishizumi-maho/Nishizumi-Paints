@@ -1,6 +1,6 @@
 @echo off
 setlocal EnableExtensions EnableDelayedExpansion
-cd /d "%~dp0"
+cd /d "%~dp0.."
 
 echo =========================================
 echo Nishizumi Paints - DIR No-Browser Build
@@ -44,19 +44,19 @@ if exist "dist\NishizumiPaints.exe" (
 
 set "CMD=py -m PyInstaller --noconfirm --clean --onedir --windowed --name NishizumiPaints"
 
-if exist "nishizumi_paints_icon.ico" (
-    set "CMD=!CMD! --icon nishizumi_paints_icon.ico"
+if exist "assets\\icons\\nishizumi_paints_icon.ico" (
+    set "CMD=!CMD! --icon assets\\icons\\nishizumi_paints_icon.ico"
 )
-if exist "nishizumi_paints_icon.png" (
-    set "CMD=!CMD! --add-data nishizumi_paints_icon.png;."
+if exist "assets\\icons\\nishizumi_paints_icon.png" (
+    set "CMD=!CMD! --add-data assets\\icons\\nishizumi_paints_icon.png;assets/icons"
 )
-if exist "nishizumi_paints_icon.ico" (
-    set "CMD=!CMD! --add-data nishizumi_paints_icon.ico;."
+if exist "assets\\icons\\nishizumi_paints_icon.ico" (
+    set "CMD=!CMD! --add-data assets\\icons\\nishizumi_paints_icon.ico;assets/icons"
 )
-if exist "tp_showroom_mapping.seed.json" (
-    set "CMD=!CMD! --add-data tp_showroom_mapping.seed.json;."
+if exist "data\\tp_showroom_mapping.seed.json" (
+    set "CMD=!CMD! --add-data data\\tp_showroom_mapping.seed.json;data"
 ) else (
-    echo [WARN] tp_showroom_mapping.seed.json not found. Build will continue without it.
+    echo [WARN] data\\tp_showroom_mapping.seed.json not found. Build will continue without it.
 )
 
 set "CMD=!CMD! --hidden-import irsdk --hidden-import bs4 %SCRIPT%"

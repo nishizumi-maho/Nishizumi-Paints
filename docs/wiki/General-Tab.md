@@ -1,42 +1,97 @@
 # General Tab
 
-The General tab holds the app-wide runtime behavior.
+The General tab is the advanced-mode control panel for app-wide behavior. It does not hold the RandomPool panel anymore; that moved to the Random tab so fallback configuration is grouped together.
+
+## Main areas
+
+- interface mode
+- startup and background behavior
+- cleanup and self-protection options
+- general download worker mode
+- online fallback lane behavior
+- iRacing Documents folder management
 
 ## Interface mode
 
-- **Easy mode**
-- **Advanced mode**
+This section lets the user switch between:
 
-This switch is always reversible.
+- Easy mode
+- Advanced mode
 
-## Main controls
+Changing modes does not reset configuration. It only changes what the UI exposes.
 
-### Start with Windows
+## Startup and background
 
-This is the renamed autostart option. It controls whether the app creates or removes the Windows sign-in startup entry.
+The main startup controls are:
 
-### Start minimized
+- `Start with Windows`
+- `Start minimized`
+- `Keep running in background on close`
+- `Auto refresh paints`
+- `Check for updates automatically`
 
-If enabled, the window can stay out of the way during startup. This is especially useful together with tray/background use.
+Easy mode also exposes the essential startup/background controls directly, but the same underlying config values are shared with this tab.
 
-### Keep running in background on close
+## Session protection and self behavior
 
-If enabled, closing the window hides the app to the tray instead of shutting it down.
+This area controls how the app treats the local user and live-session paint cleanup. Depending on the current build, it can include settings such as:
 
-### Auto refresh paints
+- keep my livery locally
+- update my own paints
+- delete live session paints
+- do not apply random paints in team events
+- do not apply random paints to myself
 
-If enabled, the monitor keeps reacting automatically as sessions change.
+That last option is important when the user wants fallback for everybody else but never wants the app to replace their own visible car with a random result.
 
-### Check for updates automatically
+## Download worker mode
 
-If enabled, the app checks for newer releases and surfaces the result in the UI.
+This section controls the main manifest, download, and save worker counts for the session pipeline.
 
-## Session behavior controls
+### Safe
 
-- Update my own paints
-- Keep my livery locally
-- Delete live session paints
-- Do not apply random paints in team events
-- Do not apply random paints to myself
+Safe mode is the default recommended option. It uses adaptive workers with protective caps chosen by the app.
 
-The last option is important for users who want fallback for everyone else but never want their own car replaced by a random source.
+### Manual
+
+Manual mode exposes fixed manifest, download, and save worker counts from `1` to `100`.
+
+### Session Total
+
+Session Total is the fastest aggressive mode. It removes the protective session cap and uses the current session size to drive worker parallelism as far as the runtime pipeline allows.
+
+Use it when absolute throughput matters more than caution.
+
+## Online fallback lanes
+
+This section is separate from the main worker mode. It controls how many public showroom car lanes can run at once when the app is filling missing paints online.
+
+### Safe
+
+One car lane at a time.
+
+### Manual
+
+Use the configured manual lane cap.
+
+### Session Total
+
+One lane per car group with no extra hard cap. This is the fastest lane mode.
+
+## Online accessory behavior
+
+The General tab also holds the advanced online-fallback toggles for:
+
+- processing cars, helmets, and suits together online
+- giving timed-out online fallbacks one final retry stage before local fallback
+
+Those settings work together with the Random tab. The Random tab decides who is eligible for fallback; the General tab decides how aggressively the online engine runs.
+
+## iRacing Documents folder
+
+The selected iRacing Documents folder is shown here and can be changed later. Changing it affects:
+
+- live-session paint output
+- AI roster syncing
+- replay-pack features
+- any local file operations that depend on the standard iRacing folder layout

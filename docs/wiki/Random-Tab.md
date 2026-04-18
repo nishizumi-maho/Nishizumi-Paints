@@ -1,54 +1,73 @@
 # Random Tab
 
-The Random tab controls how fallback paints are chosen and where they come from.
+The Random tab defines fallback policy. It decides who is eligible for fallback, which source the app should try first, and how the local fallback pool is managed.
 
-## Step 1: Who should get fallback paints
+## Step 1: Who should get fallback paints?
 
-You can enable random fallback separately for:
+This step answers two separate questions:
 
-- real drivers
-- AI drivers
-- cars
-- helmets
-- suits
+1. should the app randomize cars, helmets, and suits at all?
+2. should that happen for real drivers, AI drivers, or both?
 
-In Easy mode, the most important fallback toggles are surfaced directly so non-technical users do not need to switch to Advanced mode.
+The current layout keeps those scopes separate for:
 
-## Step 2: Online fallback lanes
+- random cars
+- random helmets
+- random suits
 
-Version 6.0.0 exposes three worker strategies:
+This matters because a user might want:
 
-### Safe
+- random cars for AI only
+- random helmets for everyone
+- no random suits at all
 
-Safe is the default recommended mode.
+Easy mode exposes the essential version of this step directly so the user does not have to open the full Random tab just to control the basics.
 
-It uses adaptive concurrency with protective caps and is meant to avoid excessive load while still being fast.
+## Step 2: Which fallback path should be preferred?
 
-### Session Total
+This step is about fallback source selection.
 
-Session Total is the maximum-throughput mode.
+Typical options are:
 
-It is intentionally uncapped relative to the current session totals. If a user chooses this mode, the app assumes they want maximum parallelism.
+- online fallback
+- local fallback
+- collection-pool behavior
 
-### Manual
+The exact source order is then refined by the General tab worker and lane options and by whether the RandomPool or collection pool already contains usable assets.
 
-Manual mode lets advanced users define their own manifest, download, and save worker counts.
+## Step 3: Public showroom and Local RandomPool
 
-## Step 3: Public showroom
+Step 3 groups the two most important supporting systems together:
 
-This area describes the public showroom online fallback path and sits next to the local RandomPool tools.
+- the public showroom section
+- the Local Random paints pool section
 
-Online fallback means the app can use a random public Trading Paints showroom asset when a driver has no usable normal Trading Paints paint.
+This is where the user manages the reusable local fallback cache and understands how public showroom imports interact with it.
 
-## Local RandomPool
+## Local Random paints pool
 
-The local RandomPool is the last fallback layer when online sources are unavailable, exhausted, or disabled.
+The Local Random paints pool is the app’s reusable local cache of fallback assets.
 
-The user can:
+It now lives here instead of the General tab because it is fundamentally a fallback-system feature, not a generic app setting.
 
-- open the pool
-- clean it
-- rebuild it from current files
-- choose whether downloaded session paints should be recycled into it
+Main controls include:
 
-In 6.0.0, recycling defaults to disabled.
+- enabling or disabling recycling of downloaded session paints into the pool
+- total pool size
+- per-category caps for cars, helmets, and suits
+- opening or cleaning the pool
+- rebuilding the pool from current files
+
+### Important default
+
+`Recycle downloaded TP car paints into the local random pool` is now off by default.
+
+That means:
+
+- manual showroom imports still remain in the pool
+- manual collection imports still remain in the pool
+- but normal live-session paints downloaded during monitoring are deleted after the session instead of being archived into the pool
+
+## Easy mode explanation
+
+In Easy mode, the text around the random fallback controls is intentionally simpler. The intent is to tell the user, clearly, that the app can assign a random online paint to a driver who does not have a usable Trading Paints paint.

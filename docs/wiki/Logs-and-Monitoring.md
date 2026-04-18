@@ -1,26 +1,55 @@
 # Logs and Monitoring
 
-The Logs tab is where you inspect what the app is doing in detail.
+The Logs tab is the runtime explanation panel. If the Session tab tells you what happened to a driver, the Logs tab tells you why.
 
-## What you can see
+## What it shows
 
-- download progress
-- save progress
-- retry messages
-- session transitions
-- fallback source selection
-- texture reload activity
-- showroom mapping activity
+- the rolling activity log
+- session start and session end summaries
+- manifest, download, and save progress
+- online fallback lane behavior
+- public showroom fetch details
+- RandomPool archival decisions
+- AI roster sync results
+- update-check results
 
-## Useful diagnosis examples
+## Why the log matters
 
-- why a driver fell back instead of downloading normally
-- whether a spec map was downloaded
-- whether a texture reload was triggered
-- whether a public showroom scheme was skipped because it was unavailable
+The app has several stages that can all succeed or fail for different reasons:
 
-## Showroom mapping tools
+- manifest resolution
+- direct downloads
+- save and extraction
+- texture reload
+- public fallback
+- local fallback
+- cleanup and recycling
 
-The app includes a showroom mapping review workflow for vehicles that need manual matching between iRacing car identifiers and Trading Paints showroom vehicles.
+The log is the fastest place to see which stage actually failed.
 
-That tooling is also exposed from the Logs area.
+## Throughput monitoring
+
+The app also keeps transfer statistics such as:
+
+- requested workers
+- peak active workers
+- stage duration
+- average file time
+- throughput
+- effective parallelism
+
+These numbers are useful when tuning worker mode or checking whether `Session Total` is actually helping.
+
+## Typical log patterns
+
+Examples of useful patterns:
+
+- `Processing session ...`
+- `Manifest progress ...`
+- `Download progress ...`
+- `Save progress ...`
+- `Triggered iRacing texture reload ...`
+- `Trading Paints public showroom pool fetched ...`
+- `Session summary ...`
+
+When investigating a problem, match the row in the Session tab with the corresponding log lines here.

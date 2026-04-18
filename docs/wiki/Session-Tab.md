@@ -1,37 +1,58 @@
 # Session Tab
 
-The Session tab is the live control surface for the current iRacing session.
+The Session tab is the live monitor view. It is where the active session becomes concrete: drivers appear, assets are tracked, overrides can be applied, and fallback decisions can be inspected per target.
 
 ## What it shows
 
-- current session drivers
-- car, helmet, and suit status per driver
-- iRacing metadata such as iRating, license, and number
-- live state changes while downloads, saves, and fallback actions are happening
+- the current session identity
+- detected users and AI entries
+- car, helmet, and suit state per row
+- whether a row came from normal Trading Paints, fallback, or an override
+- row-level actions such as randomize, fix, forget, or open the Trading Paints source
 
-## Driver-level actions
+## Session refresh behavior
 
-For a selected driver, the app can expose:
+The app rebuilds this view as the iRacing SDK changes. In 6.0.0 the tab is intended to follow session transitions correctly instead of staying stuck on the previous session state.
 
-- **Open TP**
-- **Assign link**
-- **Assign current**
-- **Random**
-- **Forget**
+That matters because the Session tab is also the user-facing explanation of what the download pipeline decided for each driver.
 
-These actions are available per asset type where supported.
+## Main actions
 
-## Random
+### Fixed override
 
-The Session tab Random action picks a fresh compatible paint for that driver and applies it immediately. In 6.0.0, this also triggers a texture reload correctly instead of waiting for a manual refresh.
+You can force a specific paint, helmet, or suit for a single driver. That override is remembered and beats normal fallback until it is cleared.
 
-## Forget
+### Random
 
-Forget now behaves differently depending on what the driver is using:
+You can ask the app to fetch a new random result for one driver. The current build is expected to:
 
-- if the driver had a manual override and also has a real Trading Paints asset, the app restores the original asset
-- if the remembered source was only a fallback choice, the app simply stops remembering it for later sessions
+- download the new result
+- save it into the correct iRacing target path
+- trigger texture reload for that car
+- update the row metadata so `Open TP` points at the new source
 
-## Session changes
+### Forget
 
-The app now refreshes the Session tab more reliably when the active iRacing session changes, instead of leaving stale rows behind.
+Forget is now meant to behave like this:
+
+- if the driver had a fixed override but also has a real Trading Paints paint, the app returns the driver to that real Trading Paints paint and reapplies it
+- if the driver was only using a fallback paint, the app simply stops remembering that fallback for future use
+
+### Open TP
+
+When the row has a known Trading Paints source, `Open TP` should open the correct showroom or profile page. This includes fallback helmets and suits as well as cars.
+
+## Typical reasons to use this tab
+
+- verify whether a driver got a real Trading Paints paint or a fallback
+- force a manual paint for a rival, teammate, or AI entry
+- regenerate one driver without touching the whole session
+- inspect which assets were missing
+- confirm that texture reload happened after a manual change
+
+## Relationship to other tabs
+
+- the General tab sets the worker and lane behavior
+- the Random tab sets who is eligible for fallback
+- the Showroom tab seeds manual pools
+- the Logs tab explains why a row ended up in its final state
