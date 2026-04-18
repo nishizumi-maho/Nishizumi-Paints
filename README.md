@@ -7,7 +7,9 @@ Nishizumi Paints is a Windows desktop companion for iRacing that downloads Tradi
 [Read the full manual](./docs/wiki/Home.md)
 ;
 [View the changelog](./CHANGELOG.md)
+;
 [Read the unofficial Trading Paints API notes](./trading_paints_unofficial_api_sdk.md)
+;
 [Security policy](./SECURITY.md)
 
 ## Requirements
