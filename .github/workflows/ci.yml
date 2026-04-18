@@ -21,4 +21,3 @@ jobs:
       - name: Syntax check
         run: |
           python -m py_compile .\Nishizumi_Paintsv6_nobrowser.py
-          python -m py_compile .\nishizumi_paints_random_showroom.py
