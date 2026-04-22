@@ -2,6 +2,26 @@
 
 All notable user-facing changes to Nishizumi Paints are documented here.
 
+## [6.1.0] - 2026-04-22
+
+### Changed
+
+- Trading Paints **collection pool** now reuses paints from the selected collections within the same session whenever normal public showroom coverage is disabled.
+- The collection-pool UI now explains that strict collection-only mode automatically repeats curated paints after the selected pool runs out.
+
+### Fixed
+
+- Fixed strict collection-pool sessions so targets are no longer left unchanged just because every compatible collection paint was already used earlier in the same session.
+
+### Packaging
+
+- The installer build now clears stale `installer/output/` artifacts before compiling a new release, reducing the chance of publishing the wrong setup executable.
+
+### Security
+
+- Expanded repository hygiene ignores for common crash, merge, and backup artifacts.
+- Refreshed the release/security docs to call out local capture folders, staging folders, and other machine-specific artifacts that should stay out of commits and release packaging.
+
 ## [6.0.0] - 2026-04-18
 
 ### Added

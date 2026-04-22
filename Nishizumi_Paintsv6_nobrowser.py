@@ -42,7 +42,7 @@ from requests.adapters import HTTPAdapter
 # Browserless copy: Trading Paints browser automation is intentionally disabled.
 sync_playwright = None
 APP_NAME = "Nishizumi Paints"
-APP_VERSION = "6.0.0"
+APP_VERSION = "6.1.0"
 APP_REGISTRY_NAME = "NishizumiPaints"
 APP_CONFIG_DIRNAME = "NishizumiPaints"
 APP_TOOLTIP = f"{APP_NAME} {APP_VERSION}"
@@ -11013,12 +11013,24 @@ def _tp_collection_candidates_for_accessory(items: list[dict], kind: str) -> lis
         and _tp_showroom_scheme_usable_for_online_fallback(item)
     ]
 
-def _choose_tp_collection_candidate(candidates: list[dict], kind: str, used_source_ids: set[str]) -> tuple[dict | None, bool]:
+def _choose_tp_collection_candidate(
+    candidates: list[dict],
+    kind: str,
+    used_source_ids: set[str],
+    *,
+    allow_repeating_when_exhausted: bool = False,
+) -> tuple[dict | None, bool]:
     if not candidates:
         return None, False
     available = [item for item in candidates if _tp_collection_source_id(item, kind) not in used_source_ids]
     if not available:
-        return None, False
+        if not allow_repeating_when_exhausted:
+            return None, False
+        chosen = random.choice(candidates)
+        source_id = _tp_collection_source_id(chosen, kind)
+        if source_id:
+            used_source_ids.add(source_id)
+        return chosen, True
     chosen = random.choice(available)
     source_id = _tp_collection_source_id(chosen, kind)
     if source_id:
@@ -11286,6 +11298,8 @@ def apply_tp_collection_pool_fallbacks(
     saved_callback: Callable[[list[SavedFile], str], None] | None = None,
     used_source_ids_seed: Iterable[str] | None = None,
     cancel_event: threading.Event | None = None,
+    strict_collection_only: bool = False,
+    allow_repeating_when_exhausted: bool = False,
     _thread_handoff_done: bool = False,
 ) -> tuple[list[SavedFile], list[str], RandomFallbackSummary]:
     source_text = collection_ids if isinstance(collection_ids, str) else " ".join(str(item) for item in collection_ids)
@@ -11380,16 +11394,40 @@ def apply_tp_collection_pool_fallbacks(
         target_id = int(user.team_id) if target_is_team else int(user.user_id)
         label = user.display_name or (f"AI {target_id}" if user.is_ai else f"user {target_id}")
         summary.attempted_targets += 1
-        chosen, reused_existing_source = _choose_tp_collection_candidate(candidates, kind, used_source_ids)
+        chosen, reused_existing_source = _choose_tp_collection_candidate(
+            candidates,
+            kind,
+            used_source_ids,
+            allow_repeating_when_exhausted=bool(allow_repeating_when_exhausted),
+        )
         if chosen is None:
             summary.missing_source_targets += 1
             if candidates:
-                logs.append(f"Trading Paints collection pool exhausted its non-repeating {kind} sources for {'AI' if user.is_ai else 'driver'} {label} on {user.directory}; normal online fallback may cover this target.")
+                if strict_collection_only:
+                    logs.append(
+                        f"Trading Paints collection-only mode ran out of reusable {kind} paints for "
+                        f"{'AI' if user.is_ai else 'driver'} {label} on {user.directory}. This target will be left unchanged."
+                    )
+                else:
+                    logs.append(
+                        f"Trading Paints collection pool exhausted its non-repeating {kind} sources for "
+                        f"{'AI' if user.is_ai else 'driver'} {label} on {user.directory}; normal online fallback may cover this target."
+                    )
             else:
-                logs.append(f"Trading Paints collection pool had no usable {kind} source for {'AI' if user.is_ai else 'driver'} {label} on {user.directory}.")
+                if strict_collection_only:
+                    logs.append(
+                        f"Trading Paints collection-only mode found no usable {kind} paint in the selected collections for "
+                        f"{'AI' if user.is_ai else 'driver'} {label} on {user.directory}. This target will be left unchanged."
+                    )
+                else:
+                    logs.append(f"Trading Paints collection pool had no usable {kind} source for {'AI' if user.is_ai else 'driver'} {label} on {user.directory}.")
             return
         if reused_existing_source:
             summary.repeated_source_uses += 1
+            logs.append(
+                f"Trading Paints collection pool reused an already used {kind} source from the selected collections for "
+                f"{'AI' if user.is_ai else 'driver'} {label} on {user.directory} because normal public showroom coverage is disabled and no unused collection paints remained."
+            )
         collection_id = str(chosen.get("_nishizumi_collection_id") or "").strip()
         scheme_id = _tp_collection_scheme_id(chosen)
         title = _tp_collection_title(chosen)
@@ -14509,6 +14547,8 @@ def process_session(
             saved_callback=_on_fallback_saved_items,
             used_source_ids_seed=collection_used_source_ids,
             cancel_event=cancel_event,
+            strict_collection_only=not bool(tp_collection_pool_allow_showroom_fallback),
+            allow_repeating_when_exhausted=not bool(tp_collection_pool_allow_showroom_fallback),
         )
         for line in collection_logs:
             logging.info(line)
@@ -14548,7 +14588,7 @@ def process_session(
         )
     elif fallback_mode == "online":
         fallback_saved, fallback_logs, fallback_summary = [], [
-            "Trading Paints collection pool handled configured collections only; normal public showroom coverage is disabled by the collection fallback checkbox."
+            "Trading Paints collection pool handled configured collections only; normal public showroom coverage is disabled, so collection paints will be reused within the session if the selected pool runs out."
         ], RandomFallbackSummary()
     else:
         fallback_saved, fallback_logs, fallback_summary = apply_local_tp_random_fallbacks(
@@ -17191,14 +17231,21 @@ class DownloaderUI:
             variable=self.tp_collection_pool_allow_showroom_var,
             command=self.on_setting_changed,
         ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Label(
+            collection_pool_box,
+            text="If normal showroom coverage stays off, the app will keep reusing paints from the selected collections after that pool runs out in the current session.",
+            justify="left",
+            foreground="#555555",
+            wraplength=430,
+        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(4, 0))
         collection_pool_actions = ttk.Frame(collection_pool_box)
-        collection_pool_actions.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        collection_pool_actions.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(6, 0))
         ttk.Button(collection_pool_actions, text="Remove selected", command=self.remove_selected_tp_collection_pool_sources).pack(side="left")
         ttk.Button(collection_pool_actions, text="Clear list", command=self.clear_tp_collection_pool_sources).pack(side="left", padx=(8, 0))
         ttk.Button(collection_pool_actions, text="Collections", command=self.open_tp_collections_page).pack(side="left", padx=(8, 0))
         ttk.Button(collection_pool_actions, text="Cache", command=self.open_tp_collection_pool_folder).pack(side="left", padx=(8, 0))
         ttk.Button(collection_pool_actions, text="Clean cache...", command=self.clean_tp_collection_pool_now).pack(side="left", padx=(8, 0))
-        ttk.Label(collection_pool_box, textvariable=self.tp_collection_pool_summary_var, justify="left", foreground="#555555", wraplength=430).grid(row=5, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        ttk.Label(collection_pool_box, textvariable=self.tp_collection_pool_summary_var, justify="left", foreground="#555555", wraplength=430).grid(row=6, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
         showroom_tab.columnconfigure(0, weight=1)
         showroom_tab.rowconfigure(1, weight=1)
@@ -18242,7 +18289,10 @@ class DownloaderUI:
     def _refresh_tp_collection_pool_summary(self) -> None:
         collection_ids = parse_tp_collection_ids_from_text(self.tp_collection_pool_sources_var.get())
         if collection_ids:
-            fallback_label = "normal showroom coverage enabled" if self.tp_collection_pool_allow_showroom_var.get() else "normal showroom coverage disabled"
+            if self.tp_collection_pool_allow_showroom_var.get():
+                fallback_label = "normal showroom coverage enabled after the selected collections run out"
+            else:
+                fallback_label = "normal showroom coverage disabled; collection paints repeat automatically after the selected pool runs out"
             self.tp_collection_pool_summary_var.set(
                 f"Collection pool active: {', '.join(collection_ids)} ({fallback_label}). Cached paints live in {default_tp_collection_pool_dir()}."
             )

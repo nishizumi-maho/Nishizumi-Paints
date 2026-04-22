@@ -53,7 +53,7 @@ The app uses an iRacing member ID to discover AI-related collection content and 
 
 ## Safe defaults applied by the wizard
 
-The current 6.0.0 flow defaults to:
+The current 6.1.0 flow defaults to:
 
 - Start with Windows enabled
 - Keep running in background on close enabled

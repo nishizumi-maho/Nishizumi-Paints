@@ -20,5 +20,10 @@ prepare_embedded_browser_fixed.bat
 
 *.log
 *.tmp
+*.bak
+*.orig
+*.rej
+*.dmp
+*.stackdump
 Thumbs.db
 .DS_Store
