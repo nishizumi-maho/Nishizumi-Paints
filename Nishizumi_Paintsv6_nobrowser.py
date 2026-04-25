@@ -24,6 +24,7 @@ import time
 import traceback
 import urllib.parse
 import unicodedata
+import uuid
 import webbrowser
 import re
 import hashlib
@@ -42,7 +43,7 @@ from requests.adapters import HTTPAdapter
 # Browserless copy: Trading Paints browser automation is intentionally disabled.
 sync_playwright = None
 APP_NAME = "Nishizumi Paints"
-APP_VERSION = "6.0.0"
+APP_VERSION = "6.2.0"
 APP_REGISTRY_NAME = "NishizumiPaints"
 APP_CONFIG_DIRNAME = "NishizumiPaints"
 APP_TOOLTIP = f"{APP_NAME} {APP_VERSION}"
@@ -111,6 +112,8 @@ AI_ROSTER_META_FILENAME = ".nishizumi_ai_roster.json"
 AI_ROSTER_OPTIONAL_UNAVAILABLE_SUFFIX = ".unavailable"
 AI_ROSTER_OPTIONAL_UNAVAILABLE_TTL_SECONDS = 24 * 60 * 60
 AI_LOCAL_ROSTER_SUFFIX = " (local)"
+AI_GENERIC_RANDOM_ROSTER_NAME = "Nishizumi Random AI - Current"
+AI_GENERIC_RANDOM_ROSTER_FOLDER_FALLBACK = "Nishizumi_Random_AI_Current"
 REPLAY_PACK_INDEX_FILENAME = ".nishizumi_replay_packs.json"
 REPLAY_PACK_MANIFEST_FILENAME = "manifest.json"
 SDK_UNCHANGED_FORCE_REFRESH_SECONDS = 1.5
@@ -1401,10 +1404,27 @@ def _is_superspeedway_track(track_name: str, track_display_name: str, track_conf
     return True
 def _is_car_related_paint_type(paint_type: PaintType) -> bool:
     return paint_type in {PaintType.CAR, PaintType.CAR_DECAL, PaintType.CAR_NUMBER, PaintType.CAR_SPEC}
-def _download_uses_superspeedway_variant(directory: str, paint_type: PaintType, is_superspeedway_track: bool) -> bool:
-    if not is_superspeedway_track:
+def _paint_filename_is_superspeedway_variant(filename: str, paint_type: PaintType) -> bool:
+    if not _is_car_related_paint_type(paint_type):
         return False
-    return _is_car_related_paint_type(paint_type)
+    name = Path(str(filename or '').strip()).name.lower()
+    if name.endswith(".bz2"):
+        name = name[:-4]
+    return bool(re.search(r"(?:_ss(?:_spec)?|_spec_ss)\.(?:tga|mip)$", name, re.IGNORECASE))
+def _manifest_file_url_is_superspeedway_variant(file_url: str, paint_type: PaintType) -> bool:
+    if not _is_car_related_paint_type(paint_type):
+        return False
+    raw_url = str(file_url or '').strip()
+    if not raw_url:
+        return False
+    candidates = [raw_url]
+    try:
+        parsed = urllib.parse.urlparse(raw_url)
+        candidates.append(urllib.parse.unquote(parsed.path or ""))
+        candidates.append(urllib.parse.unquote(parsed.query or ""))
+    except Exception:
+        pass
+    return any(_paint_filename_is_superspeedway_variant(candidate, paint_type) for candidate in candidates)
 @dataclass(frozen=True)
 class SessionUser:
     user_id: int
@@ -3035,6 +3055,7 @@ def _parse_fetch_user_manifest_xml(user_id: int, xml_text: str) -> list[Download
                     directory=directory,
                     paint_type=paint_type,
                     is_team_paint=is_team_paint,
+                    is_superspeedway_variant=_manifest_file_url_is_superspeedway_variant(file_url, paint_type),
                 ),
                 url=file_url,
             )
@@ -3042,9 +3063,11 @@ def _parse_fetch_user_manifest_xml(user_id: int, xml_text: str) -> list[Download
     return files
 
 
-def _fetch_user_files_fast_uncached(user_id: int, request_timeout: float = 8.0) -> list[DownloadFile]:
+def _fetch_user_files_fast_uncached(user_id: int, request_timeout: float = 8.0, superspeedway_variant: bool = False) -> list[DownloadFile]:
     session = get_thread_http_session()
     url = f"https://fetch.tradingpaints.gg/fetch_user.php?user={user_id}&ts={int(time.time() * 1000)}"
+    if superspeedway_variant:
+        url += "&ss=1"
     resp = session.get(
         url,
         timeout=max(2.0, float(request_timeout)),
@@ -3063,8 +3086,11 @@ def fetch_user_files(
     retries: int,
     retry_backoff_seconds: float,
     cancel_event: threading.Event | None = None,
+    superspeedway_variant: bool = False,
 ) -> list[DownloadFile]:
     url = f"https://fetch.tradingpaints.gg/fetch_user.php?user={user_id}"
+    if superspeedway_variant:
+        url += "&ss=1"
     last_exc: Exception | None = None
     for attempt in range(1, retries + 1):
         if _cancel_requested(cancel_event):
@@ -3616,6 +3642,39 @@ def _copy_source_file_to_saved_targets(source_path: Path | None, session_id: Ses
         saved.append(SavedFile(session_id=session_id, download_id=download_id, file_path=destination))
     return saved
 
+def _ensure_superspeedway_companion_saved_files(saved_items: list[SavedFile], paints_dir: Path) -> list[SavedFile]:
+    saved = list(saved_items or [])
+    if not saved:
+        return saved
+    existing_paths = {os.path.normcase(os.path.abspath(str(item.file_path))) for item in saved}
+    for item in list(saved):
+        download_id = item.download_id
+        if not _is_car_related_paint_type(download_id.paint_type):
+            continue
+        if bool(download_id.is_superspeedway_variant):
+            continue
+        source_path = item.file_path
+        if source_path is None or not source_path.exists():
+            continue
+        ss_download_id = replace(download_id, is_superspeedway_variant=True)
+        for destination in save_paths_for(ss_download_id, paints_dir):
+            destination_key = os.path.normcase(os.path.abspath(str(destination)))
+            if destination_key in existing_paths:
+                continue
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            temp_destination = destination.with_name(destination.name + ".tmp")
+            temp_destination.unlink(missing_ok=True)
+            try:
+                shutil.copy2(source_path, temp_destination)
+                os.replace(temp_destination, destination)
+            except Exception as exc:  # noqa: BLE001
+                temp_destination.unlink(missing_ok=True)
+                logging.debug("Could not create superspeedway paint companion %s from %s: %s", destination, source_path, exc)
+                continue
+            existing_paths.add(destination_key)
+            saved.append(SavedFile(session_id=item.session_id, download_id=ss_download_id, file_path=destination))
+    return saved
+
 def _driver_paint_override_kind(kind: str) -> str:
     normalized = str(kind or "").strip().lower()
     return normalized if normalized in {"car", "helmet", "suit"} else ""
@@ -4021,7 +4080,7 @@ def _apply_cached_driver_paint_override_for_user(
                 session.session_id,
                 DownloadId(
                     paint_type=paint_type,
-                    is_superspeedway_variant=bool(session.is_superspeedway_track),
+                    is_superspeedway_variant=False,
                     **base_kwargs,
                 ),
                 paints_dir,
@@ -4165,7 +4224,7 @@ def _session_manifest_items_for_user_kind(
         if _session_status_key_for_download_id(session, item.download_id) != target_key:
             continue
         matched.append(item)
-    matched = _tp_latest_manifest_items_by_paint_type(matched)
+    matched = _select_manifest_variants_for_session(session, matched)
     if not any(item.download_id.paint_type is required_type for item in matched):
         return []
     return matched
@@ -4408,6 +4467,7 @@ def _apply_local_tp_random_fallback_assets_for_user(
     target_id = int(user.team_id) if target_is_team else int(user.user_id)
     label = user.display_name or (f"AI {target_id}" if user.is_ai else f"user {target_id}")
     seed_text = f"{session.session_id.folder_name()}|{user.directory}|{target_id}|{'ai' if user.is_ai else 'driver'}"
+    fallback_target_phrase = "applied to"
     logs: list[str] = []
     saved_items: list[SavedFile] = []
     reused_existing_source = False
@@ -4420,7 +4480,7 @@ def _apply_local_tp_random_fallback_assets_for_user(
         "user_id": target_id,
         "directory": user.directory,
         "is_team_paint": target_is_team,
-        "is_superspeedway_variant": bool(session.is_superspeedway_track),
+        "is_superspeedway_variant": False,
     }
 
     if need_car:
@@ -4460,7 +4520,7 @@ def _apply_local_tp_random_fallback_assets_for_user(
         )
         if copied:
             saved_items.extend(copied)
-            logs.append(f"TP local random helmet fallback applied to {'AI' if user.is_ai else 'driver'} {label} using source {helmet_source_id or 'pool'}.")
+            logs.append(f"TP local random helmet fallback {fallback_target_phrase} {'AI' if user.is_ai else 'driver'} {label} using source {helmet_source_id or 'pool'}.")
         else:
             logs.append(f"TP local random fallback had no usable helmet source for {'AI' if user.is_ai else 'driver'} {label}.")
 
@@ -4483,11 +4543,13 @@ def _apply_local_tp_random_fallback_assets_for_user(
         )
         if copied:
             saved_items.extend(copied)
-            logs.append(f"TP local random suit fallback applied to {'AI' if user.is_ai else 'driver'} {label} using source {suit_source_id or 'pool'}.")
+            logs.append(f"TP local random suit fallback {fallback_target_phrase} {'AI' if user.is_ai else 'driver'} {label} using source {suit_source_id or 'pool'}.")
         else:
             logs.append(f"TP local random fallback had no usable suit source for {'AI' if user.is_ai else 'driver'} {label}.")
 
     if need_car and entry is not None and entry.car_file is not None and entry.car_file.exists():
+        if session.is_superspeedway_track:
+            saved_items = _ensure_superspeedway_companion_saved_files(saved_items, paints_dir)
         source_parts = [f"car={entry.car_file.name}"]
         if entry.spec_file is not None and entry.spec_file.exists():
             source_parts.append(f"spec={entry.spec_file.name}")
@@ -4496,7 +4558,7 @@ def _apply_local_tp_random_fallback_assets_for_user(
         save_targets = ", ".join(sorted({str(item.file_path.name) for item in saved_items}))
         if save_targets:
             logs.append(
-                f"TP local random fallback applied to {'AI' if user.is_ai else 'driver'} {label} using {entry.source_kind} source {entry.source_id} for {user.directory}; source_files=({' | '.join(source_parts)}); saved_targets=[{save_targets}]"
+                f"TP local random fallback {fallback_target_phrase} {'AI' if user.is_ai else 'driver'} {label} using {entry.source_kind} source {entry.source_id} for {user.directory}; source_files=({' | '.join(source_parts)}); saved_targets=[{save_targets}]"
             )
     return saved_items, logs, reused_existing_source
 
@@ -5286,11 +5348,17 @@ def _tp_showroom_mapping_entry_for_directory(directory: str, mapping_path: Path 
     mapping_doc = _load_tp_showroom_mapping(mapping_path)
     cars_map = mapping_doc.get("cars") or {}
     raw_directory = str(directory or "").strip()
+    canonical_directory = canonicalize_car_directory(raw_directory).lower()
     candidates = [
-        canonicalize_car_directory(raw_directory).lower(),
+        canonical_directory,
         raw_directory.replace("/", "\\").lower(),
         raw_directory.lower(),
     ]
+    if "\\" in canonical_directory:
+        root, leaf = canonical_directory.rsplit("\\", 1)
+        for prefix in ("chevrolet", "chevy"):
+            if leaf.startswith(prefix) and len(leaf) > len(prefix):
+                candidates.append(f"{root}\\{leaf[len(prefix):]}")
     seen: set[str] = set()
     for key in candidates:
         key = str(key or "").strip()
@@ -5864,6 +5932,8 @@ def _download_and_save_direct_showroom_car_result(
         )
         if saved:
             saved_items.extend(saved)
+    if saved_items:
+        saved_items = _ensure_superspeedway_companion_saved_files(saved_items, paints_dir)
     return saved_items
 
 
@@ -6534,6 +6604,419 @@ def download_showroom_paints_to_random_pool(
                 shutil.rmtree(temp_paints_root, ignore_errors=True)
         except Exception:
             pass
+
+@dataclass(frozen=True)
+class TPTeamPaintTarget:
+    team_id: int
+    raw_car: str
+    directories: tuple[str, ...]
+    mid: int = 0
+    slug: str = ""
+    display_name: str = ""
+
+
+def _tp_team_extract_mid_slug(value: object) -> tuple[int, str]:
+    raw = str(value or "").strip()
+    if not raw:
+        return 0, ""
+    patterns = (
+        r"/dashboard/(?P<mid>\d+)/(?P<slug>[^/?#]+)",
+        r"/showroom/(?:Road|Oval|DirtOval|DirtRoad|Formula|SportsCars|Prototype|Driver)/(?P<mid>\d+)/(?P<slug>[^/?#]+)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, raw, flags=re.IGNORECASE)
+        if not match:
+            continue
+        mid = _to_int_or_none(match.group("mid")) or 0
+        slug = urllib.parse.unquote(match.group("slug") or "").strip()
+        return mid, slug
+    if raw.isdigit():
+        return int(raw), ""
+    return 0, ""
+
+
+def _tp_team_directory_variants(values: Iterable[object]) -> tuple[str, ...]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        text = str(value or "").strip()
+        for candidate in (
+            text,
+            text.replace("/", "\\"),
+            canonicalize_car_directory(text),
+            normalize_directory(text),
+        ):
+            candidate = str(candidate or "").strip()
+            if not candidate:
+                continue
+            key = candidate.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append(candidate)
+    return tuple(result)
+
+
+def _tp_team_mapping_entries_for_mid(mid: int, mapping_path: Path | None = None) -> list[tuple[str, dict]]:
+    try:
+        wanted_mid = int(mid or 0)
+    except Exception:
+        return []
+    if wanted_mid <= 0:
+        return []
+    mapping_doc = _load_tp_showroom_mapping(mapping_path)
+    cars_map = mapping_doc.get("cars") or {}
+    matches: list[tuple[str, dict]] = []
+    for directory_key, raw_entry in cars_map.items():
+        if not isinstance(raw_entry, dict):
+            continue
+        status = str(raw_entry.get("status") or "mapped").strip().lower()
+        if status in {"unsupported", "disabled", "missing"}:
+            continue
+        try:
+            entry_mid = int(raw_entry.get("mid") or 0)
+        except Exception:
+            entry_mid = 0
+        if entry_mid != wanted_mid:
+            continue
+        entry = dict(raw_entry)
+        entry["mid"] = wanted_mid
+        entry["category"] = str(entry.get("category") or "Road").strip() or "Road"
+        entry["slug"] = str(entry.get("slug") or entry.get("tp_name") or entry.get("iracing_name") or f"car-{wanted_mid}").strip()
+        matches.append((str(directory_key), entry))
+    return matches
+
+
+def resolve_tp_team_paint_target(car_value: object, team_id: int, mapping_path: Path | None = None) -> TPTeamPaintTarget:
+    raw = str(car_value or "").strip()
+    if not raw:
+        raise ValueError("Enter a TP car ID, dashboard URL, car name, or iRacing car directory.")
+    mid, slug = _tp_team_extract_mid_slug(raw)
+    mapping: tuple[str, dict] | None = None
+    mapping_entries: list[tuple[str, dict]] = []
+    if mid > 0:
+        mapping_entries = _tp_team_mapping_entries_for_mid(mid, mapping_path)
+        if mapping_entries:
+            mapping = mapping_entries[0]
+    if mapping is None:
+        mapping = _tp_showroom_mapping_entry_for_directory(raw, mapping_path)
+    if mapping is None and slug:
+        mapping = _tp_showroom_mapping_entry_for_name(slug, mapping_path)
+    if mapping is None:
+        mapping = _tp_showroom_mapping_entry_for_name(raw, mapping_path)
+
+    directories: tuple[str, ...]
+    display_name = raw
+    if mapping is not None:
+        mapped_directory, entry = mapping
+        mid = mid or int(entry.get("mid") or 0)
+        slug = slug or str(entry.get("slug") or "").strip()
+        display_name = str(entry.get("tp_name") or entry.get("iracing_name") or slug or raw).strip()
+        if not mapping_entries and mid > 0:
+            mapping_entries = _tp_team_mapping_entries_for_mid(mid, mapping_path)
+        directory_values: list[object] = []
+        for directory_key, mapped_entry in mapping_entries or [mapping]:
+            directory_values.extend(
+                (
+                    directory_key,
+                    mapped_entry.get("directory"),
+                    mapped_entry.get("iracing_directory"),
+                    mapped_entry.get("filepath"),
+                    mapped_entry.get("filepath_full"),
+                )
+            )
+        directory_values.append(mapped_directory)
+        if slug and "://" not in raw:
+            directory_values.append(slug)
+        directories = _tp_team_directory_variants(directory_values)
+    else:
+        directory_values = [slug] if slug else [raw]
+        if raw and "://" not in raw:
+            directory_values.append(raw)
+        directories = _tp_team_directory_variants(directory_values)
+    if not directories:
+        raise ValueError(f"Could not resolve an iRacing paint directory for {raw!r}.")
+    return TPTeamPaintTarget(
+        team_id=int(team_id),
+        raw_car=raw,
+        directories=directories,
+        mid=int(mid or 0),
+        slug=slug,
+        display_name=display_name,
+    )
+
+
+def _tp_team_fetch_payloads(
+    target: TPTeamPaintTarget,
+    *,
+    request_member_id: int = 0,
+    driver_member_id: int = 0,
+    car_number: str = "0",
+) -> list[dict[str, str]]:
+    request_ids = [0]
+    if request_member_id > 0:
+        request_ids.append(int(request_member_id))
+    request_ids.append(int(target.team_id))
+    driver_ids = [0]
+    if driver_member_id > 0:
+        driver_ids.append(int(driver_member_id))
+    if request_member_id > 0:
+        driver_ids.append(int(request_member_id))
+    driver_ids.append(int(target.team_id))
+    request_ids = list(dict.fromkeys(request_ids))
+    driver_ids = list(dict.fromkeys(driver_ids))
+    extras: list[dict[str, str]] = [{}]
+    if target.mid > 0:
+        extras.append({"carid": str(target.mid)})
+    payloads: list[dict[str, str]] = []
+    number = str(car_number or "0").strip() or "0"
+    for directory in target.directories:
+        for request_id in request_ids:
+            for driver_id in driver_ids:
+                for extra in extras:
+                    payload = {
+                        "team": "1",
+                        "user": str(request_id),
+                        "night": "10:00 am",
+                        "series": "0",
+                        "league": "0",
+                        "numbers": "False",
+                        "list": f"{driver_id}={directory}={target.team_id}={number}=",
+                    }
+                    payload.update(extra)
+                    payloads.append(payload)
+    return payloads
+
+
+def _parse_tp_team_fetch_manifest(xml_text: str, target: TPTeamPaintTarget) -> list[DownloadFile]:
+    root = ET.fromstring(xml_text)
+    directory_keys = {str(item or "").strip().lower() for item in target.directories if str(item or "").strip()}
+    directory_keys.update(canonicalize_car_directory(item).lower() for item in target.directories if str(item or "").strip())
+    files: list[DownloadFile] = []
+    for car in root.findall(".//Car"):
+        file_url = (car.findtext("file") or "").strip()
+        type_raw = (car.findtext("type") or "").strip().lower()
+        if not file_url or not type_raw:
+            continue
+        try:
+            paint_type = PaintType(type_raw)
+        except ValueError:
+            continue
+        team_id = _to_int_or_none((car.findtext("teamid") or "0").strip()) or 0
+        if team_id != int(target.team_id):
+            continue
+        directory = (car.findtext("directory") or "").strip()
+        if _is_car_related_paint_type(paint_type):
+            directory_key = directory.strip().lower()
+            canonical_key = canonicalize_car_directory(directory).lower()
+            if directory_keys and directory_key not in directory_keys and canonical_key not in directory_keys:
+                continue
+            target_directory = directory or target.directories[0]
+        else:
+            target_directory = directory or paint_type.value
+        files.append(
+            DownloadFile(
+                download_id=DownloadId(
+                    user_id=int(target.team_id),
+                    directory=target_directory,
+                    paint_type=paint_type,
+                    is_team_paint=True,
+                    is_superspeedway_variant=_manifest_file_url_is_superspeedway_variant(file_url, paint_type),
+                    preserve_on_cleanup=True,
+                    tp_source="team_manual",
+                ),
+                url=file_url,
+            )
+        )
+    return files
+
+
+def _dedupe_tp_team_download_items(items: Iterable[DownloadFile]) -> list[DownloadFile]:
+    by_key: dict[tuple[str, PaintType, str], DownloadFile] = {}
+    for item in items:
+        key = (
+            str(item.url or "").strip(),
+            item.download_id.paint_type,
+            str(item.download_id.directory or "").strip().lower(),
+        )
+        if not key[0]:
+            continue
+        by_key.setdefault(key, item)
+    preferred_order = {
+        PaintType.CAR: 0,
+        PaintType.CAR_NUMBER: 1,
+        PaintType.CAR_SPEC: 2,
+        PaintType.CAR_DECAL: 3,
+        PaintType.HELMET: 4,
+        PaintType.SUIT: 5,
+    }
+    return sorted(
+        by_key.values(),
+        key=lambda item: (
+            preferred_order.get(item.download_id.paint_type, 99),
+            item.download_id.directory.lower(),
+            item.url,
+        ),
+    )
+
+
+def fetch_tp_team_paint_files(
+    target: TPTeamPaintTarget,
+    *,
+    request_member_id: int = 0,
+    driver_member_id: int = 0,
+    car_number: str = "0",
+    retries: int = 3,
+    retry_backoff_seconds: float = 1.5,
+    log: Callable[[str], None] | None = None,
+    cancel_event: threading.Event | None = None,
+) -> tuple[list[DownloadFile], list[str]]:
+    logs: list[str] = []
+
+    def write(message: str) -> None:
+        logs.append(message)
+        if log:
+            log(message)
+
+    payloads = _tp_team_fetch_payloads(
+        target,
+        request_member_id=max(0, int(request_member_id or 0)),
+        driver_member_id=max(0, int(driver_member_id or 0)),
+        car_number=car_number,
+    )
+    found: list[DownloadFile] = []
+    attempts = 0
+    for endpoint in TRADING_PAINTS_FETCH_CONTEXT_URLS:
+        for payload in payloads:
+            if _cancel_requested(cancel_event):
+                return _dedupe_tp_team_download_items(found), logs
+            attempts += 1
+            list_value = payload.get("list", "")
+            for attempt in range(1, max(1, int(retries)) + 1):
+                if _cancel_requested(cancel_event):
+                    return _dedupe_tp_team_download_items(found), logs
+                try:
+                    http = get_thread_http_session()
+                    resp = http.post(endpoint, data=payload, timeout=30)
+                    resp.raise_for_status()
+                    items = _parse_tp_team_fetch_manifest(resp.text, target)
+                    if items:
+                        found.extend(items)
+                        write(f"Team manifest matched {len(items)} file(s) via {endpoint}; list={list_value}.")
+                    break
+                except (requests.RequestException, ET.ParseError) as exc:
+                    if attempt >= max(1, int(retries)):
+                        write(f"Team manifest attempt failed via {endpoint}; list={list_value}; error={exc}")
+                        break
+                    delay = compute_retry_delay(retry_backoff_seconds, attempt)
+                    if cancel_event is not None:
+                        cancel_event.wait(delay)
+                    else:
+                        time.sleep(delay)
+    deduped = _dedupe_tp_team_download_items(found)
+    write(f"Team manifest scan completed: {len(deduped)} unique team asset(s) after {attempts} payload attempt(s).")
+    return deduped, logs
+
+
+def download_tp_team_paints_to_folder(
+    *,
+    team_id: int,
+    car_value: str,
+    destination_dir: Path,
+    mapping_path: Path | None = None,
+    request_member_id: int = 0,
+    driver_member_id: int = 0,
+    car_number: str = "0",
+    retries: int = 3,
+    retry_backoff_seconds: float = 1.5,
+    log: Callable[[str], None] | None = None,
+    cancel_event: threading.Event | None = None,
+) -> dict[str, object]:
+    logs: list[str] = []
+
+    def write(message: str) -> None:
+        logs.append(message)
+        if log:
+            log(message)
+
+    target_team_id = int(team_id)
+    if target_team_id <= 0:
+        raise ValueError("Team ID must be greater than zero.")
+    target = resolve_tp_team_paint_target(car_value, target_team_id, mapping_path=mapping_path)
+    destination = Path(destination_dir)
+    destination.mkdir(parents=True, exist_ok=True)
+    write(
+        "Resolved team target: team_id={team_id}, car={car}, directories={dirs}.".format(
+            team_id=target_team_id,
+            car=target.display_name or target.raw_car,
+            dirs=", ".join(target.directories),
+        )
+    )
+    items, fetch_logs = fetch_tp_team_paint_files(
+        target,
+        request_member_id=request_member_id,
+        driver_member_id=driver_member_id,
+        car_number=car_number,
+        retries=retries,
+        retry_backoff_seconds=retry_backoff_seconds,
+        log=write,
+        cancel_event=cancel_event,
+    )
+    logs.extend(line for line in fetch_logs if line not in logs)
+    if not items:
+        return {
+            "ok": False,
+            "downloaded": 0,
+            "saved": 0,
+            "target": target,
+            "destination": destination,
+            "saved_files": [],
+            "logs": logs,
+            "message": "No team assets were returned for that Team ID and car directory.",
+        }
+    temp_root = default_temp_dir() / "TeamPaintDownloads"
+    temp_session_id = SessionId(int(time.time() * 1000), None)
+    downloaded_files: list[DownloadedFile] = []
+    for index, item in enumerate(items, start=1):
+        downloaded = download_file(
+            temp_session_id,
+            temp_root,
+            item,
+            retries=max(1, int(retries)),
+            retry_backoff_seconds=retry_backoff_seconds,
+            ordinal=index,
+            total=len(items),
+            cancel_event=cancel_event,
+        )
+        if downloaded is None:
+            write(f"Team asset unavailable or failed: {item.download_id.paint_type.value} {item.url}")
+            continue
+        downloaded_files.append(downloaded)
+    saved_items: list[SavedFile] = []
+    for downloaded in downloaded_files:
+        saved = move_or_extract(
+            downloaded,
+            destination,
+            retries=max(1, int(retries)),
+            retry_backoff_seconds=retry_backoff_seconds,
+            cancel_event=cancel_event,
+        )
+        if saved:
+            saved_items.extend(saved)
+    saved_paths = [str(item.file_path) for item in saved_items]
+    for path in saved_paths:
+        write(f"Saved team paint: {path}")
+    ok = bool(saved_items)
+    return {
+        "ok": ok,
+        "downloaded": len(downloaded_files),
+        "saved": len(saved_items),
+        "target": target,
+        "destination": destination,
+        "saved_files": saved_paths,
+        "logs": logs,
+        "message": f"Saved {len(saved_items)} team paint file(s)." if ok else "Team assets were found, but none could be saved.",
+    }
 
 def _candidate_local_tp_paths(
     paints_dir: Path,
@@ -7273,7 +7756,7 @@ def _tp_manifest_items_for_directory(items: list[DownloadFile], directory: str) 
     wanted = set(_tp_directory_candidate_keys(directory))
     result: list[DownloadFile] = []
     for item in items:
-        if item.download_id.paint_type not in {PaintType.CAR, PaintType.CAR_SPEC, PaintType.CAR_DECAL}:
+        if item.download_id.paint_type not in {PaintType.CAR, PaintType.CAR_NUMBER, PaintType.CAR_SPEC, PaintType.CAR_DECAL}:
             continue
         if str(item.download_id.directory or '').strip().lower() in wanted:
             result.append(item)
@@ -7314,12 +7797,77 @@ def _tp_latest_manifest_items_by_paint_type(items: list[DownloadFile]) -> list[D
             latest[item.download_id.paint_type] = (freshness_key, item)
     preferred_order = (
         PaintType.CAR,
+        PaintType.CAR_NUMBER,
         PaintType.CAR_SPEC,
         PaintType.CAR_DECAL,
         PaintType.HELMET,
         PaintType.SUIT,
     )
     return [latest[paint_type][1] for paint_type in preferred_order if paint_type in latest]
+
+def _download_variant_selection_key(item: DownloadFile) -> tuple[bool, int, str, PaintType, bool]:
+    return (
+        bool(item.download_id.is_team_paint),
+        int(item.download_id.user_id),
+        str(item.download_id.directory or '').lower(),
+        item.download_id.paint_type,
+        bool(item.download_id.is_numbered_car_spec),
+    )
+
+def _select_manifest_variants_for_track(is_superspeedway_track: bool, items: list[DownloadFile]) -> list[DownloadFile]:
+    grouped: dict[tuple[bool, int, str, PaintType, bool], list[tuple[int, DownloadFile]]] = {}
+    for sequence, item in enumerate(items or []):
+        if not str(item.url or '').strip():
+            continue
+        grouped.setdefault(_download_variant_selection_key(item), []).append((sequence, item))
+    selected: list[DownloadFile] = []
+    for _key, group in grouped.items():
+        paint_type = group[0][1].download_id.paint_type
+        candidates = group
+        if _is_car_related_paint_type(paint_type):
+            if is_superspeedway_track:
+                ss_candidates = [entry for entry in group if entry[1].download_id.is_superspeedway_variant]
+                if ss_candidates:
+                    candidates = ss_candidates
+                else:
+                    candidates = [entry for entry in group if not entry[1].download_id.is_superspeedway_variant]
+            else:
+                candidates = [entry for entry in group if not entry[1].download_id.is_superspeedway_variant]
+        if not candidates:
+            continue
+        _sequence, item = max(candidates, key=lambda entry: _tp_manifest_item_freshness_key(entry[1], entry[0]))
+        selected.append(item)
+    preferred_order = {
+        PaintType.CAR: 0,
+        PaintType.CAR_NUMBER: 1,
+        PaintType.CAR_SPEC: 2,
+        PaintType.CAR_DECAL: 3,
+        PaintType.HELMET: 4,
+        PaintType.SUIT: 5,
+    }
+    return sorted(
+        selected,
+        key=lambda item: (
+            bool(item.download_id.is_team_paint),
+            int(item.download_id.user_id),
+            str(item.download_id.directory or '').lower(),
+            preferred_order.get(item.download_id.paint_type, 99),
+            item.download_id.paint_type.value,
+        ),
+    )
+
+def _select_manifest_variants_for_session(session: Session, items: list[DownloadFile]) -> list[DownloadFile]:
+    return _select_manifest_variants_for_track(bool(session.is_superspeedway_track), items)
+
+def _manifest_has_car_related_items(items: list[DownloadFile]) -> bool:
+    return any(_is_car_related_paint_type(item.download_id.paint_type) for item in items or [])
+
+def _manifest_has_superspeedway_variant(items: list[DownloadFile]) -> bool:
+    return any(
+        _is_car_related_paint_type(item.download_id.paint_type)
+        and bool(item.download_id.is_superspeedway_variant)
+        for item in items or []
+    )
 
 def _tp_manifest_url_map(items: list[DownloadFile]) -> dict[str, str]:
     result: dict[str, str] = {}
@@ -7492,6 +8040,7 @@ def _tp_wait_for_fetch_user_manifest(
     timeout_seconds: float,
     log: Callable[[str], None] | None = None,
     cancel_event: threading.Event | None = None,
+    superspeedway_variant: bool = False,
 ) -> list[DownloadFile]:
     _ = (retries, retry_backoff_seconds)
     deadline = time.monotonic() + max(4.0, float(timeout_seconds))
@@ -7504,7 +8053,11 @@ def _tp_wait_for_fetch_user_manifest(
         remaining = max(1.5, deadline - time.monotonic())
         request_timeout = min(6.0, remaining)
         try:
-            manifest = _fetch_user_files_fast_uncached(local_user_id, request_timeout=request_timeout)
+            manifest = _fetch_user_files_fast_uncached(
+                local_user_id,
+                request_timeout=request_timeout,
+                superspeedway_variant=superspeedway_variant,
+            )
         except Exception as exc:
             if log is not None and poll_attempt in {1, 3, 6}:
                 log(f"Trading Paints direct manifest poll failed for local user {local_user_id}: {exc}")
@@ -7513,7 +8066,14 @@ def _tp_wait_for_fetch_user_manifest(
             else:
                 time.sleep(0.9)
             continue
-        filtered = _tp_latest_manifest_items_by_paint_type(_tp_manifest_items_for_directory(manifest, directory))
+        directory_items = _tp_manifest_items_for_directory(manifest, directory)
+        if superspeedway_variant and not _manifest_has_car_related_items(directory_items):
+            try:
+                manifest = _fetch_user_files_fast_uncached(local_user_id, request_timeout=request_timeout)
+                directory_items = _tp_manifest_items_for_directory(manifest, directory)
+            except Exception:
+                pass
+        filtered = _select_manifest_variants_for_track(superspeedway_variant, directory_items)
         if filtered:
             best_effort = filtered
             changed_items = _tp_manifest_items_changed_from_baseline(filtered, baseline_urls)
@@ -7552,6 +8112,7 @@ def _tp_wait_for_fetch_user_manifest_match(
     timeout_seconds: float,
     log: Callable[[str], None] | None = None,
     cancel_event: threading.Event | None = None,
+    superspeedway_variant: bool = False,
 ) -> list[DownloadFile]:
     _ = (retries, retry_backoff_seconds)
     deadline = time.monotonic() + max(4.0, float(timeout_seconds))
@@ -7563,7 +8124,11 @@ def _tp_wait_for_fetch_user_manifest_match(
         remaining = max(1.5, deadline - time.monotonic())
         request_timeout = min(6.0, remaining)
         try:
-            manifest = _fetch_user_files_fast_uncached(local_user_id, request_timeout=request_timeout)
+            manifest = _fetch_user_files_fast_uncached(
+                local_user_id,
+                request_timeout=request_timeout,
+                superspeedway_variant=superspeedway_variant,
+            )
         except Exception as exc:
             if log is not None and poll_attempt in {1, 3, 6}:
                 log(f"Trading Paints restore manifest poll failed for local user {local_user_id}: {exc}")
@@ -7572,7 +8137,14 @@ def _tp_wait_for_fetch_user_manifest_match(
             else:
                 time.sleep(0.9)
             continue
-        filtered = _tp_latest_manifest_items_by_paint_type(_tp_manifest_items_for_directory(manifest, directory))
+        directory_items = _tp_manifest_items_for_directory(manifest, directory)
+        if superspeedway_variant and not _manifest_has_car_related_items(directory_items):
+            try:
+                manifest = _fetch_user_files_fast_uncached(local_user_id, request_timeout=request_timeout)
+                directory_items = _tp_manifest_items_for_directory(manifest, directory)
+            except Exception:
+                pass
+        filtered = _select_manifest_variants_for_track(superspeedway_variant, directory_items)
         if filtered:
             best_effort = filtered
             current_urls = _tp_manifest_url_map(filtered)
@@ -7589,8 +8161,8 @@ def _tp_retarget_manifest_items_for_user(session: Session, user: SessionUser, it
     target_is_team = session_user_uses_team_target(user)
     target_id = int(user.team_id) if target_is_team else int(user.user_id)
     result: list[DownloadFile] = []
-    for item in _tp_latest_manifest_items_by_paint_type(items):
-        if item.download_id.paint_type not in {PaintType.CAR, PaintType.CAR_SPEC, PaintType.CAR_DECAL}:
+    for item in _select_manifest_variants_for_session(session, items):
+        if item.download_id.paint_type not in {PaintType.CAR, PaintType.CAR_NUMBER, PaintType.CAR_SPEC, PaintType.CAR_DECAL}:
             continue
         result.append(
             DownloadFile(
@@ -7599,13 +8171,11 @@ def _tp_retarget_manifest_items_for_user(session: Session, user: SessionUser, it
                     user_id=target_id,
                     directory=user.directory,
                     is_team_paint=target_is_team,
-                    is_superspeedway_variant=_download_uses_superspeedway_variant(
-                        user.directory,
-                        item.download_id.paint_type,
-                        session.is_superspeedway_track,
-                    ),
+                    is_superspeedway_variant=item.download_id.is_superspeedway_variant,
                 ),
                 url=item.url,
+                ai_roster_optional_filename=item.ai_roster_optional_filename,
+                ai_roster_dir=item.ai_roster_dir,
             )
         )
     return result
@@ -8325,6 +8895,7 @@ def choose_and_sync_showroom_paint(
     forced_scheme_title: str = "",
     force_showroom_ui_activation: bool = False,
     cancel_event: threading.Event | None = None,
+    superspeedway_variant: bool = False,
 ) -> TPShowroomSyncResult:
     def write(msg: str) -> None:
         if log:
@@ -8826,6 +9397,7 @@ def choose_and_sync_showroom_paint(
             timeout_seconds=(TP_MULE_MANIFEST_TIMEOUT_SECONDS if fast_mule_mode else timeout_seconds),
             log=write,
             cancel_event=cancel_event,
+            superspeedway_variant=superspeedway_variant,
         )
         if not direct_items:
             return TPShowroomSyncResult(
@@ -9733,6 +10305,7 @@ def _process_tp_showroom_fallback_lane(
                         forced_scheme_title=forced_scheme_title,
                         timeout_seconds=TP_ONLINE_FALLBACK_TARGET_TIMEOUT_SECONDS,
                         cancel_event=cancel_event,
+                        superspeedway_variant=bool(session.is_superspeedway_track),
                     )
                 except Exception as exc:  # noqa: BLE001
                     logs.append(f"Trading Paints showroom fallback errored for {'AI' if user.is_ai else 'driver'} {label} on {user.directory}: {exc}")
@@ -9933,6 +10506,7 @@ def _process_tp_showroom_fallback_lane(
                         force_showroom_ui_activation=retry_attempt >= TP_ONLINE_FALLBACK_FINAL_UI_RETRY_AFTER_ATTEMPTS,
                         timeout_seconds=TP_ONLINE_FALLBACK_FINAL_POLL_SECONDS,
                         cancel_event=cancel_event,
+                        superspeedway_variant=bool(session.is_superspeedway_track),
                     )
                 except Exception as exc:  # noqa: BLE001
                     retry_result = TPShowroomSyncResult(ok=False, chosen_scheme_id=retry_seed_result.chosen_scheme_id, chosen_title=retry_seed_result.chosen_title, message=str(exc), set_scheme_applied=True)
@@ -10039,6 +10613,7 @@ def _process_tp_showroom_fallback_lane(
                         timeout_seconds=10.0,
                         log=logging.info,
                         cancel_event=cancel_event,
+                        superspeedway_variant=bool(session.is_superspeedway_track),
                     )
                     if refreshed_items:
                         restored_downloads: list[DownloadedFile] = []
@@ -11013,12 +11588,24 @@ def _tp_collection_candidates_for_accessory(items: list[dict], kind: str) -> lis
         and _tp_showroom_scheme_usable_for_online_fallback(item)
     ]
 
-def _choose_tp_collection_candidate(candidates: list[dict], kind: str, used_source_ids: set[str]) -> tuple[dict | None, bool]:
+def _choose_tp_collection_candidate(
+    candidates: list[dict],
+    kind: str,
+    used_source_ids: set[str],
+    *,
+    allow_repeating_when_exhausted: bool = False,
+) -> tuple[dict | None, bool]:
     if not candidates:
         return None, False
     available = [item for item in candidates if _tp_collection_source_id(item, kind) not in used_source_ids]
     if not available:
-        return None, False
+        if not allow_repeating_when_exhausted:
+            return None, False
+        chosen = random.choice(candidates)
+        source_id = _tp_collection_source_id(chosen, kind)
+        if source_id:
+            used_source_ids.add(source_id)
+        return chosen, True
     chosen = random.choice(available)
     source_id = _tp_collection_source_id(chosen, kind)
     if source_id:
@@ -11060,7 +11647,7 @@ def _apply_cached_tp_collection_item_for_user(
                 session.session_id,
                 DownloadId(
                     paint_type=paint_type,
-                    is_superspeedway_variant=bool(session.is_superspeedway_track),
+                    is_superspeedway_variant=False,
                     **base_kwargs,
                 ),
                 paints_dir,
@@ -11286,6 +11873,8 @@ def apply_tp_collection_pool_fallbacks(
     saved_callback: Callable[[list[SavedFile], str], None] | None = None,
     used_source_ids_seed: Iterable[str] | None = None,
     cancel_event: threading.Event | None = None,
+    strict_collection_only: bool = False,
+    allow_repeating_when_exhausted: bool = False,
     _thread_handoff_done: bool = False,
 ) -> tuple[list[SavedFile], list[str], RandomFallbackSummary]:
     source_text = collection_ids if isinstance(collection_ids, str) else " ".join(str(item) for item in collection_ids)
@@ -11375,21 +11964,44 @@ def apply_tp_collection_pool_fallbacks(
             except Exception:
                 logging.debug("Collection pool save callback failed", exc_info=True)
 
-    def _apply_choice(user: SessionUser, kind: str, candidates: list[dict]) -> None:
+    def _apply_choice(user: SessionUser, kind: str, candidates: list[dict]) -> bool:
         target_is_team = session_user_uses_team_target(user)
         target_id = int(user.team_id) if target_is_team else int(user.user_id)
         label = user.display_name or (f"AI {target_id}" if user.is_ai else f"user {target_id}")
         summary.attempted_targets += 1
-        chosen, reused_existing_source = _choose_tp_collection_candidate(candidates, kind, used_source_ids)
+        chosen, reused_existing_source = _choose_tp_collection_candidate(
+            candidates,
+            kind,
+            used_source_ids,
+            allow_repeating_when_exhausted=bool(allow_repeating_when_exhausted),
+        )
         if chosen is None:
             summary.missing_source_targets += 1
             if candidates:
-                logs.append(f"Trading Paints collection pool exhausted its non-repeating {kind} sources for {'AI' if user.is_ai else 'driver'} {label} on {user.directory}; normal online fallback may cover this target.")
+                if strict_collection_only:
+                    logs.append(
+                        f"Trading Paints collection-only mode ran out of unused {kind} paints for "
+                        f"{'AI' if user.is_ai else 'driver'} {label} on {user.directory}. "
+                        f"The selected collections do not have another allowed {kind} source, so this target will be left unchanged."
+                    )
+                else:
+                    logs.append(f"Trading Paints collection pool exhausted its non-repeating {kind} sources for {'AI' if user.is_ai else 'driver'} {label} on {user.directory}; normal online fallback may cover this target.")
             else:
-                logs.append(f"Trading Paints collection pool had no usable {kind} source for {'AI' if user.is_ai else 'driver'} {label} on {user.directory}.")
-            return
+                if strict_collection_only:
+                    logs.append(
+                        f"Trading Paints collection-only mode found no usable {kind} paint in the selected collections for "
+                        f"{'AI' if user.is_ai else 'driver'} {label} on {user.directory}. "
+                        f"This target will be left unchanged."
+                    )
+                else:
+                    logs.append(f"Trading Paints collection pool had no usable {kind} source for {'AI' if user.is_ai else 'driver'} {label} on {user.directory}.")
+            return False
         if reused_existing_source:
             summary.repeated_source_uses += 1
+            logs.append(
+                f"Trading Paints collection pool reused an already used {kind} source from the selected collections for "
+                f"{'AI' if user.is_ai else 'driver'} {label} on {user.directory} because repeat mode is enabled and no unused collection paints remained."
+            )
         collection_id = str(chosen.get("_nishizumi_collection_id") or "").strip()
         scheme_id = _tp_collection_scheme_id(chosen)
         title = _tp_collection_title(chosen)
@@ -11405,7 +12017,7 @@ def apply_tp_collection_pool_fallbacks(
             _record_saved(cached_items)
             summary.applied_targets += 1
             logs.append(f"Trading Paints collection pool applied cached {kind} to {'AI' if user.is_ai else 'driver'} {label} using collection {collection_id}, scheme {scheme_id} ({title}).")
-            return
+            return True
         result = _tp_collection_public_direct_result(
             item=chosen,
             kind=kind,
@@ -11417,7 +12029,7 @@ def apply_tp_collection_pool_fallbacks(
                 f"Trading Paints collection pool picked uncached {kind} scheme {scheme_id} from collection {collection_id} for "
                 f"{'AI' if user.is_ai else 'driver'} {label}, but that item is not exposed as a usable public showroom asset."
             )
-            return
+            return False
         try:
             saved_items = _download_and_save_tp_collection_result(
                 session=session,
@@ -11434,7 +12046,7 @@ def apply_tp_collection_pool_fallbacks(
             logging.debug("Trading Paints browserless collection pool public download exception", exc_info=True)
             summary.missing_source_targets += 1
             logs.append(f"Trading Paints collection pool errored while downloading public {kind} scheme {scheme_id} from collection {collection_id}: {exc}")
-            return
+            return False
         if not _tp_collection_saved_items_have_primary_kind(saved_items, kind):
             if saved_items:
                 delete_saved(saved_items, paints_root=paints_dir)
@@ -11443,7 +12055,7 @@ def apply_tp_collection_pool_fallbacks(
                 f"Trading Paints collection pool selected uncached public {kind} scheme {scheme_id} from collection {collection_id}, "
                 f"but the primary public asset was unavailable."
             )
-            return
+            return False
         archive_saved_to_tp_collection_pool(saved_items, collection_pool_dir, collection_id, kind, user.directory, scheme_id, title)
         _record_saved(saved_items)
         summary.applied_targets += 1
@@ -11451,7 +12063,7 @@ def apply_tp_collection_pool_fallbacks(
             f"Trading Paints collection pool downloaded and cached public {kind} for "
             f"{'AI' if user.is_ai else 'driver'} {label} using collection {collection_id}, scheme {scheme_id} ({title})."
         )
-        return
+        return True
 
     for user in sorted(session.users, key=lambda u: (u.is_ai, u.directory.lower(), u.user_id, u.team_id or 0)):
         if _cancel_requested(cancel_event):
@@ -11480,11 +12092,19 @@ def apply_tp_collection_pool_fallbacks(
         target_id = int(user.team_id) if target_is_team else int(user.user_id)
         target_key = (target_is_team, target_id, user.directory.lower())
         accessory_target_key = (target_is_team, target_id)
+        missing_strict_collection_car = False
         if car_enabled_for_user and target_key not in existing_car_targets:
-            _apply_choice(user, "car", _car_candidates_for_directory(user.directory))
-        if bool(random_helmets) and helmet_enabled_for_user and accessory_target_key not in existing_helmet_targets:
+            car_applied = _apply_choice(user, "car", _car_candidates_for_directory(user.directory))
+            missing_strict_collection_car = bool(strict_collection_only and not car_applied)
+            if missing_strict_collection_car:
+                label = user.display_name or (f"AI {target_id}" if user.is_ai else f"user {target_id}")
+                logs.append(
+                    f"Trading Paints collection-only mode will not assign helmet or suit fallback to "
+                    f"{'AI' if user.is_ai else 'driver'} {label} on {user.directory} because no collection car paint could be applied."
+                )
+        if not missing_strict_collection_car and bool(random_helmets) and helmet_enabled_for_user and accessory_target_key not in existing_helmet_targets:
             _apply_choice(user, "helmet", _accessory_candidates_for_kind("helmet"))
-        if bool(random_suits) and suit_enabled_for_user and accessory_target_key not in existing_suit_targets:
+        if not missing_strict_collection_car and bool(random_suits) and suit_enabled_for_user and accessory_target_key not in existing_suit_targets:
             _apply_choice(user, "suit", _accessory_candidates_for_kind("suit"))
     if skipped_team_event_targets > 0:
         logs.append(f"Random fallback in team events is disabled, so Nishizumi Paints skipped {skipped_team_event_targets} team target(s).")
@@ -11648,8 +12268,9 @@ def apply_tp_showroom_fallbacks_public(
             if result.reused_previous_scheme:
                 summary.repeated_source_uses += 1
             title = str(result.chosen_title or "").strip()
+            fallback_target_phrase = "applied to"
             logs.append(
-                f"Public showroom random {normalized_kind} fallback applied to {'AI' if user.is_ai else 'driver'} {label}: scheme {chosen_scheme_id}{f' - {title}' if title else ''}."
+                f"Public showroom random {normalized_kind} fallback {fallback_target_phrase} {'AI' if user.is_ai else 'driver'} {label}: scheme {chosen_scheme_id}{f' - {title}' if title else ''}."
             )
             return True
         logs.append(f"Public showroom {normalized_kind} fallback could not cover {label}; using the local random pool backup if available.")
@@ -11775,8 +12396,9 @@ def apply_tp_showroom_fallbacks_public(
                         summary.repeated_source_uses += 1
                     car_still_needs_local = False
                     title = str(result.chosen_title or "").strip()
+                    fallback_target_phrase = "applied to"
                     logs.append(
-                        f"Public showroom random car fallback applied to {'AI' if user.is_ai else 'driver'} {label} on {user.directory}: scheme {chosen_scheme_id}{f' - {title}' if title else ''}."
+                        f"Public showroom random car fallback {fallback_target_phrase} {'AI' if user.is_ai else 'driver'} {label} on {user.directory}: scheme {chosen_scheme_id}{f' - {title}' if title else ''}."
                     )
                     break
                 if car_still_needs_local:
@@ -12251,12 +12873,14 @@ def apply_tp_showroom_fallbacks(
     save_tp_recent_schemes(recent_schemes_by_directory)
     return fallback_saved, logs, summary
 
-def _build_fetch_context_payload(session: Session, user: SessionUser) -> dict[str, str] | None:
+def _build_fetch_context_payload(session: Session, user: SessionUser, superspeedway_variant: bool = False) -> dict[str, str] | None:
     context = session.trading_paints_context()
     if context is None:
         return None
     payload = dict(context)
     payload["list"] = user.trading_paints_list_value()
+    if superspeedway_variant and session.is_superspeedway_track:
+        payload["ss"] = "1"
     return payload
 def _matches_context_manifest_entry(user: SessionUser, car: ET.Element) -> bool:
     car_id = (car.findtext("carid") or '').strip()
@@ -12309,7 +12933,7 @@ def _read_ai_roster_payload(roster_dir: Path) -> tuple[dict[str, list[dict]], li
     return {"drivers": normalized_drivers}, normalized_drivers
 def _ai_roster_asset_id_from_filename(filename: str) -> str | None:
     name = Path(str(filename or '').strip()).name
-    match = re.search(r"_(\d+)(?:_spec)?\.(?:tga|mip)$", name, re.IGNORECASE)
+    match = re.search(r"_(\d+)(?:_(?:ss|spec))*\.(?:tga|mip)$", name, re.IGNORECASE)
     if not match:
         return None
     return match.group(1)
@@ -12510,11 +13134,92 @@ def _normalize_ai_car_number(value: object) -> str:
         return "0"
     stripped = text.lstrip("0")
     return stripped or "0"
+def _ai_roster_dir_is_generated_random(roster_dir: Path) -> bool:
+    if roster_dir.name.casefold() == AI_GENERIC_RANDOM_ROSTER_NAME.casefold():
+        return True
+    meta = _load_ai_roster_metadata(roster_dir)
+    source_name = str(meta.get("source_name") or '').casefold()
+    return "generic ai session random fallback" in source_name
+def _ai_roster_dir_is_local(roster_dir: Path) -> bool:
+    meta = _load_ai_roster_metadata(roster_dir)
+    if bool(meta.get("is_local")):
+        return True
+    return not bool(str(meta.get("roster_id") or '').strip() or str(meta.get("roster_file") or '').strip())
+def _score_ai_roster_against_session(session: Session, drivers: list[dict]) -> tuple[int, int, int, int]:
+    ai_users = [user for user in session.users if user.is_ai]
+    if not ai_users or not drivers:
+        return (0, 0, 0, len(ai_users))
+    exact_matches = 0
+    name_matches = 0
+    index_matches = 0
+    for user in ai_users:
+        user_name = _normalize_ai_match_text(user.display_name)
+        user_number = _normalize_ai_car_number(user.number)
+        user_path = _normalize_ai_car_path(user.directory)
+        matched_name = False
+        for driver in drivers:
+            if not isinstance(driver, dict):
+                continue
+            driver_name = _normalize_ai_match_text(driver.get('driverName') or driver.get('name'))
+            if not user_name or driver_name != user_name:
+                continue
+            matched_name = True
+            driver_number = _normalize_ai_car_number(driver.get('carNumber'))
+            driver_path = _normalize_ai_car_path(driver.get('carPath'))
+            if driver_number == user_number and (not user_path or not driver_path or driver_path == user_path):
+                exact_matches += 1
+            break
+        if matched_name:
+            name_matches += 1
+        fallback_index = int(user.user_id) - 9700
+        if 0 <= fallback_index < len(drivers):
+            driver = drivers[fallback_index]
+            driver_number = _normalize_ai_car_number(driver.get('carNumber') if isinstance(driver, dict) else None)
+            driver_path = _normalize_ai_car_path(driver.get('carPath') if isinstance(driver, dict) else None)
+            if driver_number == user_number and (not user_path or not driver_path or driver_path == user_path):
+                index_matches += 1
+    return (exact_matches, name_matches, index_matches, len(ai_users))
+def _infer_active_ai_roster_dir_from_session(session: Session, ai_rosters_dir: Path) -> Path | None:
+    if session.ai_driver_count <= 0 or not ai_rosters_dir.exists():
+        return None
+    ai_users = [user for user in session.users if user.is_ai]
+    if not ai_users:
+        return None
+    name_threshold = max(5, (len(ai_users) + 3) // 4)
+    exact_threshold = max(2, (len(ai_users) + 4) // 5)
+    regular_candidates: list[tuple[int, int, int, float, Path]] = []
+    generated_candidates: list[tuple[int, int, int, float, Path]] = []
+    for child in ai_rosters_dir.iterdir():
+        if not child.is_dir() or not (child / "roster.json").exists():
+            continue
+        try:
+            _payload, drivers = _read_ai_roster_payload(child)
+        except Exception:
+            continue
+        exact_matches, name_matches, index_matches, total_ai = _score_ai_roster_against_session(session, drivers)
+        if exact_matches < exact_threshold and name_matches < name_threshold:
+            continue
+        try:
+            freshness = float((child / "roster.json").stat().st_mtime)
+        except OSError:
+            freshness = 0.0
+        candidate = (exact_matches, name_matches, index_matches, freshness, child)
+        if _ai_roster_dir_is_generated_random(child):
+            generated_candidates.append(candidate)
+        else:
+            regular_candidates.append(candidate)
+    candidates = regular_candidates or generated_candidates
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: (item[0], item[1], item[2], item[3]), reverse=True)
+    return candidates[0][4]
 def _find_roster_driver_for_session_ai(user: SessionUser, drivers: list[dict]) -> dict | None:
     user_name = _normalize_ai_match_text(user.display_name)
     user_number = _normalize_ai_car_number(user.number)
     user_path = _normalize_ai_car_path(user.directory)
     fallback_index = int(user.user_id) - 9700
+    best_name_path_match: dict | None = None
+    best_name_number_match: dict | None = None
     best_name_match: dict | None = None
     best_index_match: dict | None = None
     for index, driver in enumerate(drivers):
@@ -12526,17 +13231,24 @@ def _find_roster_driver_for_session_ai(user: SessionUser, drivers: list[dict]) -
         if user_name and driver_name == user_name:
             if driver_number == user_number and (not user_path or not driver_path or driver_path == user_path):
                 return driver
+            if user_path and driver_path == user_path and best_name_path_match is None:
+                best_name_path_match = driver
+            if user_number and driver_number == user_number and best_name_number_match is None:
+                best_name_number_match = driver
             if best_name_match is None:
                 best_name_match = driver
         if index == fallback_index:
             best_index_match = driver
-    return best_name_match or best_index_match
+    return best_name_path_match or best_name_number_match or best_name_match or best_index_match
 def fetch_active_ai_roster_collection_files(session: Session, user: SessionUser, ai_rosters_dir: Path | None) -> list[DownloadFile]:
     if not user.is_ai or ai_rosters_dir is None:
         return []
     roster_dir = _find_active_ai_roster_dir(session, ai_rosters_dir)
     if roster_dir is None:
         logging.debug("AI collection lookup skipped for %s: active AI roster is not synced locally yet.", user.display_name or user.user_id)
+        return []
+    if _ai_roster_dir_is_local(roster_dir):
+        logging.debug("AI collection lookup skipped for %s: active AI roster %s is local.", user.display_name or user.user_id, roster_dir.name)
         return []
     try:
         _payload, drivers = _read_ai_roster_payload(roster_dir)
@@ -12560,6 +13272,7 @@ def fetch_active_ai_roster_collection_files(session: Session, user: SessionUser,
                     directory=user.directory,
                     paint_type=car_paint_type,
                     is_team_paint=False,
+                    is_superspeedway_variant=_paint_filename_is_superspeedway_variant(car_tga_name, car_paint_type),
                 ),
                 url=_ai_roster_asset_url(car_asset_id, car_tga_name),
             )
@@ -12573,6 +13286,7 @@ def fetch_active_ai_roster_collection_files(session: Session, user: SessionUser,
                         directory=user.directory,
                         paint_type=PaintType.CAR_SPEC,
                         is_team_paint=False,
+                        is_superspeedway_variant=_paint_filename_is_superspeedway_variant(spec_name, PaintType.CAR_SPEC),
                         is_numbered_car_spec=is_numbered_car,
                     ),
                     url=_ai_roster_asset_url(car_asset_id, spec_name),
@@ -12612,6 +13326,10 @@ def _find_active_ai_roster_dir(session: Session, ai_rosters_dir: Path) -> Path |
             return child
         if session.ai_roster_name and str(meta.get('name') or '') == session.ai_roster_name:
             return child
+    if not session.ai_roster_name and not session.ai_roster_id:
+        inferred = _infer_active_ai_roster_dir_from_session(session, ai_rosters_dir)
+        if inferred is not None:
+            return inferred
     return None
 def session_uses_trading_paints_ai_collection(session: Session, ai_rosters_dir: Path | None) -> bool:
     if ai_rosters_dir is None or session.ai_driver_count <= 0:
@@ -12623,6 +13341,215 @@ def session_uses_trading_paints_ai_collection(session: Session, ai_rosters_dir: 
     if bool(meta.get("is_local")):
         return False
     return bool(meta.get("roster_id") or meta.get("roster_file"))
+def session_uses_local_ai_roster(session: Session, ai_rosters_dir: Path | None) -> bool:
+    if ai_rosters_dir is None or session.ai_driver_count <= 0:
+        return False
+    roster_dir = _find_active_ai_roster_dir(session, ai_rosters_dir)
+    if roster_dir is None:
+        return False
+    return _ai_roster_dir_is_local(roster_dir)
+
+def _ai_roster_local_file(roster_dir: Path, filename: object) -> Path | None:
+    name = Path(str(filename or "").strip()).name
+    if not name:
+        return None
+    try:
+        path = safe_join_under(roster_dir, name)
+    except Exception:
+        return None
+    return path if path.exists() else None
+
+def _apply_local_ai_roster_driver_to_session(
+    *,
+    session: Session,
+    user: SessionUser,
+    paints_dir: Path,
+    roster_dir: Path,
+    driver: dict,
+    need_car: bool,
+    need_helmet: bool,
+    need_suit: bool,
+) -> list[SavedFile]:
+    target_id = int(user.user_id)
+    base_kwargs = {
+        "user_id": target_id,
+        "directory": user.directory,
+        "is_team_paint": False,
+        "is_superspeedway_variant": False,
+        "tp_title": f"Local AI roster {roster_dir.name}",
+        "tp_source": "local_ai_roster",
+    }
+    saved_items: list[SavedFile] = []
+    if need_car:
+        car_name = Path(str(driver.get("carTgaName") or "").strip()).name
+        car_source = _ai_roster_local_file(roster_dir, car_name)
+        if car_source is not None:
+            car_asset_id = _ai_roster_asset_id_from_filename(car_name) or ""
+            car_paint_type = _ai_roster_car_paint_type(car_name)
+            for paint_type, source_path in (
+                (car_paint_type, car_source),
+                (PaintType.CAR_SPEC, _ai_roster_local_file(roster_dir, _ai_roster_spec_filename(car_name))),
+            ):
+                if source_path is None:
+                    continue
+                copied = _copy_source_file_to_saved_targets(
+                    source_path,
+                    session.session_id,
+                    DownloadId(
+                        paint_type=paint_type,
+                        tp_scheme_id=car_asset_id,
+                        **base_kwargs,
+                    ),
+                    paints_dir,
+                )
+                if copied:
+                    saved_items.extend(copied)
+    if need_helmet:
+        helmet_name = Path(str(driver.get("helmetTgaName") or "").strip()).name
+        helmet_source = _ai_roster_local_file(roster_dir, helmet_name)
+        if helmet_source is not None:
+            copied = _copy_source_file_to_saved_targets(
+                helmet_source,
+                session.session_id,
+                DownloadId(
+                    paint_type=PaintType.HELMET,
+                    tp_scheme_id=_ai_roster_asset_id_from_filename(helmet_name) or "",
+                    **base_kwargs,
+                ),
+                paints_dir,
+            )
+            if copied:
+                saved_items.extend(copied)
+    if need_suit:
+        suit_name = Path(str(driver.get("suitTgaName") or "").strip()).name
+        suit_source = _ai_roster_local_file(roster_dir, suit_name)
+        if suit_source is not None:
+            copied = _copy_source_file_to_saved_targets(
+                suit_source,
+                session.session_id,
+                DownloadId(
+                    paint_type=PaintType.SUIT,
+                    tp_scheme_id=_ai_roster_asset_id_from_filename(suit_name) or "",
+                    **base_kwargs,
+                ),
+                paints_dir,
+            )
+            if copied:
+                saved_items.extend(copied)
+    return saved_items
+
+def apply_local_ai_roster_live_paints(
+    *,
+    session: Session,
+    saved: list[SavedFile],
+    paints_dir: Path,
+    ai_rosters_dir: Path | None,
+    saved_callback: Callable[[list[SavedFile], str], None] | None = None,
+) -> tuple[list[SavedFile], list[str]]:
+    logs: list[str] = []
+    applied: list[SavedFile] = []
+    if ai_rosters_dir is None or session.ai_driver_count <= 0:
+        return applied, logs
+    if not _session_has_named_ai_roster(session):
+        logs.append(
+            "Local AI roster live apply skipped because the current AI session does not expose a roster name or ID. "
+            "Nishizumi Paints will treat this as a live random AI session and apply paints directly to the session targets instead."
+        )
+        return applied, logs
+    roster_dir = _find_active_ai_roster_dir(session, ai_rosters_dir)
+    if roster_dir is None or not _ai_roster_dir_is_local(roster_dir):
+        return applied, logs
+    try:
+        _payload, drivers = _read_ai_roster_payload(roster_dir)
+    except Exception as exc:
+        logs.append(f"Local AI roster live apply could not read roster {roster_dir.name}: {exc}")
+        return applied, logs
+    exact_matches, name_matches, index_matches, total_ai = _score_ai_roster_against_session(session, drivers)
+    logs.append(
+        f"Local AI roster live apply is mirroring roster {roster_dir.name} into the active session "
+        f"({name_matches}/{total_ai} name matches, {exact_matches} exact, {index_matches} index)."
+    )
+    existing_car_targets = {
+        (bool(item.download_id.is_team_paint), int(item.download_id.user_id), item.download_id.directory.lower())
+        for item in saved
+        if item.download_id.paint_type in {PaintType.CAR, PaintType.CAR_NUMBER}
+    }
+    existing_helmet_targets = {
+        (bool(item.download_id.is_team_paint), int(item.download_id.user_id))
+        for item in saved
+        if item.download_id.paint_type is PaintType.HELMET
+    }
+    existing_suit_targets = {
+        (bool(item.download_id.is_team_paint), int(item.download_id.user_id))
+        for item in saved
+        if item.download_id.paint_type is PaintType.SUIT
+    }
+    matched_users = 0
+    copied_targets = 0
+    copied_cars = 0
+    copied_helmets = 0
+    copied_suits = 0
+    missing_targets = 0
+    for user in sorted((item for item in session.users if item.is_ai), key=lambda item: (item.directory.lower(), item.user_id)):
+        driver = _find_roster_driver_for_session_ai(user, drivers)
+        if driver is None:
+            continue
+        matched_users += 1
+        target_key = (False, int(user.user_id), user.directory.lower())
+        accessory_key = (False, int(user.user_id))
+        need_car = target_key not in existing_car_targets
+        need_helmet = accessory_key not in existing_helmet_targets
+        need_suit = accessory_key not in existing_suit_targets
+        if not (need_car or need_helmet or need_suit):
+            continue
+        saved_items = _apply_local_ai_roster_driver_to_session(
+            session=session,
+            user=user,
+            paints_dir=paints_dir,
+            roster_dir=roster_dir,
+            driver=driver,
+            need_car=need_car,
+            need_helmet=need_helmet,
+            need_suit=need_suit,
+        )
+        if not saved_items:
+            missing_targets += 1
+            continue
+        applied.extend(saved_items)
+        copied_targets += 1
+        for item in saved_items:
+            if item.download_id.paint_type in {PaintType.CAR, PaintType.CAR_NUMBER}:
+                copied_cars += 1
+                existing_car_targets.add((False, int(item.download_id.user_id), item.download_id.directory.lower()))
+            elif item.download_id.paint_type is PaintType.HELMET:
+                copied_helmets += 1
+                existing_helmet_targets.add((False, int(item.download_id.user_id)))
+            elif item.download_id.paint_type is PaintType.SUIT:
+                copied_suits += 1
+                existing_suit_targets.add((False, int(item.download_id.user_id)))
+        if saved_callback is not None:
+            try:
+                saved_callback(saved_items, "fallback_local")
+            except Exception:
+                logging.debug("Local AI roster live apply callback failed", exc_info=True)
+    if applied:
+        logs.append(
+            f"Local AI roster live apply copied {copied_cars} car file(s), {copied_helmets} helmet file(s), and {copied_suits} suit file(s) "
+            f"for {copied_targets} AI target(s) from roster {roster_dir.name}."
+        )
+    else:
+        logs.append(
+            f"Local AI roster live apply found roster {roster_dir.name}, but no usable roster paint files could be copied into the active session."
+        )
+    if matched_users < session.ai_driver_count:
+        logs.append(
+            f"Local AI roster live apply matched {matched_users}/{session.ai_driver_count} AI drivers to roster entries in {roster_dir.name}."
+        )
+    if missing_targets > 0:
+        logs.append(
+            f"Local AI roster live apply left {missing_targets} AI target(s) unchanged because the roster did not contain usable local files for those entries."
+        )
+    return applied, logs
 def _normalize_ai_driver_entry(driver: dict) -> dict:
     normalized = dict(driver)
     car_id = _to_int_or_none(normalized.get('carId')) or 0
@@ -12831,6 +13758,515 @@ def _copy_optional_file(src: Path | None, dest: Path) -> bool:
     dest.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(src, dest)
     return True
+def _session_has_named_ai_roster(session: Session) -> bool:
+    return bool(str(session.ai_roster_name or '').strip() or str(session.ai_roster_id or '').strip())
+def _generic_ai_saved_file_map(session: Session, saved: list[SavedFile]) -> dict[int, dict[PaintType, list[SavedFile]]]:
+    ai_target_ids = {int(user.user_id) for user in session.users if user.is_ai}
+    grouped: dict[int, dict[PaintType, list[SavedFile]]] = {}
+    allowed_types = {
+        PaintType.CAR,
+        PaintType.CAR_NUMBER,
+        PaintType.CAR_SPEC,
+        PaintType.CAR_DECAL,
+        PaintType.HELMET,
+        PaintType.SUIT,
+    }
+    for item in saved:
+        download_id = item.download_id
+        if download_id.is_team_paint or int(download_id.user_id) not in ai_target_ids:
+            continue
+        if download_id.paint_type not in allowed_types:
+            continue
+        if not item.file_path.exists():
+            continue
+        grouped.setdefault(int(download_id.user_id), {}).setdefault(download_id.paint_type, []).append(item)
+    return grouped
+def _choose_generic_ai_saved_file(file_map: dict[PaintType, list[SavedFile]], paint_types: Iterable[PaintType]) -> SavedFile | None:
+    for want_ss in (False, True):
+        for paint_type in paint_types:
+            for item in file_map.get(paint_type, []):
+                if bool(item.download_id.is_superspeedway_variant) == want_ss and item.file_path.exists():
+                    return item
+    return None
+def _reset_generated_ai_roster_dir(ai_rosters_dir: Path, roster_dir: Path) -> None:
+    root_abs = os.path.normcase(os.path.abspath(ai_rosters_dir))
+    target_abs = os.path.normcase(os.path.abspath(roster_dir))
+    if os.path.commonpath([root_abs, target_abs]) != root_abs or target_abs == root_abs:
+        raise ValueError(f"Refusing to reset AI roster folder outside {ai_rosters_dir}")
+    if roster_dir.exists():
+        shutil.rmtree(roster_dir)
+    roster_dir.mkdir(parents=True, exist_ok=False)
+def _copy_saved_file_to_ai_roster(item: SavedFile | None, roster_dir: Path, filename: str) -> bool:
+    if item is None or not item.file_path.exists():
+        return False
+    dest = safe_join_under(roster_dir, Path(filename).name)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(item.file_path, dest)
+    return True
+def _generic_ai_roster_driver_payload(
+    session: Session,
+    user: SessionUser,
+    row_index: int,
+    matched_driver: dict | None,
+) -> dict:
+    car_path = str((matched_driver or {}).get('carPath') or user.directory or '').strip().replace(" ", "\\")
+    seed = f"{session.session_id.folder_name()}:{user.user_id}:{user.display_name}:{user.number}:{car_path}"
+    return {
+        "driverName": str(user.display_name or f"AI {user.user_id}").strip(),
+        "carNumber": str(user.number or row_index + 1),
+        "carId": _to_int_or_none((matched_driver or {}).get('carId')) or 0,
+        "carClassId": _to_int_or_none((matched_driver or {}).get('carClassId')) or 0,
+        "carPath": car_path,
+        "id": str(uuid.uuid5(uuid.NAMESPACE_URL, f"nishizumi-generic-ai:{seed}")),
+        "carDesign": str((matched_driver or {}).get('carDesign') or "0,000000,000000,FFFFFF"),
+        "carTgaName": None,
+        "helmetTgaName": None,
+        "suitTgaName": None,
+        "numberDesign": str((matched_driver or {}).get('numberDesign') or "0,0,ffffff,AAAAAA,000000"),
+        "helmetDesign": str((matched_driver or {}).get('helmetDesign') or "0,000000,000000,FFFFFF"),
+        "suitDesign": str((matched_driver or {}).get('suitDesign') or "0,000000,000000,FFFFFF"),
+        "disableCarDecals": bool((matched_driver or {}).get('disableCarDecals', False)),
+        "sponsor1": _to_int_or_none((matched_driver or {}).get('sponsor1')) or 0,
+        "sponsor2": _to_int_or_none((matched_driver or {}).get('sponsor2')) or 0,
+        "rowIndex": row_index,
+        "driverSkill": _to_int_or_none((matched_driver or {}).get('driverSkill')) or 50,
+        "driverAggression": _to_int_or_none((matched_driver or {}).get('driverAggression')) or 50,
+        "driverOptimism": _to_int_or_none((matched_driver or {}).get('driverOptimism')) or 50,
+        "driverSmoothness": _to_int_or_none((matched_driver or {}).get('driverSmoothness')) or 50,
+        "pitCrewSkill": _to_int_or_none((matched_driver or {}).get('pitCrewSkill')) or 50,
+        "strategyRiskiness": _to_int_or_none((matched_driver or {}).get('strategyRiskiness')) or 50,
+        "driverAge": _to_int_or_none((matched_driver or {}).get('driverAge')) or 30,
+    }
+def _copy_random_fallbacks_to_ai_roster_driver(
+    user: SessionUser,
+    file_map: dict[PaintType, list[SavedFile]],
+    roster_dir: Path,
+    driver: dict,
+) -> tuple[int, int, bool]:
+    copied_files = 0
+    accessories_with_paint = 0
+    car_with_paint = False
+    car_item = _choose_generic_ai_saved_file(file_map, (PaintType.CAR, PaintType.CAR_NUMBER))
+    if car_item is not None:
+        car_filename = f"car_num_{user.user_id}.tga" if car_item.download_id.paint_type is PaintType.CAR_NUMBER else f"car_{user.user_id}.tga"
+        if _copy_saved_file_to_ai_roster(car_item, roster_dir, car_filename):
+            driver["carTgaName"] = car_filename
+            copied_files += 1
+            car_with_paint = True
+            spec_item = _choose_generic_ai_saved_file(file_map, (PaintType.CAR_SPEC,))
+            if _copy_saved_file_to_ai_roster(spec_item, roster_dir, _ai_roster_spec_filename(car_filename)):
+                copied_files += 1
+    helmet_item = _choose_generic_ai_saved_file(file_map, (PaintType.HELMET,))
+    if _copy_saved_file_to_ai_roster(helmet_item, roster_dir, f"helmet_{user.user_id}.tga"):
+        driver["helmetTgaName"] = f"helmet_{user.user_id}.tga"
+        copied_files += 1
+        accessories_with_paint += 1
+    suit_item = _choose_generic_ai_saved_file(file_map, (PaintType.SUIT,))
+    if _copy_saved_file_to_ai_roster(suit_item, roster_dir, f"suit_{user.user_id}.tga"):
+        driver["suitTgaName"] = f"suit_{user.user_id}.tga"
+        copied_files += 1
+        accessories_with_paint += 1
+    return copied_files, accessories_with_paint, car_with_paint
+def _update_active_local_ai_roster_from_random_fallbacks(
+    session: Session,
+    fallback_saved: list[SavedFile],
+    ai_rosters_dir: Path,
+    saved_by_user: dict[int, dict[PaintType, list[SavedFile]]],
+) -> tuple[bool, str]:
+    roster_dir = _find_active_ai_roster_dir(session, ai_rosters_dir)
+    if roster_dir is None or not _ai_roster_dir_is_local(roster_dir):
+        return False, ""
+    try:
+        _payload, drivers = _read_ai_roster_payload(roster_dir)
+    except Exception as exc:  # noqa: BLE001
+        return False, f"Could not read active local AI roster {roster_dir.name}: {exc}"
+    ai_users = sorted(
+        [user for user in session.users if user.is_ai],
+        key=lambda user: (user.car_idx is None, user.car_idx if user.car_idx is not None else int(user.user_id), int(user.user_id)),
+    )
+    if not ai_users:
+        return False, ""
+    copied_files = 0
+    cars_with_paint = 0
+    accessories_with_paint = 0
+    matched_targets = 0
+    for user in ai_users:
+        file_map = saved_by_user.get(int(user.user_id), {})
+        if not file_map:
+            continue
+        driver = _find_roster_driver_for_session_ai(user, drivers)
+        if not driver:
+            continue
+        matched_targets += 1
+        copied, accessories, has_car = _copy_random_fallbacks_to_ai_roster_driver(user, file_map, roster_dir, driver)
+        copied_files += copied
+        accessories_with_paint += accessories
+        if has_car:
+            cars_with_paint += 1
+    if copied_files <= 0:
+        return False, f"Active local AI roster '{roster_dir.name}' was detected, but no matching random fallback files could be copied into it."
+    roster_item = AIWebRosterItem(roster_id="", name=roster_dir.name, roster_file="")
+    _write_ai_roster_files(
+        roster_dir,
+        {"drivers": drivers},
+        drivers,
+        roster_item,
+        is_local=True,
+        source_name="Local AI roster random fallback",
+    )
+    return True, (
+        f"Updated active local AI roster '{roster_dir.name}' with random fallback paints: "
+        f"{matched_targets}/{len(ai_users)} session AI target(s) matched, {cars_with_paint} car paint(s), "
+        f"{accessories_with_paint} helmet/suit file(s), {copied_files} copied file(s). "
+        f"Recreate the AI race with this same roster selected so iRacing reloads the roster paint references."
+    )
+def create_generic_ai_roster_from_random_fallbacks(
+    session: Session,
+    fallback_saved: list[SavedFile],
+    ai_rosters_dir: Path | None,
+) -> tuple[bool, str]:
+    if ai_rosters_dir is None or session.ai_driver_count <= 0:
+        return False, ""
+    ai_users = sorted(
+        [user for user in session.users if user.is_ai],
+        key=lambda user: (user.car_idx is None, user.car_idx if user.car_idx is not None else int(user.user_id), int(user.user_id)),
+    )
+    if not ai_users:
+        return False, ""
+    saved_by_user = _generic_ai_saved_file_map(session, fallback_saved)
+    if not saved_by_user:
+        return False, ""
+    updated_local_roster, local_roster_message = _update_active_local_ai_roster_from_random_fallbacks(
+        session,
+        fallback_saved,
+        ai_rosters_dir,
+        saved_by_user,
+    )
+    if local_roster_message:
+        return updated_local_roster, local_roster_message
+    if _session_has_named_ai_roster(session):
+        return False, ""
+    roster_folder = _safe_ai_roster_folder_name(AI_GENERIC_RANDOM_ROSTER_NAME, AI_GENERIC_RANDOM_ROSTER_FOLDER_FALLBACK)
+    roster_dir = ai_rosters_dir / roster_folder
+    try:
+        ai_rosters_dir.mkdir(parents=True, exist_ok=True)
+        _reset_generated_ai_roster_dir(ai_rosters_dir, roster_dir)
+    except Exception as exc:  # noqa: BLE001
+        return False, f"Could not create generic AI random roster folder: {exc}"
+    drivers: list[dict] = []
+    copied_files = 0
+    cars_with_paint = 0
+    accessories_with_paint = 0
+    session_ai_drivers = [dict(driver) for driver in session.ai_drivers if isinstance(driver, dict)]
+    for row_index, user in enumerate(ai_users):
+        matched_driver = _find_roster_driver_for_session_ai(user, session_ai_drivers)
+        driver = _generic_ai_roster_driver_payload(session, user, row_index, matched_driver)
+        file_map = saved_by_user.get(int(user.user_id), {})
+        copied, accessories, has_car = _copy_random_fallbacks_to_ai_roster_driver(user, file_map, roster_dir, driver)
+        copied_files += copied
+        accessories_with_paint += accessories
+        if has_car:
+            cars_with_paint += 1
+        drivers.append(_normalize_ai_driver_entry(driver))
+    if cars_with_paint <= 0:
+        shutil.rmtree(roster_dir, ignore_errors=True)
+        return False, "Generic AI random fallback saved files, but no car paints were available to build an AI roster."
+    roster_item = AIWebRosterItem(roster_id="", name=AI_GENERIC_RANDOM_ROSTER_NAME, roster_file="")
+    _write_ai_roster_files(
+        roster_dir,
+        {"drivers": drivers},
+        drivers,
+        roster_item,
+        is_local=True,
+        source_name="Generic AI session random fallback",
+    )
+    return True, (
+        f"Generic AI session detected: iRacing will not load random paints live from temporary 9700-series IDs. "
+        f"Created local AI roster '{AI_GENERIC_RANDOM_ROSTER_NAME}' at {roster_dir} with {cars_with_paint}/{len(ai_users)} car paint(s) "
+        f"and {accessories_with_paint} helmet/suit file(s). Recreate the AI race and select this roster to see the random paints."
+    )
+def _prefill_local_ai_roster_accessory(
+    *,
+    roster_dir: Path,
+    driver: dict,
+    kind: str,
+    used_scheme_ids: set[str],
+    recent_scheme_ids: set[str],
+    showroom_cache: dict[str, object],
+    temp_root: Path,
+    temp_paints_root: Path,
+    retries: int,
+    retry_backoff_seconds: float,
+    detect_showroom_total_pages: bool,
+    cancel_event: threading.Event | None = None,
+) -> tuple[bool, int, str]:
+    for _attempt in range(1, 5):
+        if _cancel_requested(cancel_event):
+            return False, 0, "cancelled"
+        result = choose_showroom_accessory_direct(
+            accessory_kind=kind,
+            pages=TP_SHOWROOM_MAX_PAGES,
+            prefer_official=False,
+            choice_mode="random",
+            exclude_scheme_ids=used_scheme_ids,
+            exclude_recent_scheme_ids=recent_scheme_ids,
+            showroom_cars=list(showroom_cache.get("cars") or []),
+            showroom_sampled_pages=set(showroom_cache.get("sampled_pages") or set()),
+            detected_total_pages=int(showroom_cache.get("detected_total_pages") or 0),
+            detect_total_pages=detect_showroom_total_pages,
+            minimum_unused_choices=1,
+            allow_reuse_existing_scheme=False,
+            log=logging.debug,
+            cancel_event=cancel_event,
+        )
+        _update_prefill_showroom_cache(showroom_cache, result)
+        if not result.ok:
+            return False, 0, result.message
+        scheme_id = str(result.chosen_scheme_id or "").strip()
+        if scheme_id:
+            used_scheme_ids.add(scheme_id)
+        saved_items = _download_public_showroom_result_for_ai_roster_prefill(
+            kind=kind,
+            directory=kind,
+            result=result,
+            temp_dir=temp_root,
+            temp_paints_dir=temp_paints_root,
+            retries=retries,
+            retry_backoff_seconds=retry_backoff_seconds,
+            cancel_event=cancel_event,
+        )
+        copied, copied_files = _copy_prefill_saved_items_to_ai_roster_driver(
+            kind=kind,
+            scheme_id=scheme_id,
+            saved_items=saved_items,
+            roster_dir=roster_dir,
+            driver=driver,
+        )
+        if copied:
+            return True, copied_files, scheme_id
+        if saved_items:
+            delete_saved(saved_items, paints_root=temp_paints_root)
+    return False, 0, f"public showroom {kind} asset was unavailable"
+def prefill_local_ai_rosters_from_showroom(
+    *,
+    ai_rosters_dir: Path,
+    temp_dir: Path,
+    retries: int,
+    retry_backoff_seconds: float,
+    include_cars: bool = True,
+    include_helmets: bool = True,
+    include_suits: bool = True,
+    mapping_path: Path | None = None,
+    detect_showroom_total_pages: bool = False,
+    cancel_event: threading.Event | None = None,
+) -> LocalAIRosterPrefillResult:
+    result = LocalAIRosterPrefillResult()
+    if not (include_cars or include_helmets or include_suits):
+        return result
+    if ai_rosters_dir is None or not ai_rosters_dir.exists():
+        return result
+    mapping_path = mapping_path or default_tp_showroom_mapping_path()
+    temp_root = temp_dir / f"local_ai_roster_prefill_{os.getpid()}_{int(time.time() * 1000)}"
+    temp_paints_root = temp_root / "paint"
+    recent_schemes = load_tp_recent_schemes()
+    recent_changed = False
+    showroom_cache_by_directory: dict[str, dict[str, object]] = {}
+    showroom_cache_by_accessory_kind: dict[str, dict[str, object]] = {}
+    local_names: list[str] = []
+    logging.info("Local AI roster prefill scan started.")
+    try:
+        for roster_dir in sorted(ai_rosters_dir.iterdir(), key=lambda item: item.name.casefold()):
+            if _cancel_requested(cancel_event):
+                break
+            if not roster_dir.is_dir() or not (roster_dir / "roster.json").exists():
+                continue
+            result.rosters_scanned += 1
+            if not _ai_roster_dir_is_local(roster_dir):
+                continue
+            result.local_rosters += 1
+            local_names.append(roster_dir.name)
+            try:
+                _payload, drivers = _read_ai_roster_payload(roster_dir)
+            except Exception as exc:  # noqa: BLE001
+                result.failed += 1
+                logging.warning("Local AI roster prefill could not read %s: %s", roster_dir.name, exc)
+                continue
+            if not drivers:
+                continue
+            used_car_scheme_ids = _ai_roster_existing_scheme_ids(drivers, ("carTgaName",))
+            used_helmet_scheme_ids = _ai_roster_existing_scheme_ids(drivers, ("helmetTgaName",))
+            used_suit_scheme_ids = _ai_roster_existing_scheme_ids(drivers, ("suitTgaName",))
+            roster_changed = False
+            roster_driver_updates = 0
+            roster_files_copied = 0
+            roster_cars = 0
+            roster_helmets = 0
+            roster_suits = 0
+            for driver_index, driver in enumerate(drivers, start=1):
+                if _cancel_requested(cancel_event):
+                    break
+                if not isinstance(driver, dict):
+                    continue
+                driver_changed = False
+                driver_name = str(driver.get("driverName") or driver.get("name") or f"driver {driver_index}").strip()
+                directory = str(driver.get("carPath") or "").strip().replace("\\", " ")
+                if include_cars and _ai_roster_driver_needs_asset(roster_dir, driver, "carTgaName"):
+                    directory_key = canonicalize_car_directory(directory).lower()
+                    showroom_cache = showroom_cache_by_directory.setdefault(
+                        directory_key,
+                        {"cars": [], "sampled_pages": set(), "detected_total_pages": 0},
+                    )
+                    recent_scheme_ids = {
+                        str(item).strip()
+                        for item in recent_schemes.get(directory_key, [])
+                        if str(item).strip()
+                    }
+                    ok, copied_files, scheme_id = _prefill_local_ai_roster_car(
+                        roster_dir=roster_dir,
+                        driver=driver,
+                        directory=directory,
+                        mapping_path=mapping_path,
+                        used_scheme_ids=used_car_scheme_ids,
+                        recent_scheme_ids=recent_scheme_ids,
+                        showroom_cache=showroom_cache,
+                        temp_root=temp_root,
+                        temp_paints_root=temp_paints_root,
+                        retries=retries,
+                        retry_backoff_seconds=retry_backoff_seconds,
+                        detect_showroom_total_pages=detect_showroom_total_pages,
+                        cancel_event=cancel_event,
+                    )
+                    if ok:
+                        roster_changed = True
+                        driver_changed = True
+                        roster_files_copied += copied_files
+                        roster_cars += 1
+                        if scheme_id:
+                            remember_tp_recent_scheme(recent_schemes, directory_key, scheme_id)
+                            recent_changed = True
+                    else:
+                        result.failed += 1
+                        logging.info("Local AI roster prefill skipped car for %s in %s: %s", driver_name, roster_dir.name, scheme_id)
+                if include_helmets and _ai_roster_driver_needs_asset(roster_dir, driver, "helmetTgaName"):
+                    showroom_cache = showroom_cache_by_accessory_kind.setdefault(
+                        "helmet",
+                        {"cars": [], "sampled_pages": set(), "detected_total_pages": 0},
+                    )
+                    recent_scheme_ids = {
+                        str(item).strip()
+                        for item in recent_schemes.get(TP_DRIVER_HELMET_CACHE_KEY, [])
+                        if str(item).strip()
+                    }
+                    ok, copied_files, scheme_id = _prefill_local_ai_roster_accessory(
+                        roster_dir=roster_dir,
+                        driver=driver,
+                        kind="helmet",
+                        used_scheme_ids=used_helmet_scheme_ids,
+                        recent_scheme_ids=recent_scheme_ids,
+                        showroom_cache=showroom_cache,
+                        temp_root=temp_root,
+                        temp_paints_root=temp_paints_root,
+                        retries=retries,
+                        retry_backoff_seconds=retry_backoff_seconds,
+                        detect_showroom_total_pages=detect_showroom_total_pages,
+                        cancel_event=cancel_event,
+                    )
+                    if ok:
+                        roster_changed = True
+                        driver_changed = True
+                        roster_files_copied += copied_files
+                        roster_helmets += 1
+                        if scheme_id:
+                            remember_tp_recent_scheme(recent_schemes, TP_DRIVER_HELMET_CACHE_KEY, scheme_id)
+                            recent_changed = True
+                    else:
+                        result.failed += 1
+                        logging.info("Local AI roster prefill skipped helmet for %s in %s: %s", driver_name, roster_dir.name, scheme_id)
+                if include_suits and _ai_roster_driver_needs_asset(roster_dir, driver, "suitTgaName"):
+                    showroom_cache = showroom_cache_by_accessory_kind.setdefault(
+                        "suit",
+                        {"cars": [], "sampled_pages": set(), "detected_total_pages": 0},
+                    )
+                    recent_scheme_ids = {
+                        str(item).strip()
+                        for item in recent_schemes.get(TP_DRIVER_SUIT_CACHE_KEY, [])
+                        if str(item).strip()
+                    }
+                    ok, copied_files, scheme_id = _prefill_local_ai_roster_accessory(
+                        roster_dir=roster_dir,
+                        driver=driver,
+                        kind="suit",
+                        used_scheme_ids=used_suit_scheme_ids,
+                        recent_scheme_ids=recent_scheme_ids,
+                        showroom_cache=showroom_cache,
+                        temp_root=temp_root,
+                        temp_paints_root=temp_paints_root,
+                        retries=retries,
+                        retry_backoff_seconds=retry_backoff_seconds,
+                        detect_showroom_total_pages=detect_showroom_total_pages,
+                        cancel_event=cancel_event,
+                    )
+                    if ok:
+                        roster_changed = True
+                        driver_changed = True
+                        roster_files_copied += copied_files
+                        roster_suits += 1
+                        if scheme_id:
+                            remember_tp_recent_scheme(recent_schemes, TP_DRIVER_SUIT_CACHE_KEY, scheme_id)
+                            recent_changed = True
+                    else:
+                        result.failed += 1
+                        logging.info("Local AI roster prefill skipped suit for %s in %s: %s", driver_name, roster_dir.name, scheme_id)
+                if driver_changed:
+                    roster_driver_updates += 1
+            if roster_changed:
+                roster_item = AIWebRosterItem(roster_id="", name=roster_dir.name, roster_file="")
+                _write_ai_roster_files(
+                    roster_dir,
+                    {"drivers": drivers},
+                    drivers,
+                    roster_item,
+                    is_local=True,
+                    source_name="Local AI roster public showroom prefill",
+                )
+                result.rosters_updated += 1
+                result.drivers_updated += roster_driver_updates
+                result.files_copied += roster_files_copied
+                result.cars += roster_cars
+                result.helmets += roster_helmets
+                result.suits += roster_suits
+                logging.info(
+                    "Local AI roster prefill updated %s: %s driver(s), %s car(s), %s helmet(s), %s suit(s), %s copied file(s). Recreate/select this AI roster before starting the race so iRacing reads the new paint references.",
+                    roster_dir.name,
+                    roster_driver_updates,
+                    roster_cars,
+                    roster_helmets,
+                    roster_suits,
+                    roster_files_copied,
+                )
+        if recent_changed:
+            save_tp_recent_schemes(recent_schemes)
+    finally:
+        try:
+            shutil.rmtree(temp_root, ignore_errors=True)
+        except Exception:
+            logging.debug("Could not clean local AI roster prefill temp folder %s", temp_root, exc_info=True)
+    if result.local_rosters <= 0:
+        logging.info("Local AI roster prefill scan complete: no local AI roster folders found in %s.", ai_rosters_dir)
+    elif result.rosters_updated <= 0 and result.failed > 0:
+        logging.info("Local AI roster prefill scan complete: %s local roster(s) checked; no roster was updated and %s asset(s) were unavailable or unmapped.", result.local_rosters, result.failed)
+    elif result.rosters_updated <= 0:
+        logging.info("Local AI roster prefill scan complete: %s local roster(s) checked; no missing enabled paint references.", result.local_rosters)
+    else:
+        logging.info(
+            "Local AI roster prefill scan complete: %s/%s local roster(s) updated, %s driver(s), %s copied file(s), %s failed asset(s).",
+            result.rosters_updated,
+            result.local_rosters,
+            result.drivers_updated,
+            result.files_copied,
+            result.failed,
+        )
+    return result
 def import_saved_paint_groups_to_ai_livery(saved: list[SavedFile], session: Session | None, ai_livery_root: Path, only_local_user: bool = False) -> tuple[int, int]:
     grouped: dict[tuple[str, int, bool], dict[PaintType, Path]] = {}
     local_user_id = session.local_user_id if session is not None else None
@@ -12866,7 +14302,8 @@ def _parse_saved_paint_filename(path: Path) -> tuple[PaintType, str, int, bool, 
     name = path.name.lower()
     patterns: list[tuple[PaintType, str]] = [
         (PaintType.CAR, r"^car_(team_)?(\d+)(?:(_ss))?\.tga$"),
-        (PaintType.CAR_SPEC, r"^car_spec_(team_)?(\d+)(?:(_ss))?\.mip$"),
+        (PaintType.CAR_NUMBER, r"^car_num_(team_)?(\d+)(?:(_ss))?\.tga$"),
+        (PaintType.CAR_SPEC, r"^car_spec_(team_)?(\d+)(?:_spec)?(?:(_ss))?\.mip$"),
         (PaintType.CAR_DECAL, r"^decal_(team_)?(\d+)(?:(_ss))?\.tga$"),
         (PaintType.HELMET, r"^helmet_(team_)?(\d+)\.tga$"),
         (PaintType.SUIT, r"^suit_(team_)?(\d+)\.tga$"),
@@ -12938,8 +14375,9 @@ def fetch_context_files(
     retries: int,
     retry_backoff_seconds: float,
     cancel_event: threading.Event | None = None,
+    superspeedway_variant: bool = False,
 ) -> list[DownloadFile]:
-    payload = _build_fetch_context_payload(session, user)
+    payload = _build_fetch_context_payload(session, user, superspeedway_variant=superspeedway_variant)
     if payload is None:
         raise RuntimeError("Trading Paints context is unavailable for this session.")
     last_exc: Exception | None = None
@@ -12984,6 +14422,7 @@ def fetch_context_files(
                                 directory=target_directory,
                                 paint_type=paint_type,
                                 is_team_paint=is_team_paint,
+                                is_superspeedway_variant=_manifest_file_url_is_superspeedway_variant(file_url, paint_type),
                             ),
                             url=file_url,
                         )
@@ -13027,26 +14466,67 @@ def fetch_context_files(
     assert last_exc is not None
     raise last_exc
 def _apply_special_variant_flags(session: Session, user: SessionUser, items: list[DownloadFile]) -> list[DownloadFile]:
-    updated: list[DownloadFile] = []
-    for item in items:
-        use_ss_variant = _download_uses_superspeedway_variant(
-            item.download_id.directory or user.directory,
-            item.download_id.paint_type,
-            session.is_superspeedway_track,
-        )
-        if item.download_id.is_superspeedway_variant == use_ss_variant:
-            updated.append(item)
-            continue
-        updated.append(
-            DownloadFile(
-                download_id=replace(
-                    item.download_id,
-                    is_superspeedway_variant=use_ss_variant,
-                ),
-                url=item.url,
+    _ = user
+    return _select_manifest_variants_for_session(session, items)
+def _fetch_user_files_for_session(
+    session: Session,
+    user_id: int,
+    retries: int,
+    retry_backoff_seconds: float,
+    cancel_event: threading.Event | None = None,
+) -> list[DownloadFile]:
+    if session.is_superspeedway_track:
+        try:
+            ss_items = fetch_user_files(
+                user_id,
+                retries,
+                retry_backoff_seconds,
+                cancel_event=cancel_event,
+                superspeedway_variant=True,
             )
-        )
-    return updated
+            if _manifest_has_car_related_items(ss_items):
+                if _manifest_has_superspeedway_variant(ss_items):
+                    logging.debug("Trading Paints fetch_user.php returned server _ss car asset(s) for user %s.", user_id)
+                else:
+                    logging.debug("Trading Paints fetch_user.php returned regular car asset(s) for user %s after _ss request.", user_id)
+                return _select_manifest_variants_for_session(session, ss_items)
+            logging.debug("Trading Paints fetch_user.php returned no car assets for user %s after _ss request; retrying regular manifest.", user_id)
+        except Exception as exc:  # noqa: BLE001
+            logging.debug("Trading Paints fetch_user.php _ss request failed for user %s; retrying regular manifest: %s", user_id, exc)
+    return _select_manifest_variants_for_session(
+        session,
+        fetch_user_files(user_id, retries, retry_backoff_seconds, cancel_event=cancel_event),
+    )
+def _fetch_context_files_for_session(
+    session: Session,
+    user: SessionUser,
+    retries: int,
+    retry_backoff_seconds: float,
+    cancel_event: threading.Event | None = None,
+) -> list[DownloadFile]:
+    if session.is_superspeedway_track:
+        try:
+            ss_items = fetch_context_files(
+                session,
+                user,
+                retries,
+                retry_backoff_seconds,
+                cancel_event=cancel_event,
+                superspeedway_variant=True,
+            )
+            if _manifest_has_car_related_items(ss_items):
+                if _manifest_has_superspeedway_variant(ss_items):
+                    logging.debug("Trading Paints fetch.php returned server _ss car asset(s) for user %s.", user.user_id)
+                else:
+                    logging.debug("Trading Paints fetch.php returned regular car asset(s) for user %s after _ss request.", user.user_id)
+                return _select_manifest_variants_for_session(session, ss_items)
+            logging.debug("Trading Paints fetch.php returned no car assets for user %s after _ss request; retrying regular manifest.", user.user_id)
+        except Exception as exc:  # noqa: BLE001
+            logging.debug("Trading Paints fetch.php _ss request failed for user %s; retrying regular manifest: %s", user.user_id, exc)
+    return _select_manifest_variants_for_session(
+        session,
+        fetch_context_files(session, user, retries, retry_backoff_seconds, cancel_event=cancel_event),
+    )
 def fetch_best_manifest_files(
     session: Session,
     user: SessionUser,
@@ -13074,16 +14554,16 @@ def fetch_best_manifest_files(
             session.session_id.folder_name(),
             user.user_id,
         )
-        return _apply_special_variant_flags(session, user, fetch_user_files(user.user_id, retries, retry_backoff_seconds, cancel_event=cancel_event))
+        return _fetch_user_files_for_session(session, user.user_id, retries, retry_backoff_seconds, cancel_event=cancel_event)
     try:
-        return _apply_special_variant_flags(session, user, fetch_context_files(session, user, retries, retry_backoff_seconds, cancel_event=cancel_event))
+        return _fetch_context_files_for_session(session, user, retries, retry_backoff_seconds, cancel_event=cancel_event)
     except Exception as exc:
         logging.warning(
             "Context fetch.php manifest failed for user %s; falling back to fetch_user.php: %s",
             user.user_id,
             exc,
         )
-        return _apply_special_variant_flags(session, user, fetch_user_files(user.user_id, retries, retry_backoff_seconds, cancel_event=cancel_event))
+        return _fetch_user_files_for_session(session, user.user_id, retries, retry_backoff_seconds, cancel_event=cancel_event)
 SAFE_PAINT_DIRECTORY_RE = re.compile(r"^[A-Za-z0-9._ -]+$")
 def normalize_directory(value: str) -> str:
     normalized = value.strip().lower()
@@ -13347,23 +14827,7 @@ def save_path_for(download_id: DownloadId, paints_dir: Path) -> Path:
         return safe_join_under(paints_dir, f"suit_{team_suffix}.tga")
     raise ValueError(f"Unsupported paint type: {download_id.paint_type}")
 def save_paths_for(download_id: DownloadId, paints_dir: Path) -> list[Path]:
-    primary = save_path_for(
-        DownloadId(
-            user_id=download_id.user_id,
-            directory=download_id.directory,
-            paint_type=download_id.paint_type,
-            is_team_paint=download_id.is_team_paint,
-            is_superspeedway_variant=False,
-            is_numbered_car_spec=download_id.is_numbered_car_spec,
-        ),
-        paints_dir,
-    )
-    if not download_id.is_superspeedway_variant or not _is_car_related_paint_type(download_id.paint_type):
-        return [primary]
-    ss_path = save_path_for(download_id, paints_dir)
-    if ss_path == primary:
-        return [primary]
-    return [primary, ss_path]
+    return [save_path_for(download_id, paints_dir)]
 def _should_retry_save_exception(exc: Exception) -> bool:
     if isinstance(exc, PermissionError):
         return True
@@ -13425,13 +14889,6 @@ def move_or_extract(
                     os.replace(temp_extra_dest, extra_dest)
                     saved_paths.append(extra_dest)
                 src.unlink(missing_ok=True)
-                if len(saved_paths) > 1:
-                    logging.info(
-                        "Superspeedway dual-save active for %s: regular=%s | ss=%s",
-                        downloaded.download_id.paint_type.value,
-                        primary_dest,
-                        ", ".join(str(p) for p in saved_paths[1:]),
-                    )
                 for saved_path in saved_paths:
                     try:
                         saved_bytes += int(saved_path.stat().st_size)
@@ -14196,6 +15653,7 @@ def process_session(
     tp_retry_timed_out_fallbacks_indefinitely: bool = True,
     tp_collection_pool_sources: str = "",
     tp_collection_pool_allow_showroom_fallback: bool = True,
+    tp_collection_pool_repeat_when_strict: bool = False,
     progress_callback: Callable[..., None] | None = None,
     reload_reader: IracingSdkReader | None = None,
     auto_refresh_paints: bool = False,
@@ -14219,9 +15677,26 @@ def process_session(
         )
     else:
         logging.info("Trading Paints context unavailable; using fetch_user.php fallback manifests")
+    inferred_ai_roster_dir = _find_active_ai_roster_dir(session, ai_rosters_dir) if ai_rosters_dir is not None and session.ai_driver_count > 0 else None
+    if inferred_ai_roster_dir is not None and not _session_has_named_ai_roster(session):
+        try:
+            _payload, inferred_drivers = _read_ai_roster_payload(inferred_ai_roster_dir)
+            exact_matches, name_matches, index_matches, total_ai = _score_ai_roster_against_session(session, inferred_drivers)
+            local_label = "local" if _ai_roster_dir_is_local(inferred_ai_roster_dir) else "Trading Paints synced"
+            logging.info(
+                "Inferred active %s AI roster from session drivers: %s (%s/%s name matches, %s exact, %s index)",
+                local_label,
+                inferred_ai_roster_dir.name,
+                name_matches,
+                total_ai,
+                exact_matches,
+                index_matches,
+            )
+        except Exception:
+            logging.debug("Could not summarize inferred AI roster %s", inferred_ai_roster_dir, exc_info=True)
     if session.is_superspeedway_track:
         logging.info(
-            "Superspeedway session detected for track %s (%s); car-related paints will be saved in both regular and _ss forms when available",
+            "Superspeedway session detected for track %s (%s); server _ss car variants will be requested and preferred when Trading Paints provides them",
             session.track_display_name or session.track_name or "unknown",
             session.track_config_name or "default",
         )
@@ -14451,6 +15926,36 @@ def process_session(
             download_stats_snapshot=download_stats,
             save_stats_snapshot=save_stats,
         )
+    local_ai_roster_saved: list[SavedFile] = []
+    local_ai_roster_logs: list[str] = []
+    if _session_has_named_ai_roster(session) and session_uses_local_ai_roster(session, ai_rosters_dir):
+        local_ai_roster_saved, local_ai_roster_logs = apply_local_ai_roster_live_paints(
+            session=session,
+            saved=saved,
+            paints_dir=paints_dir,
+            ai_rosters_dir=ai_rosters_dir,
+            saved_callback=_on_fallback_saved_items,
+        )
+    if local_ai_roster_saved:
+        saved.extend(local_ai_roster_saved)
+        saved.sort(
+            key=lambda s: (
+                s.download_id.is_team_paint,
+                s.download_id.user_id,
+                s.download_id.directory.lower(),
+                s.download_id.paint_type.value,
+            )
+        )
+    for line in local_ai_roster_logs:
+        logging.info(line)
+    if _cancel_requested(cancel_event):
+        return _cancelled_result(
+            "local AI roster live apply",
+            server_saved_items=saved,
+            downloads_count=len(downloads),
+            download_stats_snapshot=download_stats,
+            save_stats_snapshot=save_stats,
+        )
     random_pool_dir = default_random_pool_dir()
     ai_livery_root = default_ai_livery_dir()
     tp_saved_file_count = len(saved)
@@ -14477,6 +15982,32 @@ def process_session(
                 session.ai_roster_name or session.ai_roster_id or "active AI roster",
                 ", ".join(skipped_ai_random_kinds),
             )
+    elif _session_has_named_ai_roster(session) and session_uses_local_ai_roster(session, ai_rosters_dir) and (
+        effective_random_fallback_ai or effective_random_helmets_ai or effective_random_suits_ai
+    ):
+        active_roster_dir = _find_active_ai_roster_dir(session, ai_rosters_dir) if ai_rosters_dir is not None else None
+        skipped_ai_random_kinds: list[str] = []
+        if effective_random_fallback_ai:
+            effective_random_fallback_ai = False
+            skipped_ai_random_kinds.append("cars")
+        if effective_random_helmets_ai:
+            effective_random_helmets_ai = False
+            skipped_ai_random_kinds.append("helmets")
+        if effective_random_suits_ai:
+            effective_random_suits_ai = False
+            skipped_ai_random_kinds.append("suits")
+        if skipped_ai_random_kinds:
+            logging.info(
+                "Local AI roster active for %s: skipping session random AI %s so local roster paints stay stable. Local roster prefill runs at app startup and after AI roster sync to fill missing files before the race is created.",
+                active_roster_dir.name if active_roster_dir is not None else (session.ai_roster_name or session.ai_roster_id or "active AI roster"),
+                ", ".join(skipped_ai_random_kinds),
+            )
+    elif session.ai_driver_count > 0 and not _session_has_named_ai_roster(session) and (
+        effective_random_fallback_ai or effective_random_helmets_ai or effective_random_suits_ai
+    ):
+        logging.info(
+            "Unnamed AI session detected: applying random paints directly to the live AI car targets. Nishizumi Paints will not create or update a local AI roster for this session."
+        )
     collection_ids = parse_tp_collection_ids_from_text(tp_collection_pool_sources)
     collection_saved: list[SavedFile] = []
     collection_logs: list[str] = []
@@ -14509,6 +16040,10 @@ def process_session(
             saved_callback=_on_fallback_saved_items,
             used_source_ids_seed=collection_used_source_ids,
             cancel_event=cancel_event,
+            strict_collection_only=not bool(tp_collection_pool_allow_showroom_fallback),
+            allow_repeating_when_exhausted=bool(
+                tp_collection_pool_repeat_when_strict and not bool(tp_collection_pool_allow_showroom_fallback)
+            ),
         )
         for line in collection_logs:
             logging.info(line)
@@ -15094,6 +16629,7 @@ class AppConfig:
     tp_retry_timed_out_fallbacks_indefinitely: bool = True
     tp_collection_pool_sources: str = ""
     tp_collection_pool_allow_showroom_fallback: bool = True
+    tp_collection_pool_repeat_when_strict: bool = False
     quick_start_completed: bool = False
     keep_tp_paints_in_random_pool: bool = False
     max_random_pool_gb: float = 5.0
@@ -15251,6 +16787,9 @@ class ConfigStore:
         config.tp_retry_timed_out_fallbacks_indefinitely = bool(getattr(config, "tp_retry_timed_out_fallbacks_indefinitely", True))
         config.tp_collection_pool_sources = normalize_tp_collection_pool_sources_text(getattr(config, "tp_collection_pool_sources", ""))
         config.tp_collection_pool_allow_showroom_fallback = bool(getattr(config, "tp_collection_pool_allow_showroom_fallback", True))
+        config.tp_collection_pool_repeat_when_strict = bool(getattr(config, "tp_collection_pool_repeat_when_strict", False))
+        if config.tp_collection_pool_allow_showroom_fallback:
+            config.tp_collection_pool_repeat_when_strict = False
         config.quick_start_completed = bool(getattr(config, "quick_start_completed", False))
         config.keep_tp_paints_in_random_pool = bool(getattr(config, "keep_tp_paints_in_random_pool", False))
         config.max_random_pool_gb = clamp_random_pool_gb(getattr(config, "max_random_pool_gb", 5.0), 5.0)
@@ -15304,6 +16843,9 @@ class ConfigStore:
         safe.tp_retry_timed_out_fallbacks_indefinitely = bool(getattr(safe, "tp_retry_timed_out_fallbacks_indefinitely", True))
         safe.tp_collection_pool_sources = normalize_tp_collection_pool_sources_text(getattr(safe, "tp_collection_pool_sources", ""))
         safe.tp_collection_pool_allow_showroom_fallback = bool(getattr(safe, "tp_collection_pool_allow_showroom_fallback", True))
+        safe.tp_collection_pool_repeat_when_strict = bool(getattr(safe, "tp_collection_pool_repeat_when_strict", False))
+        if safe.tp_collection_pool_allow_showroom_fallback:
+            safe.tp_collection_pool_repeat_when_strict = False
         safe.quick_start_completed = bool(getattr(safe, "quick_start_completed", False))
         safe.keep_tp_paints_in_random_pool = bool(safe.keep_tp_paints_in_random_pool)
         safe.max_random_pool_gb = clamp_random_pool_gb(safe.max_random_pool_gb, 5.0)
@@ -15801,6 +17343,7 @@ class DownloaderService:
         last_replay_dir_token = _replay_dir_change_token(replay_dir)
         inactive_cleanup_done = False
         reopen_sdk_after_inactive = False
+        local_ai_roster_prefill_done = False
         def _maybe_sync_replay_packs(
             config: AppConfig,
             *,
@@ -15831,6 +17374,36 @@ class DownloaderService:
             )
             last_replay_dir_token = _replay_dir_change_token(replay_dir)
             next_replay_pack_full_scan_at = now + REPLAY_PACK_FULL_SCAN_SECONDS
+        def _maybe_prefill_local_ai_rosters(config: AppConfig, *, force: bool = False) -> None:
+            nonlocal local_ai_roster_prefill_done
+            if local_ai_roster_prefill_done and not force:
+                return
+            local_ai_roster_prefill_done = True
+            include_cars = bool(getattr(config, "random_fallback_ai", True))
+            include_helmets = bool(getattr(config, "random_helmets_ai", getattr(config, "random_helmets", True)))
+            include_suits = bool(getattr(config, "random_suits_ai", getattr(config, "random_suits", True)))
+            if not (include_cars or include_helmets or include_suits):
+                logging.debug("Local AI roster prefill skipped because AI random paints are disabled.")
+                return
+            try:
+                self._set_status("Prefilling local AI rosters")
+                prefill_local_ai_rosters_from_showroom(
+                    ai_rosters_dir=default_ai_rosters_dir(config),
+                    temp_dir=temp_dir,
+                    retries=positive_int(config.retries, 3),
+                    retry_backoff_seconds=max(config.retry_backoff_seconds, 0.1),
+                    include_cars=include_cars,
+                    include_helmets=include_helmets,
+                    include_suits=include_suits,
+                    mapping_path=default_tp_showroom_mapping_path(),
+                    detect_showroom_total_pages=False,
+                    cancel_event=self._stop_event,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logging.warning("Local AI roster prefill failed: %s", exc)
+                logging.debug("Local AI roster prefill traceback\n%s", traceback.format_exc())
+            finally:
+                self._set_status("Watching")
         self._update_runtime_snapshot(current_session, last_saved, last_known_member_id, session_rows=session_rows, replay_mode_active=replay_mode_active)
         try:
             while not self._stop_event.is_set():
@@ -15852,6 +17425,7 @@ class DownloaderService:
                     next_replay_pack_full_scan_at = 0.0
                     last_replay_dir_token = _replay_dir_change_token(replay_dir)
                     logging.info("Using custom iRacing replay folder: %s", replay_dir)
+                _maybe_prefill_local_ai_rosters(config)
                 _maybe_sync_replay_packs(config, current_session_arg=current_session, saved_arg=last_saved)
                 if self._force_refresh_event.is_set() and sdk_reader is not None:
                     sdk_reader.last_update = None
@@ -15889,6 +17463,7 @@ class DownloaderService:
                         )
                         last_ai_roster_sync_member_id = member_id_for_sync
                         self._set_status("Watching")
+                    _maybe_prefill_local_ai_rosters(config, force=True)
                 ai_roster_override_member_id = normalize_tp_member_id(getattr(config, "ai_roster_member_id_override", 0))
                 if (
                     config.sync_ai_rosters_from_server
@@ -15906,6 +17481,7 @@ class DownloaderService:
                     )
                     last_ai_roster_sync_member_id = ai_roster_override_member_id
                     self._set_status("Watching")
+                    _maybe_prefill_local_ai_rosters(config, force=True)
                 if self._global_texture_reload_event.is_set():
                     self._global_texture_reload_event.clear()
                     if sdk_reader is None:
@@ -16015,6 +17591,7 @@ class DownloaderService:
                     )
                     last_ai_roster_sync_member_id = member_id_for_auto_ai_sync
                     self._set_status("Watching")
+                    _maybe_prefill_local_ai_rosters(config, force=True)
                 current_fingerprint = session.fingerprint()
                 replay_mode_active = bool(
                     getattr(config, "auto_manage_replay_packs", True)
@@ -16193,6 +17770,7 @@ class DownloaderService:
                             tp_retry_timed_out_fallbacks_indefinitely=bool(getattr(config, "tp_retry_timed_out_fallbacks_indefinitely", True)),
                             tp_collection_pool_sources=getattr(config, "tp_collection_pool_sources", ""),
                             tp_collection_pool_allow_showroom_fallback=bool(getattr(config, "tp_collection_pool_allow_showroom_fallback", True)),
+                            tp_collection_pool_repeat_when_strict=bool(getattr(config, "tp_collection_pool_repeat_when_strict", False)),
                             progress_callback=lambda rows, saved_items=None, _session=session, _existing=previous_rows, _replay=replay_mode_active: self._update_runtime_progress_snapshot(
                                 _session,
                                 last_saved,
@@ -16628,6 +18206,10 @@ class DownloaderUI:
         self.tp_collection_pool_sources_var = tk.StringVar(value=str(getattr(self.config, "tp_collection_pool_sources", "") or ""))
         self.tp_collection_pool_input_var = tk.StringVar(value="")
         self.tp_collection_pool_allow_showroom_var = tk.BooleanVar(value=bool(getattr(self.config, "tp_collection_pool_allow_showroom_fallback", True)))
+        self.tp_collection_pool_repeat_var = tk.BooleanVar(
+            value=bool(getattr(self.config, "tp_collection_pool_repeat_when_strict", False))
+            and not bool(getattr(self.config, "tp_collection_pool_allow_showroom_fallback", True))
+        )
         self.tp_collection_pool_summary_var = tk.StringVar(value="No Trading Paints collections selected.")
         self.tp_connect_button_var = tk.StringVar(value="Browserless")
         self._quick_start_nav_refresh: Callable[[], None] | None = None
@@ -16645,6 +18227,12 @@ class DownloaderUI:
         self.showroom_download_pages_var = tk.IntVar(value=TP_SHOWROOM_MAX_PAGES)
         self.showroom_download_status_var = tk.StringVar(value="Enter a Trading Paints car ID to download public non-PRO paints into the RandomPool.")
         self.showroom_download_custom_folder_var = tk.StringVar(value="Custom folder: not selected.")
+        self.showroom_team_id_var = tk.StringVar(value="")
+        self.showroom_team_car_var = tk.StringVar(value="")
+        self.showroom_team_request_member_id_var = tk.StringVar(value="")
+        self.showroom_team_driver_member_id_var = tk.StringVar(value="")
+        self.showroom_team_car_number_var = tk.StringVar(value="0")
+        self.showroom_team_status_var = tk.StringVar(value="Enter a Team ID and car to download team paints into the iRacing paint folder.")
         self._showroom_download_custom_folder_path = ""
         self._showroom_pool_download_in_progress = False
         self.session_summary_var = tk.StringVar(value="No active iRacing session detected yet.")
@@ -17191,14 +18779,21 @@ class DownloaderUI:
             variable=self.tp_collection_pool_allow_showroom_var,
             command=self.on_setting_changed,
         ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        self.tp_collection_pool_repeat_checkbox = ttk.Checkbutton(
+            collection_pool_box,
+            text="Repeat paints from the selected collections only after they run out",
+            variable=self.tp_collection_pool_repeat_var,
+            command=self.on_setting_changed,
+        )
+        self.tp_collection_pool_repeat_checkbox.grid(row=4, column=0, columnspan=2, sticky="w", pady=(4, 0))
         collection_pool_actions = ttk.Frame(collection_pool_box)
-        collection_pool_actions.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        collection_pool_actions.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(6, 0))
         ttk.Button(collection_pool_actions, text="Remove selected", command=self.remove_selected_tp_collection_pool_sources).pack(side="left")
         ttk.Button(collection_pool_actions, text="Clear list", command=self.clear_tp_collection_pool_sources).pack(side="left", padx=(8, 0))
         ttk.Button(collection_pool_actions, text="Collections", command=self.open_tp_collections_page).pack(side="left", padx=(8, 0))
         ttk.Button(collection_pool_actions, text="Cache", command=self.open_tp_collection_pool_folder).pack(side="left", padx=(8, 0))
         ttk.Button(collection_pool_actions, text="Clean cache...", command=self.clean_tp_collection_pool_now).pack(side="left", padx=(8, 0))
-        ttk.Label(collection_pool_box, textvariable=self.tp_collection_pool_summary_var, justify="left", foreground="#555555", wraplength=430).grid(row=5, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        ttk.Label(collection_pool_box, textvariable=self.tp_collection_pool_summary_var, justify="left", foreground="#555555", wraplength=430).grid(row=6, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
         showroom_tab.columnconfigure(0, weight=1)
         showroom_tab.rowconfigure(1, weight=1)
@@ -17207,7 +18802,7 @@ class DownloaderUI:
         showroom_download_box.columnconfigure(0, weight=1)
         ttk.Label(
             showroom_download_box,
-            text="Choose one source mode at a time. Downloads go to the standard RandomPool unless you use the one-time custom folder button. Only public non-PRO assets are downloaded.",
+            text="Choose one source mode at a time. Public showroom sources go to the standard RandomPool unless you use the one-time custom folder button. Team paints install into the iRacing paint folder by default.",
             foreground="#0b63b6",
             justify="left",
             wraplength=920,
@@ -17218,11 +18813,13 @@ class DownloaderUI:
         car_id_tab = ttk.Frame(showroom_mode_tabs, padding=8)
         links_tab = ttk.Frame(showroom_mode_tabs, padding=8)
         collection_tab = ttk.Frame(showroom_mode_tabs, padding=8)
-        for tab in (car_id_tab, links_tab, collection_tab):
+        teams_tab = ttk.Frame(showroom_mode_tabs, padding=8)
+        for tab in (car_id_tab, links_tab, collection_tab, teams_tab):
             tab.columnconfigure(1, weight=1)
         showroom_mode_tabs.add(car_id_tab, text="Car ID")
         showroom_mode_tabs.add(links_tab, text="Showroom links")
         showroom_mode_tabs.add(collection_tab, text="Collection")
+        showroom_mode_tabs.add(teams_tab, text="Teams")
 
         ttk.Label(car_id_tab, text="Download random public paints for one TP car ID. Category is inferred internally; slug is optional.").grid(row=0, column=0, columnspan=4, sticky="w")
         ttk.Label(car_id_tab, text="TP car ID").grid(row=1, column=0, sticky="w", pady=(10, 0))
@@ -17256,6 +18853,24 @@ class DownloaderUI:
         collection_actions.grid(row=2, column=0, columnspan=4, sticky="w", pady=(10, 0))
         ttk.Button(collection_actions, text="Download collection to RandomPool", command=self.download_showroom_collection_now).pack(side="left")
         ttk.Button(collection_actions, text="Download collection to custom folder", command=lambda: self.download_showroom_collection_now(custom_folder=True)).pack(side="left", padx=(8, 0))
+
+        ttk.Label(teams_tab, text="Download a team's Trading Paints assets by Team ID and car. This uses the session-aware team manifest and saves car, helmet, and suit files when they exist.").grid(row=0, column=0, columnspan=4, sticky="w")
+        ttk.Label(teams_tab, text="Team ID").grid(row=1, column=0, sticky="w", pady=(10, 0))
+        ttk.Entry(teams_tab, textvariable=self.showroom_team_id_var, width=16).grid(row=1, column=1, sticky="w", pady=(10, 0))
+        ttk.Label(teams_tab, text="Car ID, URL, name, or directory").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(teams_tab, textvariable=self.showroom_team_car_var, width=56).grid(row=2, column=1, columnspan=3, sticky="ew", pady=(8, 0))
+        ttk.Label(teams_tab, text="Requesting member ID").grid(row=3, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(teams_tab, textvariable=self.showroom_team_request_member_id_var, width=16).grid(row=3, column=1, sticky="w", pady=(8, 0))
+        ttk.Label(teams_tab, text="Driver member ID").grid(row=3, column=2, sticky="e", padx=(12, 6), pady=(8, 0))
+        ttk.Entry(teams_tab, textvariable=self.showroom_team_driver_member_id_var, width=16).grid(row=3, column=3, sticky="w", pady=(8, 0))
+        ttk.Label(teams_tab, text="Car number").grid(row=4, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(teams_tab, textvariable=self.showroom_team_car_number_var, width=8).grid(row=4, column=1, sticky="w", pady=(8, 0))
+        ttk.Label(teams_tab, text="Member IDs are optional. Leave them blank to use the minimal synthetic team context.", foreground="#555555", justify="left", wraplength=560).grid(row=4, column=2, columnspan=2, sticky="w", padx=(12, 0), pady=(8, 0))
+        team_actions = ttk.Frame(teams_tab)
+        team_actions.grid(row=5, column=0, columnspan=4, sticky="w", pady=(10, 0))
+        ttk.Button(team_actions, text="Download to iRacing paints", command=self.download_showroom_team_now).pack(side="left")
+        ttk.Button(team_actions, text="Download to custom folder", command=lambda: self.download_showroom_team_now(custom_folder=True)).pack(side="left", padx=(8, 0))
+        ttk.Label(teams_tab, textvariable=self.showroom_team_status_var, justify="left", foreground="#555555", wraplength=880).grid(row=6, column=0, columnspan=4, sticky="w", pady=(10, 0))
 
         ttk.Label(showroom_download_box, text=f"Default destination: {default_random_pool_dir()}", foreground="#555555", justify="left", wraplength=920).grid(row=2, column=0, sticky="w", pady=(10, 0))
         ttk.Label(showroom_download_box, textvariable=self.showroom_download_custom_folder_var, foreground="#555555", justify="left", wraplength=920).grid(row=3, column=0, sticky="w", pady=(4, 0))
@@ -18241,10 +19856,28 @@ class DownloaderUI:
 
     def _refresh_tp_collection_pool_summary(self) -> None:
         collection_ids = parse_tp_collection_ids_from_text(self.tp_collection_pool_sources_var.get())
+        allow_showroom = bool(self.tp_collection_pool_allow_showroom_var.get())
+        repeat_strict = bool(self.tp_collection_pool_repeat_var.get()) and not allow_showroom
+        checkbox = getattr(self, "tp_collection_pool_repeat_checkbox", None)
+        repeat_enabled = bool(collection_ids) and not allow_showroom
+        if not repeat_enabled and self.tp_collection_pool_repeat_var.get():
+            self.tp_collection_pool_repeat_var.set(False)
+            repeat_strict = False
+        if checkbox is not None:
+            try:
+                checkbox.configure(state="normal" if repeat_enabled else "disabled")
+            except Exception:
+                pass
         if collection_ids:
-            fallback_label = "normal showroom coverage enabled" if self.tp_collection_pool_allow_showroom_var.get() else "normal showroom coverage disabled"
+            fallback_label = "normal showroom coverage enabled" if allow_showroom else "normal showroom coverage disabled"
+            if allow_showroom:
+                repeat_label = "repeat lock active while showroom fallback stays enabled"
+            elif repeat_strict:
+                repeat_label = "repeats allowed after the selected collections run out"
+            else:
+                repeat_label = "no repeats after the selected collections run out"
             self.tp_collection_pool_summary_var.set(
-                f"Collection pool active: {', '.join(collection_ids)} ({fallback_label}). Cached paints live in {default_tp_collection_pool_dir()}."
+                f"Collection pool active: {', '.join(collection_ids)} ({fallback_label}; {repeat_label}). Cached paints live in {default_tp_collection_pool_dir()}."
             )
         else:
             self.tp_collection_pool_summary_var.set("No Trading Paints collections selected. Online fallback uses the normal public showroom.")
@@ -18926,6 +20559,9 @@ class DownloaderUI:
             tp_retry_timed_out_fallbacks_indefinitely=bool(self.tp_retry_timed_out_fallbacks_indefinitely_var.get()),
             tp_collection_pool_sources=normalize_tp_collection_pool_sources_text(self.tp_collection_pool_sources_var.get()),
             tp_collection_pool_allow_showroom_fallback=bool(self.tp_collection_pool_allow_showroom_var.get()),
+            tp_collection_pool_repeat_when_strict=bool(
+                self.tp_collection_pool_repeat_var.get() and not self.tp_collection_pool_allow_showroom_var.get()
+            ),
             quick_start_completed=bool(getattr(self.config, "quick_start_completed", False)),
             keep_tp_paints_in_random_pool=bool(self.keep_tp_pool_var.get()),
             max_random_pool_gb=max_random_pool_gb,
@@ -20642,6 +22278,45 @@ class DownloaderUI:
         destination = Path(selected)
         return destination, f"custom folder {destination}"
 
+    def _showroom_team_download_destination(self, custom_folder: bool) -> tuple[Path, str] | None:
+        if not custom_folder:
+            destination = default_paints_dir(self.config)
+            return destination, f"iRacing paint folder {destination}"
+        selected = str(getattr(self, "_showroom_download_custom_folder_path", "") or "").strip()
+        if not selected:
+            selected = self.choose_showroom_custom_folder()
+        if not selected:
+            self._append_log("Custom team paint download cancelled before a folder was selected.")
+            return None
+        destination = Path(selected)
+        return destination, f"custom folder {destination}"
+
+    def _parse_showroom_team_positive_int(self, value: object, label: str, *, required: bool = False) -> int | None:
+        text = str(value or "").strip()
+        if not text:
+            if required:
+                try:
+                    self.messagebox.showerror(APP_NAME, f"Enter a valid {label}.", parent=self.root)
+                except Exception:
+                    pass
+                return None
+            return 0
+        try:
+            parsed = int(text)
+        except Exception:
+            try:
+                self.messagebox.showerror(APP_NAME, f"{label} must be a number.", parent=self.root)
+            except Exception:
+                pass
+            return None
+        if parsed <= 0:
+            try:
+                self.messagebox.showerror(APP_NAME, f"{label} must be greater than zero.", parent=self.root)
+            except Exception:
+                pass
+            return None
+        return parsed
+
     def _showroom_pool_limits(self) -> dict[str, float]:
         return {
             "max_pool_gb": clamp_random_pool_gb(getattr(self.config, "max_random_pool_gb", 5.0), 5.0),
@@ -20877,6 +22552,91 @@ class DownloaderUI:
             self.root.after(0, _finish)
 
         threading.Thread(target=_worker, name="NishizumiShowroomCollectionDownload", daemon=True).start()
+
+    def download_showroom_team_now(self, custom_folder: bool = False) -> None:
+        if getattr(self, "_showroom_pool_download_in_progress", False):
+            self._append_log("Showroom download is already running.")
+            return
+        team_id = self._parse_showroom_team_positive_int(self.showroom_team_id_var.get(), "Team ID", required=True)
+        if team_id is None:
+            return
+        request_member_id = self._parse_showroom_team_positive_int(
+            self.showroom_team_request_member_id_var.get(),
+            "requesting member ID",
+        )
+        if request_member_id is None:
+            return
+        driver_member_id = self._parse_showroom_team_positive_int(
+            self.showroom_team_driver_member_id_var.get(),
+            "driver member ID",
+        )
+        if driver_member_id is None:
+            return
+        car_value = str(self.showroom_team_car_var.get() or "").strip()
+        if not car_value:
+            try:
+                self.messagebox.showerror(APP_NAME, "Enter a TP car ID, dashboard URL, car name, or iRacing car directory.", parent=self.root)
+            except Exception:
+                pass
+            return
+        car_number = str(self.showroom_team_car_number_var.get() or "0").strip() or "0"
+        destination_info = self._showroom_team_download_destination(custom_folder)
+        if destination_info is None:
+            return
+        destination, destination_label = destination_info
+        self._showroom_pool_download_in_progress = True
+        self.showroom_team_status_var.set(f"Downloading team {team_id} paints for {car_value} to {destination_label}...")
+        self._append_log(
+            "Manual Trading Paints team download started: "
+            f"team_id={team_id}, car={car_value}, request_member_id={request_member_id or 0}, "
+            f"driver_member_id={driver_member_id or 0}, car_number={car_number}, destination={destination}."
+        )
+
+        def ui_log(message: str) -> None:
+            self.root.after(0, lambda msg=message: self._append_log(msg))
+
+        def _worker() -> None:
+            result: dict[str, object] | None = None
+            error = ""
+            try:
+                result = download_tp_team_paints_to_folder(
+                    team_id=int(team_id),
+                    car_value=car_value,
+                    destination_dir=destination,
+                    mapping_path=default_tp_showroom_mapping_path(),
+                    request_member_id=int(request_member_id or 0),
+                    driver_member_id=int(driver_member_id or 0),
+                    car_number=car_number,
+                    retries=max(1, int(getattr(self.config, "download_retries", 3) or 3)),
+                    retry_backoff_seconds=float(getattr(self.config, "retry_backoff_seconds", 1.5) or 1.5),
+                    log=ui_log,
+                )
+            except Exception as exc:
+                logging.debug("Manual Trading Paints team download failed", exc_info=True)
+                error = str(exc) or exc.__class__.__name__
+
+            def _finish() -> None:
+                self._showroom_pool_download_in_progress = False
+                if error:
+                    self.showroom_team_status_var.set(f"Team paint download failed: {error}")
+                    self._append_log(f"Manual Trading Paints team download failed: {error}")
+                    try:
+                        self.messagebox.showerror(APP_NAME, f"Team paint download failed.\n\n{error}", parent=self.root)
+                    except Exception:
+                        pass
+                    return
+                assert result is not None
+                saved = int(result.get("saved") or 0)
+                downloaded = int(result.get("downloaded") or 0)
+                message = str(result.get("message") or "").strip()
+                if saved > 0:
+                    self.showroom_team_status_var.set(f"Done: saved {saved} team paint file(s), downloaded {downloaded} asset(s), to {destination_label}.")
+                else:
+                    self.showroom_team_status_var.set(message or "No team paint files were saved for that Team ID and car.")
+
+            self.root.after(0, _finish)
+
+        threading.Thread(target=_worker, name="NishizumiShowroomTeamDownload", daemon=True).start()
 
     def open_tp_auth_profile(self) -> None:
         self._append_log("This no-browser copy does not create or use a Trading Paints browser profile.")

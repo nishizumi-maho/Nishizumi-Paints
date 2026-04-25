@@ -2,6 +2,24 @@
 
 All notable user-facing changes to Nishizumi Paints are documented here.
 
+## [6.2.0] - 2026-04-25
+
+### Added
+
+- Added a **Teams** mode to the Showroom tab for manual Trading Paints team paint downloads by Team ID and car.
+- Added a no-login team manifest fallback that tries session-aware Trading Paints payload variants and reports which route returned matching team assets.
+- Team downloads can save directly to the iRacing paint folder or to a one-time custom folder.
+
+### Changed
+
+- Team paint imports now preserve the normal iRacing team filenames: `car_team_{team_id}.tga`, `helmet_team_{team_id}.tga`, and `suit_team_{team_id}.tga`.
+- Updated the release metadata, installer reference, and Trading Paints notes for the 6.2.0 workflow.
+
+### Privacy
+
+- Documented that the manual team downloader sends only the entered Team ID, car directory, optional member IDs, and car number to Trading Paints manifest endpoints.
+- Confirmed the team flow does not require or store Trading Paints login cookies, passwords, or tokens.
+
 ## [6.0.0] - 2026-04-18
 
 ### Added

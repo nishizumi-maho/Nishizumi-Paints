@@ -13,6 +13,7 @@ The app can store:
 - RandomPool content
 - collection-pool content
 - AI roster metadata
+- manually downloaded team paint files
 
 These are runtime files and are not intended for source control.
 
@@ -46,7 +47,9 @@ It intentionally ignores:
 
 ## Current release posture
 
-The main 6.0.0 online fallback path uses public showroom direct downloads. That reduces the need to package or ship browser automation just to make public fallback work.
+The main online fallback path uses public showroom direct downloads. That reduces the need to package or ship browser automation just to make public fallback work.
+
+The 6.2.0 manual team downloader also stays browserless. It sends the entered Team ID, resolved car directory, optional requesting/driver member IDs, and car number to Trading Paints manifest endpoints. It does not store Trading Paints passwords, cookies, or tokens.
 
 ## Responsible debugging
 

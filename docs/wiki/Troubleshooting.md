@@ -49,7 +49,7 @@ Check for:
 - a triggered texture reload
 - stale row metadata pointing at the old source
 
-The 6.0.0 work specifically tightened this path, so if it still fails, the logs around the manual random request are the key evidence.
+The no-browser work specifically tightened this path, so if it still fails, the logs around the manual random request are the key evidence.
 
 ## Helmets or suits are not getting online fallback
 

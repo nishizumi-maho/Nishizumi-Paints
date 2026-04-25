@@ -12,7 +12,7 @@ The Session tab is the live monitor view. It is where the active session becomes
 
 ## Session refresh behavior
 
-The app rebuilds this view as the iRacing SDK changes. In 6.0.0 the tab is intended to follow session transitions correctly instead of staying stuck on the previous session state.
+The app rebuilds this view as the iRacing SDK changes. The tab is intended to follow session transitions correctly instead of staying stuck on the previous session state.
 
 That matters because the Session tab is also the user-facing explanation of what the download pipeline decided for each driver.
 
