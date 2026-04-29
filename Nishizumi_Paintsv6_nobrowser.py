@@ -43,7 +43,7 @@ from requests.adapters import HTTPAdapter
 # Browserless copy: Trading Paints browser automation is intentionally disabled.
 sync_playwright = None
 APP_NAME = "Nishizumi Paints"
-APP_VERSION = "6.4.1"
+APP_VERSION = "6.5"
 APP_REGISTRY_NAME = "NishizumiPaints"
 APP_CONFIG_DIRNAME = "NishizumiPaints"
 APP_TOOLTIP = f"{APP_NAME} {APP_VERSION}"
@@ -17463,7 +17463,7 @@ class ConfigStore:
                 config.tp_showroom_sources = TP_SHOWROOM_DEFAULT_SOURCES
         config.tp_showroom_sources_default_all_migrated = True
         config.quick_start_completed = bool(getattr(config, "quick_start_completed", False))
-        config.keep_tp_paints_in_random_pool = bool(getattr(config, "keep_tp_paints_in_random_pool", False))
+        config.keep_tp_paints_in_random_pool = bool(raw.get("keep_tp_paints_in_random_pool", False))
         config.max_random_pool_gb = clamp_random_pool_gb(getattr(config, "max_random_pool_gb", 5.0), 5.0)
         car_cap, helmet_cap, suit_cap = normalize_random_pool_category_caps(
             total_gb=config.max_random_pool_gb,
@@ -19524,7 +19524,7 @@ class DownloaderUI:
 
         ttk.Label(car_id_tab, text="Choose a car to download random public non-PRO paints from the selected Showroom sources.").grid(row=0, column=0, columnspan=4, sticky="w")
         ttk.Label(car_id_tab, text="Car").grid(row=1, column=0, sticky="w", pady=(10, 0))
-        self.showroom_download_car_combo = ttk.Combobox(car_id_tab, textvariable=self.showroom_download_car_var, values=self.showroom_car_choices, width=42, height=18)
+        self.showroom_download_car_combo = ttk.Combobox(car_id_tab, textvariable=self.showroom_download_car_var, values=self.showroom_car_choices, width=42, height=12)
         self.showroom_download_car_combo.grid(row=1, column=1, columnspan=3, sticky="w", pady=(10, 0))
         ttk.Label(car_id_tab, textvariable=self.showroom_download_car_suggestions_var, foreground="#555555", justify="left", wraplength=680).grid(row=2, column=1, columnspan=3, sticky="w", pady=(4, 0))
         ttk.Label(car_id_tab, text="Paints").grid(row=3, column=0, sticky="w", pady=(8, 0))
@@ -19558,30 +19558,36 @@ class DownloaderUI:
         ttk.Label(members_tab, text="Member ID").grid(row=1, column=0, sticky="w", pady=(10, 0))
         ttk.Entry(members_tab, textvariable=self.showroom_member_id_var, width=16).grid(row=1, column=1, sticky="w", pady=(10, 0))
         ttk.Label(members_tab, text="Car").grid(row=2, column=0, sticky="w", pady=(8, 0))
-        self.showroom_member_car_combo = ttk.Combobox(members_tab, textvariable=self.showroom_member_car_var, values=self.showroom_car_choices, width=42, height=18)
+        self.showroom_member_car_combo = ttk.Combobox(members_tab, textvariable=self.showroom_member_car_var, values=self.showroom_car_choices, width=42, height=12)
         self.showroom_member_car_combo.grid(row=2, column=1, columnspan=3, sticky="w", pady=(8, 0))
         ttk.Label(members_tab, textvariable=self.showroom_member_car_suggestions_var, foreground="#555555", justify="left", wraplength=680).grid(row=3, column=1, columnspan=3, sticky="w", pady=(4, 0))
         member_actions = ttk.Frame(members_tab)
         member_actions.grid(row=4, column=0, columnspan=4, sticky="w", pady=(10, 0))
         ttk.Button(member_actions, text="Download car to iRacing paints", command=self.download_showroom_member_now).pack(side="left")
         ttk.Button(member_actions, text="Download car to custom folder", command=lambda: self.download_showroom_member_now(custom_folder=True)).pack(side="left", padx=(8, 0))
-        ttk.Button(member_actions, text="Download all to member folder...", command=self.download_showroom_member_all_now).pack(side="left", padx=(8, 0))
-        ttk.Label(members_tab, textvariable=self.showroom_member_status_var, justify="left", foreground="#555555", wraplength=880).grid(row=5, column=0, columnspan=4, sticky="w", pady=(10, 0))
+        member_all_box = ttk.LabelFrame(members_tab, text="Download everything", padding=8)
+        member_all_box.grid(row=5, column=0, columnspan=4, sticky="ew", pady=(12, 0))
+        ttk.Label(member_all_box, text="Use only the Member ID above. Downloads all public cars, helmets, and suits found for that member into one organized folder.", foreground="#444444", justify="left", wraplength=740).pack(side="left", fill="x", expand=True)
+        ttk.Button(member_all_box, text="Download ALL member paints...", command=self.download_showroom_member_all_now).pack(side="right", padx=(12, 0))
+        ttk.Label(members_tab, textvariable=self.showroom_member_status_var, justify="left", foreground="#555555", wraplength=880).grid(row=6, column=0, columnspan=4, sticky="w", pady=(10, 0))
         self._bind_showroom_car_combobox(self.showroom_member_car_combo, self.showroom_member_car_var, self.showroom_member_car_suggestions_var)
 
         ttk.Label(teams_tab, text="Download a team's Trading Paints assets by Team ID and car. This uses the session-aware team manifest and saves car, helmet, and suit files when they exist.").grid(row=0, column=0, columnspan=4, sticky="w")
         ttk.Label(teams_tab, text="Team ID").grid(row=1, column=0, sticky="w", pady=(10, 0))
         ttk.Entry(teams_tab, textvariable=self.showroom_team_id_var, width=16).grid(row=1, column=1, sticky="w", pady=(10, 0))
         ttk.Label(teams_tab, text="Car").grid(row=2, column=0, sticky="w", pady=(8, 0))
-        self.showroom_team_car_combo = ttk.Combobox(teams_tab, textvariable=self.showroom_team_car_var, values=self.showroom_car_choices, width=42, height=18)
+        self.showroom_team_car_combo = ttk.Combobox(teams_tab, textvariable=self.showroom_team_car_var, values=self.showroom_car_choices, width=42, height=12)
         self.showroom_team_car_combo.grid(row=2, column=1, columnspan=3, sticky="w", pady=(8, 0))
         ttk.Label(teams_tab, textvariable=self.showroom_team_car_suggestions_var, foreground="#555555", justify="left", wraplength=680).grid(row=3, column=1, columnspan=3, sticky="w", pady=(4, 0))
         team_actions = ttk.Frame(teams_tab)
         team_actions.grid(row=4, column=0, columnspan=4, sticky="w", pady=(10, 0))
         ttk.Button(team_actions, text="Download to iRacing paints", command=self.download_showroom_team_now).pack(side="left")
         ttk.Button(team_actions, text="Download to custom folder", command=lambda: self.download_showroom_team_now(custom_folder=True)).pack(side="left", padx=(8, 0))
-        ttk.Button(team_actions, text="Download all to team folder...", command=self.download_showroom_team_all_now).pack(side="left", padx=(8, 0))
-        ttk.Label(teams_tab, textvariable=self.showroom_team_status_var, justify="left", foreground="#555555", wraplength=880).grid(row=5, column=0, columnspan=4, sticky="w", pady=(10, 0))
+        team_all_box = ttk.LabelFrame(teams_tab, text="Download everything", padding=8)
+        team_all_box.grid(row=5, column=0, columnspan=4, sticky="ew", pady=(12, 0))
+        ttk.Label(team_all_box, text="Use only the Team ID above. Scans mapped Trading Paints cars and downloads all team car, helmet, and suit assets found into one organized folder.", foreground="#444444", justify="left", wraplength=740).pack(side="left", fill="x", expand=True)
+        ttk.Button(team_all_box, text="Download ALL team paints...", command=self.download_showroom_team_all_now).pack(side="right", padx=(12, 0))
+        ttk.Label(teams_tab, textvariable=self.showroom_team_status_var, justify="left", foreground="#555555", wraplength=880).grid(row=6, column=0, columnspan=4, sticky="w", pady=(10, 0))
         self._bind_showroom_car_combobox(self.showroom_team_car_combo, self.showroom_team_car_var, self.showroom_team_car_suggestions_var)
 
         ttk.Label(showroom_download_box, text=f"Default destination: {default_random_pool_dir()}", foreground="#555555", justify="left", wraplength=920).grid(row=2, column=0, sticky="w", pady=(10, 0))
@@ -23081,80 +23087,171 @@ class DownloaderUI:
             "max_pool_suit_gb": clamp_random_pool_category_gb(getattr(self.config, "max_random_pool_suit_gb", 1.0), 1.0),
         }
 
-    def _showroom_car_choice_matches(self, query: object, limit: int = 18) -> list[str]:
+    def _showroom_car_choice_matches(self, query: object, limit: int = 0) -> list[str]:
         choices = list(getattr(self, "showroom_car_choices", []) or [])
         text = str(query or "").strip()
         if not text:
-            return choices[:max(1, int(limit or 18))]
+            return choices
         normalized_query = _tp_normalized_vehicle_name(text)
         query_lower = text.lower()
+        query_tokens = [token for token in normalized_query.split() if token]
         scored: list[tuple[int, float, str]] = []
         for label in choices:
             label_text = str(label or "")
             normalized_label = _tp_normalized_vehicle_name(label_text)
             if not normalized_label:
                 continue
+            rank = 9
             score = 0.0
-            if normalized_query and normalized_label.startswith(normalized_query):
+            if normalized_query and normalized_label == normalized_query:
+                rank = 0
                 score = 1.0
+            elif normalized_query and normalized_label.startswith(normalized_query):
+                rank = 1
+                score = 0.98
             elif normalized_query and normalized_query in normalized_label:
-                score = 0.92
+                rank = 2
+                score = 0.94
             elif query_lower and query_lower in label_text.lower():
+                rank = 3
                 score = 0.9
-            else:
+            elif query_tokens and all(token in normalized_label for token in query_tokens):
+                rank = 4
+                score = 0.84
+            elif len(normalized_query) >= 4:
                 score = SequenceMatcher(None, normalized_query, normalized_label).ratio()
-            if score >= 0.52:
-                scored.append((0 if normalized_label.startswith(normalized_query) else 1, score, label_text))
+                if score >= 0.72:
+                    rank = 5
+            if rank < 9:
+                scored.append((rank, score, label_text))
         scored.sort(key=lambda item: (item[0], -item[1], item[2].lower()))
-        return [label for _prefix, _score, label in scored[:max(1, int(limit or 18))]]
+        labels = [label for _rank, _score, label in scored]
+        if limit and limit > 0:
+            return labels[:limit]
+        return labels
 
-    def _set_showroom_car_suggestions(self, suggestions_var: Any, matches: list[str]) -> None:
+    def _set_showroom_car_suggestions(self, suggestions_var: Any, matches: list[str], query: object = "") -> None:
         if suggestions_var is None:
+            return
+        if not str(query or "").strip():
+            suggestions_var.set("")
             return
         if not matches:
             suggestions_var.set("No matching cars.")
             return
-        suggestions_var.set("Suggestions: " + " | ".join(matches[:4]))
+        suggestions: list[str] = []
+        for label in matches[:3]:
+            text = str(label)
+            suggestions.append(text if len(text) <= 54 else text[:51].rstrip() + "...")
+        suggestions_var.set("Suggestions: " + " | ".join(suggestions))
 
     def _post_showroom_car_combobox(self, combo: Any) -> None:
         try:
-            combo.event_generate("<Down>")
+            combo.tk.call("ttk::combobox::Post", str(combo))
             return
         except Exception:
             pass
         try:
-            combo.tk.call("ttk::combobox::Post", str(combo))
+            combo.event_generate("<Alt-Down>")
         except Exception:
             pass
 
-    def _refresh_showroom_car_combobox(self, combo: Any, value_var: Any, suggestions_var: Any, *, open_dropdown: bool = False) -> None:
-        matches = self._showroom_car_choice_matches(value_var.get() if value_var is not None else "")
+    def _unpost_showroom_car_combobox(self, combo: Any) -> None:
         try:
-            combo.configure(values=matches if matches else list(getattr(self, "showroom_car_choices", []) or []))
+            combo.tk.call("ttk::combobox::Unpost", str(combo))
         except Exception:
             pass
-        self._set_showroom_car_suggestions(suggestions_var, matches)
-        if open_dropdown:
+
+    def _is_showroom_car_combobox_posted(self, combo: Any) -> bool:
+        try:
+            popdown = combo.tk.call("ttk::combobox::PopdownWindow", str(combo))
+            return bool(int(combo.tk.call("winfo", "ismapped", popdown)))
+        except Exception:
+            return False
+
+    def _cancel_showroom_car_dropdown_post(self, combo: Any) -> None:
+        after_id = str(getattr(combo, "_nishizumi_showroom_car_after_id", "") or "")
+        if not after_id:
+            return
+        try:
+            self.root.after_cancel(after_id)
+        except Exception:
+            pass
+        try:
+            setattr(combo, "_nishizumi_showroom_car_after_id", "")
+        except Exception:
+            pass
+
+    def _schedule_showroom_car_dropdown_post(self, combo: Any) -> None:
+        self._cancel_showroom_car_dropdown_post(combo)
+
+        def _post_if_still_allowed() -> None:
             try:
-                self.root.after(80, lambda cmb=combo: self._post_showroom_car_combobox(cmb))
+                setattr(combo, "_nishizumi_showroom_car_after_id", "")
             except Exception:
-                self._post_showroom_car_combobox(combo)
+                pass
+            if time.monotonic() < float(getattr(combo, "_nishizumi_showroom_car_suppress_until", 0.0) or 0.0):
+                return
+            if self._is_showroom_car_combobox_posted(combo):
+                return
+            self._post_showroom_car_combobox(combo)
+
+        try:
+            after_id = self.root.after(80, _post_if_still_allowed)
+            setattr(combo, "_nishizumi_showroom_car_after_id", after_id)
+        except Exception:
+            _post_if_still_allowed()
+
+    def _refresh_showroom_car_combobox(self, combo: Any, value_var: Any, suggestions_var: Any, *, browse: bool = False) -> None:
+        choices = list(getattr(self, "showroom_car_choices", []) or [])
+        query = str(value_var.get() if value_var is not None else "").strip()
+        if browse and (not query or query in choices):
+            values = choices
+            matches: list[str] = []
+        else:
+            matches = self._showroom_car_choice_matches(query)
+            values = matches if query and matches else choices
+        try:
+            combo.configure(values=values)
+        except Exception:
+            pass
+        self._set_showroom_car_suggestions(suggestions_var, matches, query)
 
     def _bind_showroom_car_combobox(self, combo: Any, value_var: Any, suggestions_var: Any) -> None:
         def _open(_event: object = None) -> None:
-            self._refresh_showroom_car_combobox(combo, value_var, suggestions_var, open_dropdown=True)
+            if time.monotonic() < float(getattr(combo, "_nishizumi_showroom_car_suppress_until", 0.0) or 0.0):
+                return
+            if self._is_showroom_car_combobox_posted(combo):
+                return
+            self._refresh_showroom_car_combobox(combo, value_var, suggestions_var, browse=True)
+            self._schedule_showroom_car_dropdown_post(combo)
 
-        def _typed(_event: object = None) -> None:
+        def _typed(event: object = None) -> None:
+            keysym = str(getattr(event, "keysym", "") or "")
+            if keysym in {"Escape", "Return", "Tab"}:
+                if keysym == "Escape":
+                    self._cancel_showroom_car_dropdown_post(combo)
+                    self._unpost_showroom_car_combobox(combo)
+                return
             self._refresh_showroom_car_combobox(combo, value_var, suggestions_var)
 
+        def _selected(_event: object = None) -> None:
+            self._cancel_showroom_car_dropdown_post(combo)
+            try:
+                setattr(combo, "_nishizumi_showroom_car_suppress_until", time.monotonic() + 0.45)
+            except Exception:
+                pass
+            self._unpost_showroom_car_combobox(combo)
+            self._refresh_showroom_car_combobox(combo, value_var, suggestions_var, browse=True)
+
         try:
-            combo.bind("<FocusIn>", _open, add="+")
             combo.bind("<Button-1>", _open, add="+")
             combo.bind("<KeyRelease>", _typed, add="+")
-            combo.bind("<<ComboboxSelected>>", _typed, add="+")
+            combo.bind("<<ComboboxSelected>>", _selected, add="+")
+            combo.configure(postcommand=lambda: self._refresh_showroom_car_combobox(combo, value_var, suggestions_var, browse=True))
         except Exception:
             pass
-        self._refresh_showroom_car_combobox(combo, value_var, suggestions_var)
+        self._refresh_showroom_car_combobox(combo, value_var, suggestions_var, browse=True)
 
     def download_showroom_random_pool_now(self, custom_folder: bool = False) -> None:
         if getattr(self, "_showroom_pool_download_in_progress", False):

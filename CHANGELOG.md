@@ -2,6 +2,22 @@
 
 All notable user-facing changes to Nishizumi Paints are documented here.
 
+## [6.5] - 2026-04-29
+
+### Stable Release
+
+- First stable release since 6.0, collecting the showroom source, Team, Member ID, car dropdown, all-paints folder export, and 6.4.2 dropdown UX fixes.
+- Confirmed **Recycle downloaded TP car paints into the local random pool** defaults to off for new or missing config values while preserving explicit user opt-ins.
+
+## [6.4.2] - 2026-04-29
+
+### Fixed
+
+- Fixed Showroom car dropdowns so selecting a car closes the menu instead of reopening it.
+- Fixed Showroom car dropdowns to show the full car list when browsing and only filter the list while typing.
+- Reduced dropdown height and shortened inline suggestions so the Car, Member ID, and Teams car selectors stay readable.
+- Moved Member ID and Teams all-paints downloads into a separate **Download everything** area so the one-click full download is clearer.
+
 ## [6.4.1] - 2026-04-29
 
 ### Changed

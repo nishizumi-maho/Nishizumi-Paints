@@ -23,7 +23,7 @@ Nishizumi Paints is a Windows desktop companion for iRacing that downloads Tradi
 ## Install
 
 1. Download the latest setup executable from the [Releases](https://github.com/nishizumi-maho/Nishizumi-Paints/releases/latest) page.
-2. Run `NishizumiPaints-Setup-6.4.1.exe`.
+2. Run `NishizumiPaints-Setup-6.5.exe`.
 3. Keep the startup and background options enabled if you want the app to keep monitoring from the tray.
 4. Finish the Quick Start wizard after first launch.
 
@@ -42,6 +42,52 @@ The Quick Start wizard covers:
 - safe fallback defaults
 - AI member ID setup
 - startup and background behavior
+
+## Using the 6.5 Showroom tools
+
+Open **Showroom** when you want to pre-fill paints manually instead of waiting for a live session fallback.
+
+### Choose Showroom sources
+
+In **Advanced mode**, enable the public Showroom sources the app may use:
+
+- **Trending**
+- **Newest**
+- **Most favorited**
+- **Most raced (ever)**
+
+If more than one source is enabled, Nishizumi Paints randomly chooses one enabled source each time it fetches a public random paint. New or missing configs default to all four sources enabled.
+
+### Download random paints for one car
+
+1. Open **Showroom**.
+2. Use the **Car** tab.
+3. Click the **Car** field and choose a car from the dropdown, or type part of the car name to filter suggestions.
+4. Choose how many paints to download and the max page scan limit.
+5. Click **Download to RandomPool**, or choose a custom folder first and click **Download to custom folder**.
+
+### Download a member's paints
+
+Use **Showroom > Member ID** when you know a Trading Paints/iRacing member ID.
+
+- To download one car: enter the Member ID, choose the car, then click **Download car to iRacing paints** or **Download car to custom folder**.
+- To download everything found for that member: enter only the Member ID, then use the **Download everything** box and click **Download ALL member paints...**. The app saves all returned cars, helmets, and suits into an organized member folder.
+
+### Download a team's paints
+
+Use **Showroom > Teams** when you know a Trading Paints team ID.
+
+- To download one car: enter the Team ID, choose the car, then click **Download to iRacing paints** or **Download to custom folder**.
+- To download everything found for that team: enter only the Team ID, then use the **Download everything** box and click **Download ALL team paints...**. The app scans mapped Trading Paints cars and saves found car, helmet, and suit assets into an organized team folder.
+
+### Other Showroom tabs
+
+- **Showroom links**: paste one or more Trading Paints paint links, one per line.
+- **Collection**: paste a Trading Paints collection URL or ID to download usable public non-PRO paints from that collection.
+
+### Local RandomPool recycle option
+
+The **Recycle downloaded TP car paints into the local random pool** checkbox is off by default. Leave it off if you only want live downloads to be used for the current workflow. Turn it on if you want downloaded Trading Paints car paints to be archived into the local RandomPool for future fallback reuse.
 
 ## Run from source
 
