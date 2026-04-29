@@ -43,7 +43,7 @@ from requests.adapters import HTTPAdapter
 # Browserless copy: Trading Paints browser automation is intentionally disabled.
 sync_playwright = None
 APP_NAME = "Nishizumi Paints"
-APP_VERSION = "6.6"
+APP_VERSION = "6.7"
 APP_REGISTRY_NAME = "NishizumiPaints"
 APP_CONFIG_DIRNAME = "NishizumiPaints"
 APP_TOOLTIP = f"{APP_NAME} {APP_VERSION}"
@@ -105,6 +105,8 @@ TP_LOGIN_STATUS_FILENAME = ".nishizumi_tp_login_status.json"
 TP_ORIGINAL_SCHEME_CACHE_FILENAME = ".nishizumi_tp_original_scheme_cache.json"
 TP_DRIVER_HELMET_CACHE_KEY = "__driver_helmet__"
 TP_DRIVER_SUIT_CACHE_KEY = "__driver_suit__"
+TEAM_DRIVER_PRELOAD_CACHE_TTL_SECONDS = 60 * 60
+TEAM_DRIVER_PRELOAD_DIRNAME = "TeamDriverPreload"
 LOCAL_TP_BACKUP_MISSING_SENTINEL = "__NISHIZUMI_MISSING__"
 SUPER_SPEEDWAY_TRACK_KEYWORDS = ("talladega", "iracing superspeedway")
 DAYTONA_TRACK_KEYWORD = "daytona"
@@ -1860,6 +1862,9 @@ class SessionDriverSnapshot:
     helmet_status_code: str = "queued"
     helmet_status_text: str = "Queued"
     helmet_status_icon: str = "…"
+    current_driver_text: str = ""
+    last_driver_swap_text: str = "-"
+    last_refresh_text: str = "-"
 
 def session_target_key_from_download_id(download_id: DownloadId) -> tuple[str, int, str]:
     return ("team" if download_id.is_team_paint else "user", int(download_id.user_id), download_id.directory.lower())
@@ -1877,10 +1882,13 @@ def _session_status_meta(status_code: str) -> tuple[str, str]:
         "queued": ("…", "Queued"),
         "downloading": ("↓", "Downloading"),
         "downloaded": ("✓", "Downloaded"),
+        "team_paint": ("✓", "Team paint"),
+        "driver_paint": ("↳", "Driver paint"),
         "replay": ("▶", "Replay pack"),
-        "fallback": ("↺", "Fallback"),
-        "fallback_local": ("↺", "FALLBACK LOCAL"),
-        "fallback_online": ("↺", "FALLBACK ONLINE"),
+        "fallback": ("↺", "Random"),
+        "fallback_local": ("↺", "Random local"),
+        "fallback_online": ("↺", "Random online"),
+        "iracing_default": ("○", "iRacing default"),
         "missing": ("✕", "Missing"),
         "skipped": ("○", "Skipped"),
     }
@@ -1922,7 +1930,7 @@ def _session_overall_status_code(asset_statuses: dict[str, str]) -> str:
     if car_code not in {"queued", "missing", "skipped"}:
         return car_code
     seen_codes = {str(code or "missing") for code in asset_statuses.values()}
-    for preferred in ("downloading", "override", "replay", "fallback_online", "fallback_local", "fallback", "downloaded", "missing", "skipped", "queued"):
+    for preferred in ("downloading", "override", "replay", "team_paint", "driver_paint", "fallback_online", "fallback_local", "fallback", "downloaded", "iracing_default", "missing", "skipped", "queued"):
         if preferred in seen_codes:
             return preferred
     return car_code or "queued"
@@ -1930,14 +1938,20 @@ def _session_overall_status_code(asset_statuses: dict[str, str]) -> str:
 def build_session_driver_rows(
     session: Session | None,
     status_by_key: dict[tuple[str, int, str], str | dict[str, str]] | None = None,
+    diagnostics_by_key: dict[tuple[str, int, str], dict[str, str]] | None = None,
 ) -> list[SessionDriverSnapshot]:
     if session is None:
         return []
     status_by_key = status_by_key or {}
+    diagnostics_by_key = diagnostics_by_key or {}
     rows: list[SessionDriverSnapshot] = []
     for user in session.users:
         key = user.effective_target_key()
         asset_statuses = _session_normalize_asset_statuses(status_by_key.get(key, "queued"), default_code="queued")
+        diagnostics = diagnostics_by_key.get(key, {})
+        current_driver_text = str(diagnostics.get("current_driver") or "").strip()
+        if not current_driver_text:
+            current_driver_text = f"{user.display_name or user.user_id} ({user.user_id})"
         status_code = _session_overall_status_code(asset_statuses)
         icon, label = _session_status_meta(status_code)
         car_icon, car_label = _session_status_meta(asset_statuses["car"])
@@ -1967,6 +1981,9 @@ def build_session_driver_rows(
                 helmet_status_code=asset_statuses["helmet"],
                 helmet_status_text=helmet_label,
                 helmet_status_icon=helmet_icon,
+                current_driver_text=current_driver_text,
+                last_driver_swap_text=str(diagnostics.get("last_driver_swap") or "-"),
+                last_refresh_text=str(diagnostics.get("last_refresh") or "-"),
             )
         )
     rows.sort(key=lambda row: (_session_driver_sort_number(row.number), row.display_name.lower(), row.directory.lower(), row.target_id))
@@ -2171,6 +2188,53 @@ def merge_session_driver_rows(
         merged.append(updated_map.get(key) or previous_map.get(key) or base_row)
     return merged
 
+def _format_session_time_for_ui(timestamp: float | None) -> str:
+    if timestamp is None or timestamp <= 0:
+        return "-"
+    try:
+        return time.strftime("%H:%M:%S", time.localtime(float(timestamp)))
+    except Exception:
+        return "-"
+
+def _session_row_diagnostics(
+    session: Session | None,
+    last_driver_swap_by_key: dict[tuple[str, int, str], str] | None = None,
+    last_refresh_by_key: dict[tuple[str, int, str], float] | None = None,
+) -> dict[tuple[str, int, str], dict[str, str]]:
+    if session is None:
+        return {}
+    swaps = last_driver_swap_by_key or {}
+    refreshes = last_refresh_by_key or {}
+    diagnostics: dict[tuple[str, int, str], dict[str, str]] = {}
+    for user in session.users:
+        key = user.effective_target_key()
+        diagnostics[key] = {
+            "current_driver": f"{user.display_name or user.user_id} ({user.user_id})",
+            "last_driver_swap": swaps.get(key, "-"),
+            "last_refresh": _format_session_time_for_ui(refreshes.get(key)),
+        }
+    return diagnostics
+
+def apply_session_row_diagnostics(
+    session: Session | None,
+    rows: list[SessionDriverSnapshot],
+    last_driver_swap_by_key: dict[tuple[str, int, str], str] | None = None,
+    last_refresh_by_key: dict[tuple[str, int, str], float] | None = None,
+) -> list[SessionDriverSnapshot]:
+    diagnostics = _session_row_diagnostics(session, last_driver_swap_by_key, last_refresh_by_key)
+    decorated: list[SessionDriverSnapshot] = []
+    for row in rows:
+        data = diagnostics.get(_session_row_key(row), {})
+        decorated.append(
+            replace(
+                row,
+                current_driver_text=str(data.get("current_driver") or row.current_driver_text or ""),
+                last_driver_swap_text=str(data.get("last_driver_swap") or row.last_driver_swap_text or "-"),
+                last_refresh_text=str(data.get("last_refresh") or row.last_refresh_text or "-"),
+            )
+        )
+    return decorated
+
 def _session_statuses_from_rows(rows: list[SessionDriverSnapshot] | None) -> dict[tuple[str, int, str], dict[str, str]]:
     statuses: dict[tuple[str, int, str], dict[str, str]] = {}
     for row in rows or []:
@@ -2240,6 +2304,21 @@ def build_session_stage_statuses(
         statuses[key] = asset_statuses
     return statuses
 
+def _saved_file_is_team_driver_personal_fallback(item: SavedFile) -> bool:
+    source = str(getattr(item.download_id, "tp_source", "") or "").strip().lower()
+    return source in {"team_driver_fallback", "team_driver_preload"}
+
+def _session_server_saved_status_code(item: SavedFile, replay_mode: bool) -> str:
+    if bool(getattr(item.download_id, "preserve_on_cleanup", False)):
+        return "override"
+    if replay_mode:
+        return "replay"
+    if _saved_file_is_team_driver_personal_fallback(item):
+        return "driver_paint"
+    if bool(item.download_id.is_team_paint):
+        return "team_paint"
+    return "driver_paint"
+
 def build_session_final_statuses(
     session: Session,
     wanted_items: list[DownloadFile],
@@ -2248,9 +2327,10 @@ def build_session_final_statuses(
     sync_my_livery_from_server: bool,
     replay_mode: bool = False,
     fallback_mode: str = "local",
+    disable_random_in_team_events: bool = False,
 ) -> dict[tuple[str, int, str], dict[str, str]]:
     wanted_slots_by_key: dict[tuple[str, int, str], set[str]] = {}
-    server_slots_by_key: dict[tuple[str, int, str], set[str]] = {}
+    server_slots_by_key: dict[tuple[str, int, str], dict[str, str]] = {}
     fallback_slots_by_key: dict[tuple[str, int, str], set[str]] = {}
     override_slots_by_key: dict[tuple[str, int, str], set[str]] = {}
     for item in wanted_items:
@@ -2264,7 +2344,8 @@ def build_session_final_statuses(
             if bool(getattr(item.download_id, "preserve_on_cleanup", False)):
                 override_slots_by_key.setdefault(key, set()).add(slot)
             else:
-                server_slots_by_key.setdefault(key, set()).add(slot)
+                slot_codes = server_slots_by_key.setdefault(key, {})
+                slot_codes[slot] = _session_server_saved_status_code(item, replay_mode)
     for item in fallback_saved:
         slot = _session_asset_slot_for_paint_type(item.download_id.paint_type)
         if slot is not None:
@@ -2286,12 +2367,16 @@ def build_session_final_statuses(
         asset_statuses = _session_make_asset_statuses("missing")
         for slot in wanted_slots_by_key.get(key, set()):
             asset_statuses[slot] = "missing"
-        for slot in server_slots_by_key.get(key, set()):
-            asset_statuses[slot] = "replay" if replay_mode else "downloaded"
+        for slot, code in server_slots_by_key.get(key, {}).items():
+            asset_statuses[slot] = code
         for slot in fallback_slots_by_key.get(key, set()):
             asset_statuses[slot] = fallback_code
         for slot in override_slots_by_key.get(key, set()):
             asset_statuses[slot] = "override"
+        if disable_random_in_team_events and session_user_uses_team_target(user):
+            for slot in _SESSION_ASSET_SLOTS:
+                if asset_statuses.get(slot) == "missing":
+                    asset_statuses[slot] = "iracing_default"
         statuses[key] = asset_statuses
     return statuses
 class TransferBatchMonitor:
@@ -2626,6 +2711,12 @@ def default_driver_paint_override_cache_dir() -> Path:
     if appdata:
         return Path(appdata) / "Nishizumi-Paints" / "DriverOverrides"
     return Path.home() / "AppData" / "Roaming" / "Nishizumi-Paints" / "DriverOverrides"
+
+def default_team_driver_preload_cache_dir() -> Path:
+    appdata = os.getenv("APPDATA")
+    if appdata:
+        return Path(appdata) / "Nishizumi-Paints" / TEAM_DRIVER_PRELOAD_DIRNAME
+    return Path.home() / "AppData" / "Roaming" / "Nishizumi-Paints" / TEAM_DRIVER_PRELOAD_DIRNAME
 
 def default_driver_paint_overrides_path() -> Path:
     appdata = os.getenv("APPDATA")
@@ -15122,43 +15213,400 @@ def _retarget_personal_download_for_team(session_user: SessionUser, item: Downlo
         ai_roster_dir=item.ai_roster_dir,
     )
 
+_TEAM_DRIVER_PERSONAL_MANIFEST_CACHE_LOCK = threading.Lock()
+_TEAM_DRIVER_PERSONAL_MANIFEST_CACHE: dict[tuple[int, str, bool], tuple[float, list[DownloadFile]]] = {}
+_TEAM_DRIVER_PRELOAD_INFLIGHT_LOCK = threading.Lock()
+_TEAM_DRIVER_PRELOAD_INFLIGHT: set[str] = set()
+
+def _normalize_team_driver_personal_fallback_slots(slots: Iterable[str] | None = None) -> set[str]:
+    normalized = {str(slot or "").strip().lower() for slot in (slots or _SESSION_ASSET_SLOTS)}
+    return {slot for slot in normalized if slot in set(_SESSION_ASSET_SLOTS)}
+
+def _team_driver_personal_manifest_cache_key(session: Session, user: SessionUser) -> tuple[int, str, bool]:
+    return (int(user.user_id), normalize_directory(user.directory), bool(session.is_superspeedway_track))
+
+def _cached_team_driver_personal_manifest(session: Session, user: SessionUser) -> list[DownloadFile] | None:
+    key = _team_driver_personal_manifest_cache_key(session, user)
+    now = time.time()
+    with _TEAM_DRIVER_PERSONAL_MANIFEST_CACHE_LOCK:
+        cached = _TEAM_DRIVER_PERSONAL_MANIFEST_CACHE.get(key)
+    if cached is None:
+        return None
+    cached_at, items = cached
+    if now - float(cached_at) > TEAM_DRIVER_PRELOAD_CACHE_TTL_SECONDS:
+        with _TEAM_DRIVER_PERSONAL_MANIFEST_CACHE_LOCK:
+            _TEAM_DRIVER_PERSONAL_MANIFEST_CACHE.pop(key, None)
+        return None
+    return list(items)
+
+def _remember_team_driver_personal_manifest(session: Session, user: SessionUser, items: list[DownloadFile]) -> None:
+    key = _team_driver_personal_manifest_cache_key(session, user)
+    with _TEAM_DRIVER_PERSONAL_MANIFEST_CACHE_LOCK:
+        _TEAM_DRIVER_PERSONAL_MANIFEST_CACHE[key] = (time.time(), list(items))
+
+def _fetch_team_driver_personal_manifest(
+    session: Session,
+    user: SessionUser,
+    retries: int,
+    retry_backoff_seconds: float,
+    cancel_event: threading.Event | None = None,
+) -> list[DownloadFile]:
+    cached = _cached_team_driver_personal_manifest(session, user)
+    if cached is not None:
+        return cached
+    fetched = _fetch_user_files_for_session(
+        session,
+        int(user.user_id),
+        retries,
+        retry_backoff_seconds,
+        cancel_event=cancel_event,
+    )
+    personal = [
+        item
+        for item in fetched
+        if _download_item_matches_driver_personal_asset(user, item)
+    ]
+    personal = _select_manifest_variants_for_session(session, personal)
+    _remember_team_driver_personal_manifest(session, user, personal)
+    return list(personal)
+
+def _team_driver_preload_candidate_download_ids(user: SessionUser, slot: str) -> list[DownloadId]:
+    normalized_slot = str(slot or "").strip().lower()
+    if normalized_slot == "helmet":
+        return [DownloadId(user_id=int(user.user_id), directory=user.directory, paint_type=PaintType.HELMET)]
+    if normalized_slot == "suit":
+        return [DownloadId(user_id=int(user.user_id), directory=user.directory, paint_type=PaintType.SUIT)]
+    if normalized_slot != "car":
+        return []
+    candidates: list[DownloadId] = []
+    for ss_variant in (False, True):
+        for paint_type in (PaintType.CAR, PaintType.CAR_NUMBER, PaintType.CAR_DECAL):
+            candidates.append(
+                DownloadId(
+                    user_id=int(user.user_id),
+                    directory=user.directory,
+                    paint_type=paint_type,
+                    is_superspeedway_variant=ss_variant,
+                )
+            )
+        for numbered_spec in (False, True):
+            candidates.append(
+                DownloadId(
+                    user_id=int(user.user_id),
+                    directory=user.directory,
+                    paint_type=PaintType.CAR_SPEC,
+                    is_superspeedway_variant=ss_variant,
+                    is_numbered_car_spec=numbered_spec,
+                )
+            )
+    return candidates
+
+def _team_driver_preload_file_fresh(path: Path, now: float | None = None) -> bool:
+    try:
+        stat = path.stat()
+    except OSError:
+        return False
+    current = time.time() if now is None else now
+    return current - float(stat.st_mtime) <= TEAM_DRIVER_PRELOAD_CACHE_TTL_SECONDS
+
+def _team_driver_preloaded_slot_available(
+    user: SessionUser,
+    slot: str,
+    cache_root: Path | None = None,
+) -> bool:
+    resolved_root = Path(cache_root) if cache_root is not None else default_team_driver_preload_cache_dir()
+    now = time.time()
+    primary_types = PRIMARY_CAR_PAINT_TYPES if str(slot or "").strip().lower() == "car" else None
+    for download_id in _team_driver_preload_candidate_download_ids(user, slot):
+        path = save_path_for(download_id, resolved_root)
+        if not _team_driver_preload_file_fresh(path, now):
+            continue
+        if primary_types is None or download_id.paint_type in primary_types:
+            return True
+    return False
+
+def _filter_team_driver_personal_items_for_slots(
+    session: Session,
+    user: SessionUser,
+    items: Iterable[DownloadFile],
+    slots: Iterable[str],
+) -> list[DownloadFile]:
+    enabled_slots = _normalize_team_driver_personal_fallback_slots(slots)
+    personal_items = [
+        item
+        for item in items
+        if _download_item_matches_driver_personal_asset(user, item)
+        and (_session_asset_slot_for_paint_type(item.download_id.paint_type) in enabled_slots)
+    ]
+    return _select_manifest_variants_for_session(session, personal_items)
+
+def _copy_cached_file_to_saved_target(
+    source_path: Path,
+    target_id: DownloadId,
+    session_id: SessionId,
+    paints_dir: Path,
+) -> SavedFile | None:
+    if not source_path.exists():
+        return None
+    dest_path = save_path_for(target_id, paints_dir)
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = dest_path.with_name(f"{dest_path.name}.tmp_{uuid.uuid4().hex}")
+    try:
+        shutil.copy2(source_path, temp_path)
+        os.replace(temp_path, dest_path)
+    except Exception as exc:  # noqa: BLE001
+        temp_path.unlink(missing_ok=True)
+        logging.warning("Could not apply cached team driver personal paint %s -> %s: %s", source_path, dest_path, exc)
+        return None
+    return SavedFile(session_id=session_id, download_id=target_id, file_path=dest_path)
+
+def _copy_preloaded_team_driver_slot(
+    session: Session,
+    user: SessionUser,
+    slot: str,
+    cache_root: Path,
+    paints_dir: Path,
+) -> list[SavedFile]:
+    if not session_user_uses_team_target(user):
+        return []
+    normalized_slot = str(slot or "").strip().lower()
+    if not _team_driver_preloaded_slot_available(user, normalized_slot, cache_root):
+        return []
+    saved: list[SavedFile] = []
+    now = time.time()
+    for source_id in _team_driver_preload_candidate_download_ids(user, normalized_slot):
+        source_path = save_path_for(source_id, cache_root)
+        if not _team_driver_preload_file_fresh(source_path, now):
+            continue
+        target_id = replace(
+            source_id,
+            user_id=int(user.team_id or 0),
+            is_team_paint=True,
+            tp_source="team_driver_preload",
+        )
+        copied = _copy_cached_file_to_saved_target(source_path, target_id, session.session_id, paints_dir)
+        if copied is not None:
+            saved.append(copied)
+    if normalized_slot == "car" and not any(item.download_id.paint_type in PRIMARY_CAR_PAINT_TYPES for item in saved):
+        delete_saved(saved, paints_root=paints_dir)
+        return []
+    return saved
+
+def apply_preloaded_team_driver_personal_fallbacks(
+    *,
+    session: Session,
+    saved: list[SavedFile],
+    paints_dir: Path,
+    enabled_slots: Iterable[str],
+    cache_root: Path | None = None,
+    saved_callback: Callable[[list[SavedFile], str], None] | None = None,
+    cancel_event: threading.Event | None = None,
+) -> tuple[list[SavedFile], list[str]]:
+    active_slots = _normalize_team_driver_personal_fallback_slots(enabled_slots)
+    if not active_slots:
+        return [], []
+    resolved_cache_root = Path(cache_root) if cache_root is not None else default_team_driver_preload_cache_dir()
+    logs: list[str] = []
+    applied: list[SavedFile] = []
+    existing_slots_by_key: dict[tuple[str, int, str], set[str]] = {}
+    for item in saved:
+        slot = _session_asset_slot_for_paint_type(item.download_id.paint_type)
+        if slot is not None:
+            existing_slots_by_key.setdefault(_session_status_key_for_download_id(session, item.download_id), set()).add(slot)
+    for user in sorted(session.users, key=lambda u: (u.team_id or 0, u.directory.lower(), u.user_id)):
+        if _cancel_requested(cancel_event):
+            logs.append("Team driver personal preload fallback cancelled because the iRacing session changed or ended.")
+            break
+        if not session_user_uses_team_target(user):
+            continue
+        key = user.effective_target_key()
+        current_slots = existing_slots_by_key.setdefault(key, set())
+        for slot in _SESSION_ASSET_SLOTS:
+            if slot not in active_slots or slot in current_slots:
+                continue
+            saved_items = _copy_preloaded_team_driver_slot(session, user, slot, resolved_cache_root, paints_dir)
+            if not saved_items:
+                continue
+            applied.extend(saved_items)
+            current_slots.add(slot)
+            logs.append(
+                f"Team {user.team_id} missing {slot}, using driver {user.user_id} personal {slot} from preload cache."
+            )
+            if saved_callback is not None and not _cancel_requested(cancel_event):
+                try:
+                    saved_callback(saved_items, "driver_paint")
+                except Exception:
+                    logging.debug("Team driver preload save callback failed", exc_info=True)
+    return applied, logs
+
+def start_team_driver_personal_paint_preload(
+    *,
+    session: Session,
+    temp_dir: Path,
+    manifest_workers: int,
+    retries: int,
+    retry_backoff_seconds: float,
+    enabled_slots: Iterable[str],
+    cancel_event: threading.Event | None = None,
+) -> None:
+    active_slots = _normalize_team_driver_personal_fallback_slots(enabled_slots)
+    if not active_slots or not session.team_racing:
+        return
+    users = [
+        user
+        for user in sorted(session.users, key=lambda u: (u.team_id or 0, u.user_id, u.directory.lower()))
+        if session_user_uses_team_target(user)
+    ]
+    if not users:
+        return
+    unique_users: dict[tuple[int, str], SessionUser] = {}
+    for user in users:
+        unique_users[(int(user.user_id), normalize_directory(user.directory))] = user
+    users = list(unique_users.values())
+    preload_key = "|".join(
+        [
+            session.session_id.folder_name(),
+            ",".join(sorted(active_slots)),
+            ",".join(f"{user.user_id}:{normalize_directory(user.directory)}" for user in users),
+        ]
+    )
+    with _TEAM_DRIVER_PRELOAD_INFLIGHT_LOCK:
+        if preload_key in _TEAM_DRIVER_PRELOAD_INFLIGHT:
+            return
+        _TEAM_DRIVER_PRELOAD_INFLIGHT.add(preload_key)
+
+    def _worker() -> None:
+        try:
+            cache_root = default_team_driver_preload_cache_dir()
+            cache_root.mkdir(parents=True, exist_ok=True)
+            logging.info(
+                "Team session detected; preloading personal %s paint(s) for %s team driver(s).",
+                ", ".join(sorted(active_slots)),
+                len(users),
+            )
+            for user in users:
+                if _cancel_requested(cancel_event):
+                    logging.info("Team driver personal paint preload stopped because the session changed or the app is stopping.")
+                    break
+                missing_slots = [
+                    slot
+                    for slot in _SESSION_ASSET_SLOTS
+                    if slot in active_slots and not _team_driver_preloaded_slot_available(user, slot, cache_root)
+                ]
+                if not missing_slots:
+                    continue
+                try:
+                    manifest = _fetch_team_driver_personal_manifest(
+                        session,
+                        user,
+                        retries,
+                        retry_backoff_seconds,
+                        cancel_event=cancel_event,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logging.warning(
+                        "Team driver personal paint preload failed for driver %s (%s): %s",
+                        user.display_name or user.user_id,
+                        user.user_id,
+                        exc,
+                    )
+                    continue
+                wanted = _filter_team_driver_personal_items_for_slots(session, user, manifest, missing_slots)
+                wanted = _dedupe_download_items(wanted)
+                if not wanted:
+                    logging.debug(
+                        "Team driver personal paint preload found no usable %s paint(s) for driver %s (%s).",
+                        ", ".join(missing_slots),
+                        user.display_name or user.user_id,
+                        user.user_id,
+                    )
+                    continue
+                download_workers = max(1, min(4, len(wanted)))
+                preload_temp = Path(temp_dir) / "TeamDriverPreload"
+                downloads, _download_stats = _download_items_parallel(
+                    session=session,
+                    temp_dir=preload_temp,
+                    items=wanted,
+                    download_workers=download_workers,
+                    retries=retries,
+                    retry_backoff_seconds=retry_backoff_seconds,
+                    cancel_event=cancel_event,
+                )
+                if _cancel_requested(cancel_event):
+                    break
+                save_workers = max(1, min(4, len(downloads)))
+                saved_items, _save_stats = _save_downloads_parallel(
+                    downloads=downloads,
+                    paints_dir=cache_root,
+                    save_workers=save_workers,
+                    retries=retries,
+                    retry_backoff_seconds=max(0.1, retry_backoff_seconds),
+                    cancel_event=cancel_event,
+                )
+                if saved_items:
+                    slots_saved = sorted({
+                        slot
+                        for item in saved_items
+                        for slot in [_session_asset_slot_for_paint_type(item.download_id.paint_type)]
+                        if slot is not None
+                    })
+                    logging.info(
+                        "Preloaded personal %s paint(s) for team driver %s (%s).",
+                        ", ".join(slots_saved),
+                        user.display_name or user.user_id,
+                        user.user_id,
+                    )
+        finally:
+            with _TEAM_DRIVER_PRELOAD_INFLIGHT_LOCK:
+                _TEAM_DRIVER_PRELOAD_INFLIGHT.discard(preload_key)
+
+    threading.Thread(target=_worker, name="NishizumiTeamDriverPreload", daemon=True).start()
+
 def _select_team_session_downloads(
     *,
     session: Session,
     user: SessionUser,
     all_files: list[DownloadFile],
-    enable_driver_personal_fallback: bool,
+    driver_personal_fallback_slots: Iterable[str],
     retries: int,
     retry_backoff_seconds: float,
     cancel_event: threading.Event | None = None,
-) -> tuple[list[DownloadFile], list[str], list[str]]:
+) -> tuple[list[DownloadFile], list[str], list[str], list[str]]:
     team_items = [
         normalize_download_for_session_user(user, item)
         for item in all_files
         if _download_item_matches_team_asset(user, item)
     ]
     team_items = _select_manifest_variants_for_session(session, team_items)
-    if not enable_driver_personal_fallback:
-        return team_items, [], []
-
     missing_slots = [
         slot
         for slot in _SESSION_ASSET_SLOTS
         if not _download_items_have_primary_slot(team_items, slot)
     ]
+    enabled_slots = _normalize_team_driver_personal_fallback_slots(driver_personal_fallback_slots)
+    if not enabled_slots:
+        return team_items, [], missing_slots, []
     if not missing_slots:
-        return team_items, [], []
+        return team_items, [], [], []
+    fallback_candidate_slots = [slot for slot in missing_slots if slot in enabled_slots]
+    disabled_missing_slots = [slot for slot in missing_slots if slot not in enabled_slots]
+    cached_slots = [
+        slot
+        for slot in fallback_candidate_slots
+        if _team_driver_preloaded_slot_available(user, slot)
+    ]
+    fallback_candidate_slots = [slot for slot in fallback_candidate_slots if slot not in set(cached_slots)]
 
     personal_items = [
         item
         for item in all_files
         if _download_item_matches_driver_personal_asset(user, item)
     ]
-    if missing_slots and not all(_download_items_have_primary_slot(personal_items, slot) for slot in missing_slots):
+    if fallback_candidate_slots and not all(_download_items_have_primary_slot(personal_items, slot) for slot in fallback_candidate_slots):
         try:
-            fetched_personal = _fetch_user_files_for_session(
+            fetched_personal = _fetch_team_driver_personal_manifest(
                 session,
-                int(user.user_id),
+                user,
                 retries,
                 retry_backoff_seconds,
                 cancel_event=cancel_event,
@@ -15180,7 +15628,7 @@ def _select_team_session_downloads(
     fallback_items: list[DownloadFile] = []
     applied_slots: list[str] = []
     still_missing_slots: list[str] = []
-    for slot in missing_slots:
+    for slot in fallback_candidate_slots:
         slot_items = _download_items_for_slot(personal_items, slot)
         if not _download_items_have_primary_slot(slot_items, slot):
             still_missing_slots.append(slot)
@@ -15189,7 +15637,7 @@ def _select_team_session_downloads(
         applied_slots.append(slot)
     if fallback_items:
         fallback_items = _select_manifest_variants_for_session(session, fallback_items)
-    return team_items + fallback_items, applied_slots, still_missing_slots
+    return team_items + fallback_items, applied_slots, still_missing_slots + disabled_missing_slots, cached_slots
 def download_file(
     session_id: SessionId,
     temp_root: Path,
@@ -15856,17 +16304,17 @@ def delete_saved(
                 logging.warning("Paint file still present after delete attempts: %s", item.file_path)
     return kept
 
-def _expected_team_target_paths(paints_dir: Path, team_id: int, directory: str) -> list[Path]:
+def _expected_session_target_paths(paints_dir: Path, target_is_team: bool, target_id: int, directory: str) -> list[Path]:
     paths: list[Path] = []
     for paint_type in (PaintType.CAR, PaintType.CAR_NUMBER, PaintType.CAR_DECAL):
         for ss_variant in (False, True):
             paths.append(
                 save_path_for(
                     DownloadId(
-                        user_id=int(team_id),
+                        user_id=int(target_id),
                         directory=directory,
                         paint_type=paint_type,
-                        is_team_paint=True,
+                        is_team_paint=bool(target_is_team),
                         is_superspeedway_variant=ss_variant,
                     ),
                     paints_dir,
@@ -15877,10 +16325,10 @@ def _expected_team_target_paths(paints_dir: Path, team_id: int, directory: str) 
             paths.append(
                 save_path_for(
                     DownloadId(
-                        user_id=int(team_id),
+                        user_id=int(target_id),
                         directory=directory,
                         paint_type=PaintType.CAR_SPEC,
-                        is_team_paint=True,
+                        is_team_paint=bool(target_is_team),
                         is_superspeedway_variant=ss_variant,
                         is_numbered_car_spec=numbered_spec,
                     ),
@@ -15891,10 +16339,10 @@ def _expected_team_target_paths(paints_dir: Path, team_id: int, directory: str) 
         paths.append(
             save_path_for(
                 DownloadId(
-                    user_id=int(team_id),
+                    user_id=int(target_id),
                     directory=directory,
                     paint_type=paint_type,
-                    is_team_paint=True,
+                    is_team_paint=bool(target_is_team),
                 ),
                 paints_dir,
             )
@@ -15903,6 +16351,60 @@ def _expected_team_target_paths(paints_dir: Path, team_id: int, directory: str) 
     for path in paths:
         unique[str(path).lower()] = path
     return list(unique.values())
+
+def _expected_team_target_paths(paints_dir: Path, team_id: int, directory: str) -> list[Path]:
+    return _expected_session_target_paths(paints_dir, True, int(team_id), directory)
+
+def _saved_file_matches_session_target_key(
+    session: Session,
+    item: SavedFile,
+    target_key: tuple[str, int, str],
+) -> bool:
+    if _session_status_key_for_download_id(session, item.download_id) == target_key:
+        return True
+    wanted_kind, wanted_id, wanted_directory = target_key
+    item_kind = "team" if item.download_id.is_team_paint else "user"
+    if item_kind != wanted_kind or int(item.download_id.user_id) != int(wanted_id):
+        return False
+    slot = _session_asset_slot_for_paint_type(item.download_id.paint_type)
+    if slot in {"helmet", "suit"}:
+        return True
+    return str(item.download_id.directory or "").lower() == str(wanted_directory or "").lower()
+
+def clear_session_target_files(
+    *,
+    session: Session,
+    saved: list[SavedFile],
+    paints_dir: Path,
+    target_keys: Iterable[tuple[str, int, str]],
+) -> tuple[list[SavedFile], int]:
+    changed = {
+        (str(kind), int(target_id), str(directory).lower())
+        for kind, target_id, directory in target_keys
+        if str(kind) in {"team", "user"}
+    }
+    if not changed:
+        return list(saved or []), 0
+    kept: list[SavedFile] = []
+    tracked_to_delete: list[SavedFile] = []
+    for item in saved or []:
+        if any(_saved_file_matches_session_target_key(session, item, target_key) for target_key in changed):
+            tracked_to_delete.append(item)
+        else:
+            kept.append(item)
+    deleted_paths: set[str] = set()
+    if tracked_to_delete:
+        delete_saved(tracked_to_delete, keep_targets=set(), paints_root=paints_dir)
+        deleted_paths.update(str(item.file_path).lower() for item in tracked_to_delete)
+    for kind, target_id, directory in changed:
+        target_is_team = kind == "team"
+        for path in _expected_session_target_paths(paints_dir, target_is_team, int(target_id), directory):
+            key = str(path).lower()
+            if key in deleted_paths:
+                continue
+            if path.exists() and _hard_delete_file(path, paints_root=paints_dir):
+                deleted_paths.add(key)
+    return kept, len(deleted_paths)
 
 def clear_changed_team_driver_target_files(
     *,
@@ -15918,25 +16420,12 @@ def clear_changed_team_driver_target_files(
     }
     if not changed:
         return list(saved or []), 0
-    kept: list[SavedFile] = []
-    tracked_to_delete: list[SavedFile] = []
-    for item in saved or []:
-        if _session_status_key_for_download_id(session, item.download_id) in changed:
-            tracked_to_delete.append(item)
-        else:
-            kept.append(item)
-    deleted_paths: set[str] = set()
-    if tracked_to_delete:
-        delete_saved(tracked_to_delete, keep_targets=set(), paints_root=paints_dir)
-        deleted_paths.update(str(item.file_path).lower() for item in tracked_to_delete)
-    for _kind, team_id, directory in changed:
-        for path in _expected_team_target_paths(paints_dir, int(team_id), directory):
-            key = str(path).lower()
-            if key in deleted_paths:
-                continue
-            if path.exists() and _hard_delete_file(path, paints_root=paints_dir):
-                deleted_paths.add(key)
-    return kept, len(deleted_paths)
+    return clear_session_target_files(
+        session=session,
+        saved=saved,
+        paints_dir=paints_dir,
+        target_keys=changed,
+    )
 
 def _collect_wanted_downloads(
     session: Session,
@@ -15944,7 +16433,7 @@ def _collect_wanted_downloads(
     retries: int,
     retry_backoff_seconds: float,
     sync_my_livery_from_server: bool,
-    use_driver_paints_for_missing_team_assets: bool,
+    team_driver_personal_fallback_slots: Iterable[str],
     ai_rosters_dir: Path | None = None,
     cancel_event: threading.Event | None = None,
 ) -> list[DownloadFile]:
@@ -15986,22 +16475,30 @@ def _collect_wanted_downloads(
                 )
                 continue
             if session_user_uses_team_target(user):
-                user_wanted, personal_fallback_slots, missing_after_personal = _select_team_session_downloads(
+                user_wanted, personal_fallback_slots, missing_after_personal, cached_personal_slots = _select_team_session_downloads(
                     session=session,
                     user=user,
                     all_files=all_files,
-                    enable_driver_personal_fallback=bool(use_driver_paints_for_missing_team_assets),
+                    driver_personal_fallback_slots=team_driver_personal_fallback_slots,
                     retries=retries,
                     retry_backoff_seconds=retry_backoff_seconds,
                     cancel_event=cancel_event,
                 )
-                if personal_fallback_slots:
+                for slot in cached_personal_slots:
                     logging.info(
-                        "Team %s has no team %s for current driver %s (%s); queued the driver's personal paint(s) for the team target.",
+                        "Team %s missing %s, using driver %s personal %s from preload cache.",
                         user.team_id,
-                        ", ".join(personal_fallback_slots),
-                        user.display_name or user.user_id,
                         user.user_id,
+                        slot,
+                        slot,
+                    )
+                for slot in personal_fallback_slots:
+                    logging.info(
+                        "Team %s missing %s, using driver %s personal %s.",
+                        user.team_id,
+                        slot,
+                        user.user_id,
+                        slot,
                     )
                 if missing_after_personal:
                     logging.debug(
@@ -16264,7 +16761,7 @@ def process_session(
     random_suits_ai: bool,
     disable_random_in_team_events: bool,
     disable_random_for_local_user: bool,
-    use_driver_paints_for_missing_team_assets: bool,
+    team_driver_personal_fallback_slots: Iterable[str],
     ai_collection_skip_random_cars: bool,
     ai_collection_skip_random_helmets: bool,
     ai_collection_skip_random_suits: bool,
@@ -16345,7 +16842,7 @@ def process_session(
         retries=retries,
         retry_backoff_seconds=retry_backoff_seconds,
         sync_my_livery_from_server=sync_my_livery_from_server,
-        use_driver_paints_for_missing_team_assets=use_driver_paints_for_missing_team_assets,
+        team_driver_personal_fallback_slots=team_driver_personal_fallback_slots,
         ai_rosters_dir=ai_rosters_dir,
         cancel_event=cancel_event,
     )
@@ -16412,6 +16909,7 @@ def process_session(
                 sync_my_livery_from_server=sync_my_livery_from_server,
                 replay_mode=False,
                 fallback_mode=fallback_mode_for_rows,
+                disable_random_in_team_events=disable_random_in_team_events,
             ),
         )
         if progress_callback is not None:
@@ -16584,6 +17082,34 @@ def process_session(
     if _cancel_requested(cancel_event):
         return _cancelled_result(
             "local AI roster live apply",
+            server_saved_items=saved,
+            downloads_count=len(downloads),
+            download_stats_snapshot=download_stats,
+            save_stats_snapshot=save_stats,
+        )
+    preloaded_saved, preloaded_logs = apply_preloaded_team_driver_personal_fallbacks(
+        session=session,
+        saved=saved,
+        paints_dir=paints_dir,
+        enabled_slots=team_driver_personal_fallback_slots,
+        saved_callback=_on_fallback_saved_items,
+        cancel_event=cancel_event,
+    )
+    if preloaded_saved:
+        saved.extend(preloaded_saved)
+        saved.sort(
+            key=lambda s: (
+                s.download_id.is_team_paint,
+                s.download_id.user_id,
+                s.download_id.directory.lower(),
+                s.download_id.paint_type.value,
+            )
+        )
+    for line in preloaded_logs:
+        logging.info(line)
+    if _cancel_requested(cancel_event):
+        return _cancelled_result(
+            "team driver preload fallback",
             server_saved_items=saved,
             downloads_count=len(downloads),
             download_stats_snapshot=download_stats,
@@ -16899,6 +17425,7 @@ def process_session(
             sync_my_livery_from_server=sync_my_livery_from_server,
             replay_mode=False,
             fallback_mode=fallback_mode,
+            disable_random_in_team_events=disable_random_in_team_events,
         ),
     )
     if progress_callback is not None:
@@ -17252,6 +17779,10 @@ class AppConfig:
     disable_random_in_team_events: bool = True
     disable_random_for_local_user: bool = True
     use_driver_paints_for_missing_team_assets: bool = True
+    use_driver_paints_for_missing_team_car: bool = True
+    use_driver_paints_for_missing_team_suit: bool = True
+    use_driver_paints_for_missing_team_helmet: bool = True
+    preload_team_driver_personal_paints: bool = True
     tp_fallback_mode: str = "online"
     tp_manifest_member_id_override: int = 0
     tp_primary_fast_mode: bool = True
@@ -17288,6 +17819,18 @@ class AppConfig:
     retry_backoff_seconds: float = 1.0
     iracing_documents_dir: str = ""
     launch_mode_preference: str = "ask"
+
+
+def team_driver_personal_fallback_slots_from_config(config: AppConfig) -> set[str]:
+    slots: set[str] = set()
+    legacy_enabled = bool(getattr(config, "use_driver_paints_for_missing_team_assets", True))
+    if bool(getattr(config, "use_driver_paints_for_missing_team_car", legacy_enabled)):
+        slots.add("car")
+    if bool(getattr(config, "use_driver_paints_for_missing_team_suit", legacy_enabled)):
+        slots.add("suit")
+    if bool(getattr(config, "use_driver_paints_for_missing_team_helmet", legacy_enabled)):
+        slots.add("helmet")
+    return _normalize_team_driver_personal_fallback_slots(slots)
 
 
 def enforce_hidden_tp_speed_modes(config: AppConfig) -> AppConfig:
@@ -17407,7 +17950,16 @@ class ConfigStore:
         config.random_suits = bool(config.random_suits_real_drivers or config.random_suits_ai)
         config.disable_random_in_team_events = bool(getattr(config, "disable_random_in_team_events", True))
         config.disable_random_for_local_user = bool(getattr(config, "disable_random_for_local_user", True))
-        config.use_driver_paints_for_missing_team_assets = bool(getattr(config, "use_driver_paints_for_missing_team_assets", True))
+        legacy_team_driver_fallback = bool(getattr(config, "use_driver_paints_for_missing_team_assets", True))
+        config.use_driver_paints_for_missing_team_car = bool(raw.get("use_driver_paints_for_missing_team_car", legacy_team_driver_fallback))
+        config.use_driver_paints_for_missing_team_suit = bool(raw.get("use_driver_paints_for_missing_team_suit", legacy_team_driver_fallback))
+        config.use_driver_paints_for_missing_team_helmet = bool(raw.get("use_driver_paints_for_missing_team_helmet", legacy_team_driver_fallback))
+        config.use_driver_paints_for_missing_team_assets = bool(
+            config.use_driver_paints_for_missing_team_car
+            or config.use_driver_paints_for_missing_team_suit
+            or config.use_driver_paints_for_missing_team_helmet
+        )
+        config.preload_team_driver_personal_paints = bool(getattr(config, "preload_team_driver_personal_paints", True))
         config.tp_fallback_mode = str(getattr(config, "tp_fallback_mode", "online") or "online").strip().lower()
         if config.tp_fallback_mode not in {"local", "online"}:
             config.tp_fallback_mode = "online"
@@ -17480,7 +18032,16 @@ class ConfigStore:
         safe.random_suits = bool(safe.random_suits_real_drivers or safe.random_suits_ai)
         safe.disable_random_in_team_events = bool(getattr(safe, "disable_random_in_team_events", True))
         safe.disable_random_for_local_user = bool(getattr(safe, "disable_random_for_local_user", True))
-        safe.use_driver_paints_for_missing_team_assets = bool(getattr(safe, "use_driver_paints_for_missing_team_assets", True))
+        legacy_team_driver_fallback = bool(getattr(safe, "use_driver_paints_for_missing_team_assets", True))
+        safe.use_driver_paints_for_missing_team_car = bool(getattr(safe, "use_driver_paints_for_missing_team_car", legacy_team_driver_fallback))
+        safe.use_driver_paints_for_missing_team_suit = bool(getattr(safe, "use_driver_paints_for_missing_team_suit", legacy_team_driver_fallback))
+        safe.use_driver_paints_for_missing_team_helmet = bool(getattr(safe, "use_driver_paints_for_missing_team_helmet", legacy_team_driver_fallback))
+        safe.use_driver_paints_for_missing_team_assets = bool(
+            safe.use_driver_paints_for_missing_team_car
+            or safe.use_driver_paints_for_missing_team_suit
+            or safe.use_driver_paints_for_missing_team_helmet
+        )
+        safe.preload_team_driver_personal_paints = bool(getattr(safe, "preload_team_driver_personal_paints", True))
         safe.tp_fallback_lanes_mode = normalize_tp_fallback_lanes_mode(getattr(safe, "tp_fallback_lanes_mode", "session_total"))
         safe.tp_manual_max_lanes = max(1, min(100, positive_int(getattr(safe, "tp_manual_max_lanes", 1), 1)))
         safe.tp_process_all_online_fallbacks_together = bool(getattr(safe, "tp_process_all_online_fallbacks_together", True))
@@ -17571,6 +18132,7 @@ class DownloaderService:
         self._status_callback: Callable[[str], None] | None = None
         self._log_queue = log_queue
         self._force_refresh_event = threading.Event()
+        self._force_target_refresh_key: tuple[str, int, str] | None = None
         self._clear_current_event = threading.Event()
         self._sync_ai_rosters_event = threading.Event()
         self._global_texture_reload_event = threading.Event()
@@ -17578,6 +18140,8 @@ class DownloaderService:
         self._runtime_snapshot = RuntimeSnapshot()
         self._runtime_snapshot_version = 0
         self._pending_driver_override_applies: list[PendingDriverOverrideApply] = []
+        self._session_driver_swap_by_key: dict[tuple[str, int, str], str] = {}
+        self._session_refresh_by_key: dict[tuple[str, int, str], float] = {}
     def set_status_callback(self, callback: Callable[[str], None]) -> None:
         self._status_callback = callback
     def _set_status(self, value: str) -> None:
@@ -17714,6 +18278,12 @@ class DownloaderService:
     ) -> None:
         if session_rows is None:
             session_rows = build_session_driver_rows(current_session)
+        session_rows = apply_session_row_diagnostics(
+            current_session,
+            list(session_rows),
+            self._session_driver_swap_by_key,
+            self._session_refresh_by_key,
+        )
         with self._lock:
             self._runtime_snapshot = RuntimeSnapshot(
                 current_session=current_session,
@@ -17809,6 +18379,12 @@ class DownloaderService:
             statuses = _session_statuses_from_rows(list(self._runtime_snapshot.session_rows))
             _apply_saved_file_statuses(current_session, statuses, list(saved_items), status_code)
             session_rows = build_session_driver_rows(current_session, statuses)
+            session_rows = apply_session_row_diagnostics(
+                current_session,
+                session_rows,
+                self._session_driver_swap_by_key,
+                self._session_refresh_by_key,
+            )
             self._runtime_snapshot = RuntimeSnapshot(
                 current_session=current_session,
                 last_saved=last_saved,
@@ -17848,6 +18424,12 @@ class DownloaderService:
             statuses = _session_statuses_from_rows(list(self._runtime_snapshot.session_rows))
             _apply_saved_file_statuses(current_session, statuses, unpreserved_items, "downloaded")
             session_rows = build_session_driver_rows(current_session, statuses)
+            session_rows = apply_session_row_diagnostics(
+                current_session,
+                session_rows,
+                self._session_driver_swap_by_key,
+                self._session_refresh_by_key,
+            )
             self._runtime_snapshot = RuntimeSnapshot(
                 current_session=current_session,
                 last_saved=updated_saved,
@@ -17879,6 +18461,13 @@ class DownloaderService:
         _apply_saved_file_statuses(session, statuses, manual_items, "override")
         return merged_saved, build_session_driver_rows(session, statuses)
     def request_refresh_now(self) -> None:
+        with self._lock:
+            self._force_target_refresh_key = None
+        self._force_refresh_event.set()
+    def request_refresh_target_now(self, target_key: tuple[str, int, str]) -> None:
+        normalized_key = (str(target_key[0]), int(target_key[1]), str(target_key[2]).lower())
+        with self._lock:
+            self._force_target_refresh_key = normalized_key
         self._force_refresh_event.set()
     def request_clear_current_downloads(self) -> None:
         self._clear_current_event.set()
@@ -18146,6 +18735,8 @@ class DownloaderService:
                         replay_mode_active = False
                         last_session_fingerprint = None
                         last_session_preserve_targets = set()
+                        self._session_driver_swap_by_key = {}
+                        self._session_refresh_by_key = {}
                         self._update_runtime_snapshot(None, last_saved, last_known_member_id, session_rows=[])
                     self._stop_event.wait(max(config.poll_seconds, 0.2))
                     continue
@@ -18204,6 +18795,7 @@ class DownloaderService:
                     last_ai_roster_sync_member_id = member_id_for_auto_ai_sync
                     self._set_status("Watching")
                 current_fingerprint = session.fingerprint()
+                current_user_map = _session_user_map(session)
                 replay_mode_active = bool(
                     getattr(config, "auto_manage_replay_packs", True)
                     and sdk_reader is not None
@@ -18211,6 +18803,40 @@ class DownloaderService:
                     and has_replay_pack_for_session(session, replay_packs_dir, replay_pack_index)
                 )
                 forced_refresh = self._force_refresh_event.is_set()
+                with self._lock:
+                    requested_force_target_key = self._force_target_refresh_key
+                partial_target_refresh_key: tuple[str, int, str] | None = None
+                if forced_refresh and requested_force_target_key is not None:
+                    if requested_force_target_key in current_user_map:
+                        partial_target_refresh_key = requested_force_target_key
+                    else:
+                        logging.info(
+                            "Force refresh current car/team requested for %s %s (%s), but that target is not in the active session.",
+                            requested_force_target_key[0],
+                            requested_force_target_key[1],
+                            requested_force_target_key[2],
+                        )
+                        self._force_refresh_event.clear()
+                        with self._lock:
+                            self._force_target_refresh_key = None
+                        forced_refresh = False
+                for key in list(self._session_driver_swap_by_key):
+                    if key not in current_user_map:
+                        self._session_driver_swap_by_key.pop(key, None)
+                for key in list(self._session_refresh_by_key):
+                    if key not in current_user_map:
+                        self._session_refresh_by_key.pop(key, None)
+                team_driver_fallback_slots = team_driver_personal_fallback_slots_from_config(config)
+                if bool(getattr(config, "preload_team_driver_personal_paints", True)) and team_driver_fallback_slots:
+                    start_team_driver_personal_paint_preload(
+                        session=session,
+                        temp_dir=temp_dir,
+                        manifest_workers=get_manifest_cap_from_download_cap(config.max_concurrent_downloads),
+                        retries=positive_int(config.retries, 3),
+                        retry_backoff_seconds=max(config.retry_backoff_seconds, 0.1),
+                        enabled_slots=team_driver_fallback_slots,
+                        cancel_event=self._stop_event,
+                    )
                 if last_session_fingerprint == current_fingerprint and not forced_refresh:
                     existing_rows = session_rows
                     session_rows = merge_session_driver_rows(session, list(existing_rows), []) if existing_rows else base_session_rows
@@ -18226,7 +18852,6 @@ class DownloaderService:
                 previous_session = last_processed_session
                 previous_rows = list(session_rows)
                 previous_user_map = _session_user_map(previous_session)
-                current_user_map = _session_user_map(session)
                 same_session_identity = last_session == session.session_id
                 roster_changed_same_session = bool(
                     not forced_refresh
@@ -18248,7 +18873,21 @@ class DownloaderService:
                         previous_user = previous_user_map[key]
                         current_user = current_user_map[key]
                         logging.info(
-                            "Team driver changed in session %s for team %s (%s): %s (%s) -> %s (%s). Nishizumi Paints will refresh that team's car, helmet, and suit paints.",
+                            "Driver changed from %s (%s) to %s (%s) for team %s on %s; refreshing team paints.",
+                            previous_user.display_name or previous_user.user_id,
+                            previous_user.user_id,
+                            current_user.display_name or current_user.user_id,
+                            current_user.user_id,
+                            key[1],
+                            key[2],
+                        )
+                        self._session_driver_swap_by_key[key] = (
+                            f"{previous_user.display_name or previous_user.user_id} ({previous_user.user_id}) -> "
+                            f"{current_user.display_name or current_user.user_id} ({current_user.user_id}) "
+                            f"at {_format_session_time_for_ui(time.time())}"
+                        )
+                        logging.debug(
+                            "Team driver changed in session %s for team %s (%s): %s (%s) -> %s (%s).",
                             session.session_id.folder_name(),
                             key[1],
                             key[2],
@@ -18268,7 +18907,31 @@ class DownloaderService:
                             "Cleared %s stale team paint file(s) before applying the new team's active-driver paints.",
                             cleared_count,
                         )
-                if roster_changed_same_session:
+                if partial_target_refresh_key is not None:
+                    refresh_user = current_user_map[partial_target_refresh_key]
+                    last_saved, cleared_count = clear_session_target_files(
+                        session=session,
+                        saved=last_saved,
+                        paints_dir=paints_dir,
+                        target_keys=[partial_target_refresh_key],
+                    )
+                    logging.info(
+                        "Force refresh current car/team requested for %s %s (%s); cleared %s existing paint file(s) before reapplying.",
+                        partial_target_refresh_key[0],
+                        partial_target_refresh_key[1],
+                        partial_target_refresh_key[2],
+                        cleared_count,
+                    )
+                    session_to_process = replace(session, users={refresh_user})
+                    session_rows = merge_session_driver_rows(session, previous_rows, [])
+                    self._update_runtime_snapshot(
+                        current_session,
+                        last_saved,
+                        last_known_member_id,
+                        session_rows=session_rows,
+                        replay_mode_active=replay_mode_active,
+                    )
+                elif roster_changed_same_session:
                     logging.info(
                         "Session roster changed inside the same session %s: +%s target(s), -%s target(s). The paint sync will only fetch the new targets now.",
                         session.session_id.folder_name(),
@@ -18301,8 +18964,11 @@ class DownloaderService:
                     session_rows = base_session_rows
                 if forced_refresh:
                     self._force_refresh_event.clear()
-                    logging.info("Manual re-download requested for session %s", session.session_id.folder_name())
-                if last_saved and config.cleanup_before_fetch and not roster_changed_same_session:
+                    with self._lock:
+                        self._force_target_refresh_key = None
+                    if partial_target_refresh_key is None:
+                        logging.info("Manual re-download requested for session %s", session.session_id.folder_name())
+                if last_saved and config.cleanup_before_fetch and not roster_changed_same_session and partial_target_refresh_key is None:
                     reason = (
                         f"Refreshing current session files before new fetch for {session.session_id.folder_name()}"
                         if current_fingerprint == last_session_fingerprint or same_session_identity
@@ -18343,8 +19009,12 @@ class DownloaderService:
                             fallback_saved=[],
                             sync_my_livery_from_server=config.sync_my_livery_from_server,
                             replay_mode=True,
+                            disable_random_in_team_events=bool(getattr(config, "disable_random_in_team_events", True)),
                         ),
                     )
+                    refresh_time = time.time()
+                    for row in session_rows:
+                        self._session_refresh_by_key[_session_row_key(row)] = refresh_time
                     logging.info(
                         "Replay pack '%s' restored for replay session %s with %s file(s)",
                         restored_pack_name or "unknown",
@@ -18393,7 +19063,7 @@ class DownloaderService:
                             random_suits_ai=bool(getattr(config, "random_suits_ai", getattr(config, "random_suits", True))),
                             disable_random_in_team_events=bool(getattr(config, "disable_random_in_team_events", True)),
                             disable_random_for_local_user=bool(getattr(config, "disable_random_for_local_user", True)),
-                            use_driver_paints_for_missing_team_assets=bool(getattr(config, "use_driver_paints_for_missing_team_assets", True)),
+                            team_driver_personal_fallback_slots=team_driver_fallback_slots,
                             ai_collection_skip_random_cars=bool(getattr(config, "ai_collection_skip_random_cars", True)),
                             ai_collection_skip_random_helmets=bool(getattr(config, "ai_collection_skip_random_helmets", True)),
                             ai_collection_skip_random_suits=bool(getattr(config, "ai_collection_skip_random_suits", True)),
@@ -18464,7 +19134,10 @@ class DownloaderService:
                         self._set_status("Watching")
                         self._stop_event.wait(max(config.poll_seconds, 0.2))
                         continue
-                    if roster_changed_same_session:
+                    refresh_time = time.time()
+                    for row in processed_rows:
+                        self._session_refresh_by_key[_session_row_key(row)] = refresh_time
+                    if roster_changed_same_session or partial_target_refresh_key is not None:
                         last_saved = merge_saved_files(last_saved, processed_saved)
                         session_rows = merge_session_driver_rows(session, previous_rows, processed_rows)
                     else:
@@ -18827,7 +19500,11 @@ class DownloaderUI:
         self.random_suits_ai_var = tk.BooleanVar(value=bool(getattr(self.config, "random_suits_ai", getattr(self.config, "random_suits", True))))
         self.disable_random_in_team_events_var = tk.BooleanVar(value=bool(getattr(self.config, "disable_random_in_team_events", True)))
         self.disable_random_for_local_user_var = tk.BooleanVar(value=bool(getattr(self.config, "disable_random_for_local_user", True)))
-        self.use_driver_paints_for_missing_team_assets_var = tk.BooleanVar(value=bool(getattr(self.config, "use_driver_paints_for_missing_team_assets", True)))
+        legacy_team_driver_fallback = bool(getattr(self.config, "use_driver_paints_for_missing_team_assets", True))
+        self.use_driver_paints_for_missing_team_car_var = tk.BooleanVar(value=bool(getattr(self.config, "use_driver_paints_for_missing_team_car", legacy_team_driver_fallback)))
+        self.use_driver_paints_for_missing_team_suit_var = tk.BooleanVar(value=bool(getattr(self.config, "use_driver_paints_for_missing_team_suit", legacy_team_driver_fallback)))
+        self.use_driver_paints_for_missing_team_helmet_var = tk.BooleanVar(value=bool(getattr(self.config, "use_driver_paints_for_missing_team_helmet", legacy_team_driver_fallback)))
+        self.preload_team_driver_personal_paints_var = tk.BooleanVar(value=bool(getattr(self.config, "preload_team_driver_personal_paints", True)))
         self.tp_fallback_mode_var = tk.StringVar(value=str(getattr(self.config, "tp_fallback_mode", "online") or "online").strip().lower().title())
         self.keep_tp_pool_var = tk.BooleanVar(value=getattr(self.config, "keep_tp_paints_in_random_pool", False))
         self.random_pool_size_gb_var = tk.DoubleVar(value=clamp_random_pool_gb(getattr(self.config, "max_random_pool_gb", 5.0), 5.0))
@@ -19039,12 +19716,13 @@ class DownloaderUI:
         session_info.columnconfigure(0, weight=1)
         ttk.Label(session_info, textvariable=self.session_summary_var, justify="left").grid(row=0, column=0, sticky="w")
         ttk.Label(session_info, textvariable=self.session_status_summary_var, justify="left", foreground="#555555").grid(row=1, column=0, sticky="w", pady=(4, 0))
+        ttk.Button(session_info, text="Force refresh current car/team", command=self.force_refresh_current_car_team).grid(row=0, column=1, rowspan=2, sticky="e", padx=(12, 0))
 
         driver_list_frame = ttk.LabelFrame(session_tab, text="Drivers in session", padding=8)
         driver_list_frame.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
         driver_list_frame.columnconfigure(0, weight=1)
         driver_list_frame.rowconfigure(0, weight=1)
-        self.session_tree = ttk.Treeview(driver_list_frame, columns=("car", "suit", "helmet", "id", "num", "ir", "lic", "sr", "name"), show="headings", height=18)
+        self.session_tree = ttk.Treeview(driver_list_frame, columns=("car", "suit", "helmet", "id", "num", "ir", "lic", "sr", "name", "swap", "refresh"), show="headings", height=18)
         self.session_tree.heading("car", text="Car", command=lambda: self.on_session_heading_clicked("car"))
         self.session_tree.heading("suit", text="Suit", command=lambda: self.on_session_heading_clicked("suit"))
         self.session_tree.heading("helmet", text="Helmet", command=lambda: self.on_session_heading_clicked("helmet"))
@@ -19053,16 +19731,20 @@ class DownloaderUI:
         self.session_tree.heading("ir", text="iR", command=lambda: self.on_session_heading_clicked("ir"))
         self.session_tree.heading("lic", text="Lic", command=lambda: self.on_session_heading_clicked("lic"))
         self.session_tree.heading("sr", text="SR", command=lambda: self.on_session_heading_clicked("sr"))
-        self.session_tree.heading("name", text="Name", command=lambda: self.on_session_heading_clicked("name"))
-        self.session_tree.column("car", width=138, minwidth=126, anchor="center", stretch=False)
-        self.session_tree.column("suit", width=138, minwidth=126, anchor="center", stretch=False)
-        self.session_tree.column("helmet", width=138, minwidth=126, anchor="center", stretch=False)
-        self.session_tree.column("id", width=98, minwidth=88, anchor="e", stretch=False)
-        self.session_tree.column("num", width=54, minwidth=48, anchor="center", stretch=False)
-        self.session_tree.column("ir", width=84, minwidth=74, anchor="e", stretch=False)
-        self.session_tree.column("lic", width=54, minwidth=48, anchor="center", stretch=False)
-        self.session_tree.column("sr", width=62, minwidth=56, anchor="center", stretch=False)
-        self.session_tree.column("name", width=320, minwidth=240, anchor="w", stretch=False)
+        self.session_tree.heading("name", text="Current driver", command=lambda: self.on_session_heading_clicked("name"))
+        self.session_tree.heading("swap", text="Last swap", command=lambda: self.on_session_heading_clicked("swap"))
+        self.session_tree.heading("refresh", text="Last refresh", command=lambda: self.on_session_heading_clicked("refresh"))
+        self.session_tree.column("car", width=122, minwidth=110, anchor="center", stretch=False)
+        self.session_tree.column("suit", width=122, minwidth=110, anchor="center", stretch=False)
+        self.session_tree.column("helmet", width=122, minwidth=110, anchor="center", stretch=False)
+        self.session_tree.column("id", width=90, minwidth=82, anchor="e", stretch=False)
+        self.session_tree.column("num", width=50, minwidth=44, anchor="center", stretch=False)
+        self.session_tree.column("ir", width=76, minwidth=68, anchor="e", stretch=False)
+        self.session_tree.column("lic", width=48, minwidth=42, anchor="center", stretch=False)
+        self.session_tree.column("sr", width=54, minwidth=48, anchor="center", stretch=False)
+        self.session_tree.column("name", width=220, minwidth=190, anchor="w", stretch=True)
+        self.session_tree.column("swap", width=220, minwidth=180, anchor="w", stretch=True)
+        self.session_tree.column("refresh", width=88, minwidth=78, anchor="center", stretch=False)
         session_tree_scroll = ttk.Scrollbar(driver_list_frame, orient="vertical", command=self.session_tree.yview)
         self.session_tree.configure(yscrollcommand=session_tree_scroll.set)
         self.session_tree.bind("<<TreeviewSelect>>", self.on_session_driver_selected)
@@ -19072,11 +19754,14 @@ class DownloaderUI:
             "queued": "#6a6a6a",
             "downloading": "#0b63b6",
             "downloaded": "#176d2b",
+            "team_paint": "#176d2b",
+            "driver_paint": "#0b63b6",
             "override": "#176d2b",
             "replay": "#6d3ca6",
             "fallback": "#a06a00",
             "fallback_local": "#a06a00",
             "fallback_online": "#7a3fb0",
+            "iracing_default": "#555555",
             "missing": "#9a2020",
             "skipped": "#555555",
         }.items():
@@ -19160,14 +19845,33 @@ class DownloaderUI:
             variable=self.disable_random_for_local_user_var,
             command=self.on_setting_changed,
         ).grid(row=12, column=0, columnspan=2, sticky="w", pady=(2, 0))
+        ttk.Label(prefs, text="Team driver fallback", font=("Segoe UI", 9, "bold"), foreground="#0b63b6").grid(row=13, column=0, columnspan=2, sticky="w", pady=(8, 0))
         ttk.Checkbutton(
             prefs,
-            text="Use driver personal paints when team paints are missing",
-            variable=self.use_driver_paints_for_missing_team_assets_var,
+            text="Use driver personal car when team car is missing",
+            variable=self.use_driver_paints_for_missing_team_car_var,
             command=self.on_setting_changed,
-        ).grid(row=13, column=0, columnspan=2, sticky="w", pady=(2, 0))
+        ).grid(row=14, column=0, sticky="w", pady=(2, 0))
+        ttk.Checkbutton(
+            prefs,
+            text="Use driver personal suit when team suit is missing",
+            variable=self.use_driver_paints_for_missing_team_suit_var,
+            command=self.on_setting_changed,
+        ).grid(row=14, column=1, sticky="w", padx=(12, 0), pady=(2, 0))
+        ttk.Checkbutton(
+            prefs,
+            text="Use driver personal helmet when team helmet is missing",
+            variable=self.use_driver_paints_for_missing_team_helmet_var,
+            command=self.on_setting_changed,
+        ).grid(row=15, column=0, columnspan=2, sticky="w", pady=(2, 0))
+        ttk.Checkbutton(
+            prefs,
+            text="Preload team drivers' personal paints",
+            variable=self.preload_team_driver_personal_paints_var,
+            command=self.on_setting_changed,
+        ).grid(row=16, column=0, columnspan=2, sticky="w", pady=(2, 0))
         iracing_docs_box = ttk.LabelFrame(prefs, text="iRacing Documents folder", padding=8)
-        iracing_docs_box.grid(row=14, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        iracing_docs_box.grid(row=17, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         iracing_docs_box.columnconfigure(0, weight=1)
         iracing_docs_row = ttk.Frame(iracing_docs_box)
         iracing_docs_row.grid(row=0, column=0, sticky="ew")
@@ -19841,7 +20545,9 @@ class DownloaderUI:
             self._format_irating_text(row.irating),
             str(row.license_label),
             str(row.safety_rating),
-            self._format_session_driver_name(row),
+            str(row.current_driver_text or self._format_session_driver_name(row)),
+            str(row.last_driver_swap_text or "-"),
+            str(row.last_refresh_text or "-"),
         )
     def _session_snapshot_signature(self, snapshot: RuntimeSnapshot) -> tuple:
         session_label = snapshot.current_session.session_id.folder_name() if snapshot.current_session is not None else ""
@@ -19860,14 +20566,17 @@ class DownloaderUI:
         order = {
             "downloading": 0,
             "override": 1,
-            "downloaded": 2,
-            "fallback_online": 3,
-            "fallback_local": 4,
-            "fallback": 5,
-            "replay": 6,
-            "missing": 7,
-            "skipped": 8,
-            "queued": 9,
+            "team_paint": 2,
+            "driver_paint": 3,
+            "downloaded": 4,
+            "fallback_online": 5,
+            "fallback_local": 6,
+            "fallback": 7,
+            "replay": 8,
+            "iracing_default": 9,
+            "missing": 10,
+            "skipped": 11,
+            "queued": 12,
         }
         return (order.get(str(status_code or ''), 99), str(status_text or '').lower())
     def _session_status_sort_key(self, row: SessionDriverSnapshot) -> tuple[int, str]:
@@ -19904,8 +20613,12 @@ class DownloaderUI:
             key_fn = self._session_license_sort_key
         elif column == "sr":
             key_fn = self._session_sr_sort_key
+        elif column == "swap":
+            key_fn = lambda row: str(row.last_driver_swap_text or "").lower()
+        elif column == "refresh":
+            key_fn = lambda row: str(row.last_refresh_text or "").lower()
         else:
-            key_fn = lambda row: self._format_session_driver_name(row).lower()
+            key_fn = lambda row: str(row.current_driver_text or self._format_session_driver_name(row)).lower()
         return sorted(rows, key=key_fn, reverse=reverse)
     def on_session_heading_clicked(self, column: str) -> None:
         column = str(column or "name").strip().lower()
@@ -19959,7 +20672,7 @@ class DownloaderUI:
                 saved_items=list(snapshot.last_saved),
                 user=user,
                 kind=kind,
-                allow_profile_link=row_status_code in {"downloaded", "replay", "fallback_online"},
+                allow_profile_link=row_status_code in {"downloaded", "team_paint", "driver_paint", "replay", "fallback_online"},
             )
             can_open = bool(_driver_paint_entry_url(entry or current_entry, user))
             can_assign_current = current_entry is not None
@@ -20012,7 +20725,7 @@ class DownloaderUI:
         )
         counts = Counter(row.status_code for row in rows)
         summary_bits = []
-        for code in ("override", "downloaded", "replay", "downloading", "fallback_online", "fallback_local", "fallback", "missing", "skipped"):
+        for code in ("override", "team_paint", "driver_paint", "downloaded", "replay", "downloading", "fallback_online", "fallback_local", "fallback", "iracing_default", "missing", "skipped"):
             if counts.get(code):
                 summary_bits.append(f"{_session_status_meta(code)[1]} {counts[code]}")
         self.session_status_summary_var.set(" • ".join(summary_bits) if summary_bits else "No paint activity yet.")
@@ -20072,7 +20785,7 @@ class DownloaderUI:
                 saved_items=list(_snapshot.last_saved),
                 user=user,
                 kind=normalized_kind,
-                allow_profile_link=str(getattr(row, f"{normalized_kind}_status_code", "") or "") in {"downloaded", "replay", "fallback_online"},
+                allow_profile_link=str(getattr(row, f"{normalized_kind}_status_code", "") or "") in {"downloaded", "team_paint", "driver_paint", "replay", "fallback_online"},
             )
         url = _driver_paint_entry_url(entry, user)
         if not url:
@@ -21272,7 +21985,15 @@ class DownloaderUI:
             random_accessory_defaults_migrated=True,
             disable_random_in_team_events=bool(self.disable_random_in_team_events_var.get()),
             disable_random_for_local_user=bool(self.disable_random_for_local_user_var.get()),
-            use_driver_paints_for_missing_team_assets=bool(self.use_driver_paints_for_missing_team_assets_var.get()),
+            use_driver_paints_for_missing_team_assets=bool(
+                self.use_driver_paints_for_missing_team_car_var.get()
+                or self.use_driver_paints_for_missing_team_suit_var.get()
+                or self.use_driver_paints_for_missing_team_helmet_var.get()
+            ),
+            use_driver_paints_for_missing_team_car=bool(self.use_driver_paints_for_missing_team_car_var.get()),
+            use_driver_paints_for_missing_team_suit=bool(self.use_driver_paints_for_missing_team_suit_var.get()),
+            use_driver_paints_for_missing_team_helmet=bool(self.use_driver_paints_for_missing_team_helmet_var.get()),
+            preload_team_driver_personal_paints=bool(self.preload_team_driver_personal_paints_var.get()),
             tp_fallback_mode=str(self.tp_fallback_mode_var.get() or "Local").strip().lower(),
             tp_manifest_member_id_override=self._parse_tp_manifest_member_id_ui(),
             tp_primary_fast_mode=True,
@@ -21616,6 +22337,15 @@ class DownloaderUI:
         else:
             self._append_log("Manual re-download requested (worker mode: Safe).")
         self.service.request_refresh_now()
+    def force_refresh_current_car_team(self) -> None:
+        snapshot, row, user = self._selected_session_context()
+        if snapshot.current_session is None or row is None or user is None:
+            self._append_log("Select a current session row before forcing a car/team refresh.")
+            return
+        target_key = _session_row_key(row)
+        target_label = f"team {row.target_id}" if row.target_kind == "team" else f"user {row.target_id}"
+        self._append_log(f"Force refresh requested for current {target_label} on {row.directory}.")
+        self.service.request_refresh_target_now(target_key)
     def clear_downloaded_now(self) -> None:
         self._append_log("Manual clear requested.")
         self.service.request_clear_current_downloads()

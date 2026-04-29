@@ -2,6 +2,16 @@
 
 All notable user-facing changes to Nishizumi Paints are documented here.
 
+## [6.7] - 2026-04-29
+
+### Experimental
+
+- Added experimental preloading for personal paints from drivers detected in Team sessions, so driver swaps can reuse cached car, suit, and helmet files faster.
+- Added **Force refresh current car/team** in the Session tab to clear and reapply only the selected current target without restarting the app.
+- Split the Team-session personal paint fallback into separate General-tab options for car, suit, and helmet, all enabled by default.
+- Expanded Team Event logs with clearer messages for missing team items, personal-driver fallback, and active driver swaps.
+- Expanded the Session tab table to show per-item source status, current driver, last detected driver swap, and last refresh time.
+
 ## [6.6] - 2026-04-29
 
 ### Stable Release

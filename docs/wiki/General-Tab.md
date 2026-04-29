@@ -41,11 +41,16 @@ This area controls how the app treats the local user and live-session paint clea
 - delete live session paints
 - do not apply random paints in team events
 - do not apply random paints to myself
-- use driver personal paints when team paints are missing
+- use driver personal car when team car is missing
+- use driver personal suit when team suit is missing
+- use driver personal helmet when team helmet is missing
+- preload team drivers' personal paints
 
-That last option is important when the user wants fallback for everybody else but never wants the app to replace their own visible car with a random result.
+The self-protection options are important when the user wants fallback for everybody else but never wants the app to replace their own visible car with a random result.
 
-The team-driver option is enabled by default. In Team sessions, the app tries the team's car, helmet, and suit first. If one item is missing for the team, it uses the personal paint for the driver currently in the car. When the active driver changes, the app refreshes the team target for the new driver. If neither the team nor that driver has the item, the normal random fallback rules apply; if random paints in team events are disabled, iRacing keeps its default item.
+The team-driver options are enabled by default. In Team sessions, the app tries the team's car, helmet, and suit first. If one item is missing for the team, the matching per-item option allows the app to use the personal paint for the driver currently in the car. When the active driver changes, the app refreshes the team target for the new driver. If neither the team nor that driver has the item, the normal random fallback rules apply; if random paints in team events are disabled, iRacing keeps its default item.
+
+The preload option is also enabled by default. When a Team session is detected, the app caches personal paints for team drivers exposed by the iRacing session data. That cache can be applied immediately if one of those drivers later becomes the active driver in the team car.
 
 ## Download worker mode
 
