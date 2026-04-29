@@ -5,6 +5,9 @@ on:
     branches: ["main", "master"]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   python-checks:
     runs-on: windows-latest

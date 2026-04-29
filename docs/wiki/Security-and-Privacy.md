@@ -26,6 +26,9 @@ Do not commit:
 - tokens or cookies
 - `settings.json`
 - installer output
+- `.playwright-cli/` captures
+- `FILES TO SEND/` or other manual staging/export folders
+- crash dumps and merge/backup artifacts such as `*.dmp`, `*.orig`, `*.rej`, and `*.bak`
 - local temp folders
 - logs containing private local paths unless a support workflow explicitly asks for them
 

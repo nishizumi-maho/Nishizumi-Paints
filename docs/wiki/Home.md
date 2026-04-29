@@ -45,7 +45,7 @@ The RandomPool is the local reusable fallback cache. It can be filled manually f
 
 ### Collection pool
 
-The app can also cache paints from Trading Paints collections. This is useful for curated themed sets that should be reused locally without relying on a live session fetch.
+The app can also cache paints from Trading Paints collections. This is useful for curated themed sets that should be reused locally without relying on a live session fetch. When normal public showroom coverage is disabled, the app now keeps reusing the selected collection paints within the same session instead of leaving later targets unchanged.
 
 ### Per-driver memory
 
