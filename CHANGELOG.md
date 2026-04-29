@@ -2,25 +2,88 @@
 
 All notable user-facing changes to Nishizumi Paints are documented here.
 
-## [6.1.0] - 2026-04-22
+## [6.5] - 2026-04-29
 
-### Changed
+### Stable Release
 
-- Trading Paints **collection pool** now reuses paints from the selected collections within the same session whenever normal public showroom coverage is disabled.
-- The collection-pool UI now explains that strict collection-only mode automatically repeats curated paints after the selected pool runs out.
+- First stable release since 6.0, collecting the showroom source, Team, Member ID, car dropdown, all-paints folder export, and 6.4.2 dropdown UX fixes.
+- Confirmed **Recycle downloaded TP car paints into the local random pool** defaults to off for new or missing config values while preserving explicit user opt-ins.
+
+## [6.4.2] - 2026-04-29
 
 ### Fixed
 
-- Fixed strict collection-pool sessions so targets are no longer left unchanged just because every compatible collection paint was already used earlier in the same session.
+- Fixed Showroom car dropdowns so selecting a car closes the menu instead of reopening it.
+- Fixed Showroom car dropdowns to show the full car list when browsing and only filter the list while typing.
+- Reduced dropdown height and shortened inline suggestions so the Car, Member ID, and Teams car selectors stay readable.
+- Moved Member ID and Teams all-paints downloads into a separate **Download everything** area so the one-click full download is clearer.
 
-### Packaging
+## [6.4.1] - 2026-04-29
 
-- The installer build now clears stale `installer/output/` artifacts before compiling a new release, reducing the chance of publishing the wrong setup executable.
+### Changed
 
-### Security
+- Reworked the Showroom car download tab so users choose a Trading Paints car directly instead of typing a TP car ID or slug.
+- Added the same click-to-open searchable car dropdown to Showroom car, Member ID, and Teams downloads.
+- Reduced the car field width and added live suggestions below each car selector while typing.
+- Manual random car downloads keep using the selected Showroom source pool and randomly fetch from any enabled source.
 
-- Expanded repository hygiene ignores for common crash, merge, and backup artifacts.
-- Refreshed the release/security docs to call out local capture folders, staging folders, and other machine-specific artifacts that should stay out of commits and release packaging.
+## [6.4] - 2026-04-29
+
+### Added
+
+- Added **Showroom > Member ID** for downloading a member's car, helmet, and suit paints by Member ID and selected car.
+- Added one-click all-paints downloads for Member ID targets, saving all returned cars plus helmet and suit into an organized member folder.
+- Added one-click all-paints downloads for Teams, scanning mapped Trading Paints cars in manifest batches and saving found cars plus helmet and suit into an organized team folder.
+- Added editable car dropdowns for Member ID and Teams so users can pick a Trading Paints car from the bundled mapping instead of typing IDs or directories.
+
+## [6.3.3] - 2026-04-29
+
+### Changed
+
+- New and migrated default showroom source settings now enable all four sources: **Trending**, **Newest**, **Most favorited**, and **Most raced (ever)**.
+- Empty showroom source selections are normalized back to all four sources instead of only **Trending**.
+
+## [6.3.2] - 2026-04-29
+
+### Changed
+
+- Reverted the 6.3.1 interactive **Showroom > Teams** redesign.
+- Simplified **Showroom > Teams** so users only type the required Team ID and car value.
+- Team downloads now keep the optional manifest context internal instead of showing member ID and car number fields in the Teams box.
+
+## [6.3.0] - 2026-04-29
+
+### Added
+
+- Added Advanced mode controls for choosing which public Trading Paints showroom sources random fallback can use:
+  - Trending
+  - Newest
+  - Most favorited
+  - Most raced (ever)
+- Multiple selected showroom sources are mixed randomly per fallback attempt.
+
+### Changed
+
+- Random showroom fallback still defaults to **Trending** for existing and new users.
+- Public showroom logs now include the source used for each random fallback paint.
+
+## [6.2.0] - 2026-04-25
+
+### Added
+
+- Added a **Teams** mode to the Showroom tab for manual Trading Paints team paint downloads by Team ID and car.
+- Added a no-login team manifest fallback that tries session-aware Trading Paints payload variants and reports which route returned matching team assets.
+- Team downloads can save directly to the iRacing paint folder or to a one-time custom folder.
+
+### Changed
+
+- Team paint imports now preserve the normal iRacing team filenames: `car_team_{team_id}.tga`, `helmet_team_{team_id}.tga`, and `suit_team_{team_id}.tga`.
+- Updated the release metadata, installer reference, and Trading Paints notes for the 6.2.0 workflow.
+
+### Privacy
+
+- Documented that the manual team downloader sends only the entered Team ID and car directory plus minimal synthetic context to Trading Paints manifest endpoints.
+- Confirmed the team flow does not require or store Trading Paints login cookies, passwords, or tokens.
 
 ## [6.0.0] - 2026-04-18
 

@@ -21,7 +21,7 @@ This section is where the repository reorganization matters, because the script 
 
 ## 2. Legacy browser and authenticated showroom compatibility
 
-Even though 6.0.0 is the no-browser release, the script still keeps older authenticated showroom helpers for:
+Even though the current app is a no-browser release, the script still keeps older authenticated showroom helpers for:
 
 - login-state detection
 - member-ID detection
@@ -98,7 +98,7 @@ Another large section implements the public direct-download architecture:
 - collection JSON loading
 - collection-pool caching
 
-This section is the real heart of the 6.0.0 no-browser workflow.
+This section is the real heart of the current no-browser workflow.
 
 ## 8. AI roster logic
 

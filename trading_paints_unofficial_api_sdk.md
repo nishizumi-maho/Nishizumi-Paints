@@ -5,14 +5,16 @@
 
 ## 1. Scope
 
-The current Nishizumi Paints 6.0.0 codebase talks to Trading Paints in four practical ways:
+The current Nishizumi Paints 6.4 codebase talks to Trading Paints in six practical ways:
 
 1. session-aware manifest lookups for real live-session paints
 2. single-user manifest fallback lookups
 3. public showroom JSON and direct asset downloads for cars, helmets, and suits
 4. collection and AI-roster metadata lookups
+5. manual team paint manifest lookups by Team ID and car directory
+6. manual member paint manifest lookups by Member ID, including all-paints folder exports
 
-The public showroom path is now the main no-browser fallback flow. Legacy authenticated showroom endpoints still exist in the script for compatibility and historical logic, but they are no longer the primary 6.0.0 path.
+The public showroom path is now the main no-browser fallback flow. Legacy authenticated showroom endpoints still exist in the script for compatibility and historical logic, but they are no longer the primary 6.4 path.
 
 ## 2. Endpoint catalog
 
@@ -29,6 +31,21 @@ Purpose:
 
 - resolve Trading Paints assets for a specific iRacing session entry using the local member, session context, and target driver/team details
 
+### 2.1.1 Manual team paint manifest lookup
+
+- `https://dl.tradingpaints.com/fetch.php`
+- `https://fetch.tradingpaints.gg/fetch.php`
+
+Method:
+
+- `POST`
+
+Purpose:
+
+- resolve team-owned car, helmet, and suit assets for a known Team ID and car directory without using a browser login
+- filter the XML response to `<teamid>{team_id}</teamid>` before accepting files
+- batch all-team exports by sending comma-separated `list` entries, then filtering the returned XML per mapped car directory
+
 ### 2.2 Single-user manifest fallback
 
 - `https://fetch.tradingpaints.gg/fetch_user.php?user={user_id}`
@@ -42,6 +59,7 @@ Purpose:
 
 - resolve paint files for one member without full session context
 - the `ts` variant is used as an uncached poll when the app needs to observe a fresh manifest
+- power manual **Showroom > Member ID** downloads for one selected car or every returned car, helmet, and suit for that member
 
 ### 2.3 Public showroom JSON
 
@@ -116,7 +134,7 @@ Purpose:
 - `https://www.tradingpaints.com/js/dashboard.php?cmd=delete&id=active&make={mid}&series=0&cid=0&number=0`
 - `https://www.tradingpaints.com/auth`
 
-These belong to the older authenticated showroom-switching path. They are still described here because the script retains compatibility logic, but they are not required for the main public fallback flow in 6.0.0.
+These belong to the older authenticated showroom-switching path. They are still described here because the script retains compatibility logic, but they are not required for the main public fallback flow in 6.2.0.
 
 ## 3. Session-aware manifest payload
 
@@ -148,6 +166,30 @@ league=0
 numbers=False
 list=987654=dallarap217=0=12=
 ```
+
+### 3.1 Manual team paint payload
+
+For manual team paint lookup, the app sends `team=1` and uses the Team ID in the `list` field:
+
+```text
+team=1
+user=0
+night=10:00 am
+series=0
+league=0
+numbers=False
+list=0=amvantageevogt3=404314=0=
+```
+
+The app also tries conservative variants that include an optional requesting member ID, optional driver member ID, and the resolved Trading Paints car ID when known. A response is accepted only when the XML node has the requested `teamid`. For car, decal, number, and spec files, the XML `directory` must also match the resolved iRacing car directory. Helmet and suit nodes are allowed through by Team ID because their directories are `helmets` and `suits`.
+
+For all-team exports, multiple car requests are sent in one payload by comma-separating the `list` entries:
+
+```text
+list=404314=acuraarx06gtp=404314=0=,404314=amvantageevogt3=404314=0=
+```
+
+The app still filters every returned XML node by Team ID and by mapped car directory before saving files.
 
 ## 4. Manifest XML shape
 
@@ -441,6 +483,12 @@ For normal user targets, the current app writes:
 
 Team targets replace the user portion with `team_{team_id}`.
 
+Manual team downloads use the same convention, for example:
+
+- `paint/{directory}/car_team_404314.tga`
+- `paint/helmet_team_404314.tga`
+- `paint/suit_team_404314.tga`
+
 Superspeedway sessions can also create `_ss` variants for car-related paint types.
 
 ## 14. Download, retry, and failure handling
@@ -466,7 +514,7 @@ The script still contains the older authenticated workflow, including:
 - manifest polling after scheme switches
 - original-paint backup and restore helpers
 
-That logic remains valuable for historical understanding and fallback compatibility, but it is no longer the main 6.0.0 architecture.
+That logic remains valuable for historical understanding and fallback compatibility, but it is no longer the main 6.2.0 architecture.
 
 ## 16. Practical guidance
 

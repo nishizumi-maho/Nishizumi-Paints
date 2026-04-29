@@ -37,7 +37,7 @@ If a driver already has a usable Trading Paints paint for the current car and se
 
 ### Public online fallback
 
-If a driver does not have a usable Trading Paints paint, the app can fetch a public showroom paint directly. In 6.1.0 this is the main no-browser online fallback path, including cars, helmets, and suits.
+If a driver does not have a usable Trading Paints paint, the app can fetch a public showroom paint directly. This is the main no-browser online fallback path, including cars, helmets, and suits.
 
 ### RandomPool
 

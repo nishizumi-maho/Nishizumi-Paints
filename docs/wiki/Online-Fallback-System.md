@@ -2,7 +2,7 @@
 
 The online fallback system is the part of Nishizumi Paints that fills missing liveries from public Trading Paints showroom data when a driver does not already have a usable normal Trading Paints paint.
 
-## Main design in 6.1.0
+## Main design
 
 The current release is centered on a public no-browser path:
 
