@@ -2,7 +2,7 @@
 
 The online fallback system is the part of Nishizumi Paints that fills missing liveries from public Trading Paints showroom data when a driver does not already have a usable normal Trading Paints paint.
 
-## Main design in 6.0.0
+## Main design in 6.1.0
 
 The current release is centered on a public no-browser path:
 
@@ -17,10 +17,18 @@ The app still contains legacy authenticated showroom logic, but the public direc
 At a high level, the app tries to resolve a driver like this:
 
 1. normal Trading Paints manifest result if one exists
-2. public online fallback if enabled and the driver is eligible
-3. local RandomPool fallback if online fallback cannot provide a usable result
+2. collection-pool fallback first when curated collection IDs are configured
+3. public online fallback if enabled and the driver is eligible
+4. local RandomPool fallback if the online path cannot provide a usable result
 
 That is why the Random tab, General tab, and Showroom tab all affect the final outcome even though the live work happens automatically.
+
+## Collection pool behavior
+
+When collection IDs are configured, the app tries those curated paints before the normal public showroom.
+
+- if normal public showroom coverage stays enabled, the collection pool behaves as a preferred first pass and the public showroom can still cover any target the curated pool misses
+- if normal public showroom coverage is disabled, the app stays collection-only and now repeats the selected collection paints within the same session after the unused curated options run out
 
 ## Public showroom cars
 

@@ -68,6 +68,8 @@ The app can:
 - map cars back to iRacing directories when possible
 - save the results into the RandomPool or collection-specific cache
 
+When those collections are used as a live fallback source, disabling normal public showroom coverage now keeps the session inside that curated pool by repeating collection paints once the unused options are exhausted.
+
 ## Mixed-vehicle collections
 
 Collections can contain:

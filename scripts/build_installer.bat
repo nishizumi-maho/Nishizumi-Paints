@@ -40,6 +40,9 @@ if not defined APP_VERSION (
 )
 
 set "ISCC="
+if exist "%ProgramFiles%\Inno Setup 7\ISCC.exe" set "ISCC=%ProgramFiles%\Inno Setup 7\ISCC.exe"
+if not defined ISCC if exist "%ProgramFiles(x86)%\Inno Setup 7\ISCC.exe" set "ISCC=%ProgramFiles(x86)%\Inno Setup 7\ISCC.exe"
+if not defined ISCC if exist "%LOCALAPPDATA%\Programs\Inno Setup 7\ISCC.exe" set "ISCC=%LOCALAPPDATA%\Programs\Inno Setup 7\ISCC.exe"
 if exist "%ProgramFiles%\Inno Setup 6\ISCC.exe" set "ISCC=%ProgramFiles%\Inno Setup 6\ISCC.exe"
 if not defined ISCC if exist "%ProgramFiles(x86)%\Inno Setup 6\ISCC.exe" set "ISCC=%ProgramFiles(x86)%\Inno Setup 6\ISCC.exe"
 if not defined ISCC if exist "%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe" set "ISCC=%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe"
@@ -58,6 +61,11 @@ if not defined ISCC (
 echo [INFO] App version: %APP_VERSION%
 echo [INFO] Inno compiler: %ISCC%
 echo.
+
+if exist "installer\output" (
+    echo [INFO] Cleaning previous installer output...
+    rmdir /s /q "installer\output"
+)
 
 "%ISCC%" /DAppVersion=%APP_VERSION% "%ISS%"
 if errorlevel 1 (

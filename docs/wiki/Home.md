@@ -37,7 +37,7 @@ If a driver already has a usable Trading Paints paint for the current car and se
 
 ### Public online fallback
 
-If a driver does not have a usable Trading Paints paint, the app can fetch a public showroom paint directly. In 6.0.0 this is the main no-browser online fallback path, including cars, helmets, and suits.
+If a driver does not have a usable Trading Paints paint, the app can fetch a public showroom paint directly. In 6.1.0 this is the main no-browser online fallback path, including cars, helmets, and suits.
 
 ### RandomPool
 
@@ -45,7 +45,7 @@ The RandomPool is the local reusable fallback cache. It can be filled manually f
 
 ### Collection pool
 
-The app can also cache paints from Trading Paints collections. This is useful for curated themed sets that should be reused locally without relying on a live session fetch.
+The app can also cache paints from Trading Paints collections. This is useful for curated themed sets that should be reused locally without relying on a live session fetch. When normal public showroom coverage is disabled, the app now keeps reusing the selected collection paints within the same session instead of leaving later targets unchanged.
 
 ### Per-driver memory
 

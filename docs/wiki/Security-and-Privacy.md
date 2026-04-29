@@ -25,6 +25,9 @@ Do not commit:
 - tokens or cookies
 - `settings.json`
 - installer output
+- `.playwright-cli/` captures
+- `FILES TO SEND/` or other manual staging/export folders
+- crash dumps and merge/backup artifacts such as `*.dmp`, `*.orig`, `*.rej`, and `*.bak`
 - local temp folders
 - logs containing private local paths unless a support workflow explicitly asks for them
 
@@ -46,7 +49,7 @@ It intentionally ignores:
 
 ## Current release posture
 
-The main 6.0.0 online fallback path uses public showroom direct downloads. That reduces the need to package or ship browser automation just to make public fallback work.
+The main 6.1.0 online fallback path uses public showroom direct downloads. That reduces the need to package or ship browser automation just to make public fallback work.
 
 ## Responsible debugging
 

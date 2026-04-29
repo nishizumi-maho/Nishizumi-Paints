@@ -47,7 +47,7 @@ That distinction matters because RandomPool imports are meant for app reuse, whi
 
 ## Public no-browser behavior
 
-The 6.0.0 no-browser release is centered on public showroom access:
+The 6.1.0 no-browser release is centered on public showroom access:
 
 - no embedded browser is required for the normal showroom importer
 - no Trading Paints login is required for the main public path

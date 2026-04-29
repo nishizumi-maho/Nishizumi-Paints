@@ -39,6 +39,8 @@ Build the installer:
 .\scripts\build_installer.bat
 ```
 
+The installer helper clears the previous `installer/output/` folder before compiling so the release folder only contains fresh artifacts for the current version.
+
 ## Installer output
 
 The Inno Setup build writes release installers into:
@@ -65,6 +67,7 @@ Generated artifacts and local scratch areas are intentionally ignored:
 - `.playwright-cli/`
 - `wiki_tmp/`
 - `FILES TO SEND/`
+- `*.bak`, `*.orig`, `*.rej`, `*.dmp`, and `*.stackdump`
 - downloaded paint pools and local browser bundles
 
 ## Release hygiene
@@ -75,4 +78,5 @@ Before publishing a release:
 2. verify the onedir build works
 3. verify the installer build works
 4. keep root-level repository noise low
-5. avoid shipping local caches, tokens, browser profiles, or downloaded paint folders
+5. avoid shipping local caches, tokens, browser profiles, Playwright captures, staging folders, or downloaded paint folders
+6. upload only the freshly generated installer from the cleaned `installer/output/` folder
