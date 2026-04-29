@@ -16083,7 +16083,7 @@ def process_session(
         )
     elif fallback_mode == "online":
         fallback_saved, fallback_logs, fallback_summary = [], [
-            "Trading Paints collection pool handled configured collections only; normal public showroom coverage is disabled by the collection fallback checkbox."
+            "Trading Paints collection pool handled configured collections only; normal public showroom coverage is disabled, so collection paints will be reused within the session if the selected pool runs out."
         ], RandomFallbackSummary()
     else:
         fallback_saved, fallback_logs, fallback_summary = apply_local_tp_random_fallbacks(

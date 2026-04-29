@@ -35,6 +35,8 @@ Typical options are:
 
 The exact source order is then refined by the General tab worker and lane options and by whether the RandomPool or collection pool already contains usable assets.
 
+When the collection pool is active and normal public showroom coverage is turned off, the app now repeats the selected collection paints within the same session after that curated pool is exhausted.
+
 ## Step 3: Public showroom and Local RandomPool
 
 Step 3 groups the two most important supporting systems together:
