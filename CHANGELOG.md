@@ -2,6 +2,13 @@
 
 All notable user-facing changes to Nishizumi Paints are documented here.
 
+## [6.5.2] - 2026-04-29
+
+### Stable Release
+
+- Changed the default for **Do not apply random paints to myself** to checked for new or missing config values.
+- Confirmed **Do not apply random paints in team events** remains checked by default.
+
 ## [6.5.1] - 2026-04-29
 
 ### Experimental
