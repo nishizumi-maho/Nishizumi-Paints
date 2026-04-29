@@ -178,7 +178,7 @@ night=10:00 am
 series=0
 league=0
 numbers=False
-list=0=amvantageevogt3=404314=0=
+list=0=amvantageevogt3=<team_id>=0=
 ```
 
 The app also tries conservative variants that include an optional requesting member ID, optional driver member ID, and the resolved Trading Paints car ID when known. A response is accepted only when the XML node has the requested `teamid`. For car, decal, number, and spec files, the XML `directory` must also match the resolved iRacing car directory. Helmet and suit nodes are allowed through by Team ID because their directories are `helmets` and `suits`.
@@ -186,7 +186,7 @@ The app also tries conservative variants that include an optional requesting mem
 For all-team exports, multiple car requests are sent in one payload by comma-separating the `list` entries:
 
 ```text
-list=404314=acuraarx06gtp=404314=0=,404314=amvantageevogt3=404314=0=
+list=<driver_id>=acuraarx06gtp=<team_id>=0=,<driver_id>=amvantageevogt3=<team_id>=0=
 ```
 
 The app still filters every returned XML node by Team ID and by mapped car directory before saving files.
@@ -485,9 +485,9 @@ Team targets replace the user portion with `team_{team_id}`.
 
 Manual team downloads use the same convention, for example:
 
-- `paint/{directory}/car_team_404314.tga`
-- `paint/helmet_team_404314.tga`
-- `paint/suit_team_404314.tga`
+- `paint/{directory}/car_team_<team_id>.tga`
+- `paint/helmet_team_<team_id>.tga`
+- `paint/suit_team_<team_id>.tga`
 
 Superspeedway sessions can also create `_ss` variants for car-related paint types.
 

@@ -28,3 +28,24 @@ prepare_embedded_browser_fixed.bat
 *.stackdump
 Thumbs.db
 .DS_Store
+
+# Local secrets and browser/profile artifacts
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.sqlite
+*.sqlite3
+*.db
+**/Cookies
+**/Cookies-journal
+**/Login Data
+**/Login Data-journal
+**/Local State
+**/Preferences
+**/Secure Preferences
+**/Web Data
+**/Web Data-journal
