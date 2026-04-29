@@ -2,13 +2,13 @@
 
 All notable user-facing changes to Nishizumi Paints are documented here.
 
-## [6.3.1] - 2026-04-29
+## [6.3.2] - 2026-04-29
 
 ### Changed
 
-- Made **Showroom > Teams** more interactive with live Team ID/car validation, a ready preview, and clearer download progress text.
-- Added quick actions in **Showroom > Teams** to fill fields from the selected Session driver, clear the form, open the paint folder, and open Trading Paints showroom.
-- Team download buttons now stay disabled until the required Team ID and car resolve cleanly.
+- Reverted the 6.3.1 interactive **Showroom > Teams** redesign.
+- Simplified **Showroom > Teams** so users only type the required Team ID and car value.
+- Team downloads now keep the optional manifest context internal instead of showing member ID and car number fields in the Teams box.
 
 ## [6.3.0] - 2026-04-29
 
@@ -41,7 +41,7 @@ All notable user-facing changes to Nishizumi Paints are documented here.
 
 ### Privacy
 
-- Documented that the manual team downloader sends only the entered Team ID, car directory, optional member IDs, and car number to Trading Paints manifest endpoints.
+- Documented that the manual team downloader sends only the entered Team ID and car directory plus minimal synthetic context to Trading Paints manifest endpoints.
 - Confirmed the team flow does not require or store Trading Paints login cookies, passwords, or tokens.
 
 ## [6.0.0] - 2026-04-18

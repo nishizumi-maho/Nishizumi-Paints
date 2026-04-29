@@ -43,7 +43,7 @@ from requests.adapters import HTTPAdapter
 # Browserless copy: Trading Paints browser automation is intentionally disabled.
 sync_playwright = None
 APP_NAME = "Nishizumi Paints"
-APP_VERSION = "6.3.1"
+APP_VERSION = "6.3.2"
 APP_REGISTRY_NAME = "NishizumiPaints"
 APP_CONFIG_DIRNAME = "NishizumiPaints"
 APP_TOOLTIP = f"{APP_NAME} {APP_VERSION}"
@@ -18374,14 +18374,9 @@ class DownloaderUI:
         self.showroom_download_custom_folder_var = tk.StringVar(value="Custom folder: not selected.")
         self.showroom_team_id_var = tk.StringVar(value="")
         self.showroom_team_car_var = tk.StringVar(value="")
-        self.showroom_team_request_member_id_var = tk.StringVar(value="")
-        self.showroom_team_driver_member_id_var = tk.StringVar(value="")
-        self.showroom_team_car_number_var = tk.StringVar(value="0")
         self.showroom_team_status_var = tk.StringVar(value="Enter a Team ID and car to download team paints into the iRacing paint folder.")
-        self.showroom_team_preview_var = tk.StringVar(value="Team preview: enter a Team ID and car.")
         self._showroom_download_custom_folder_path = ""
         self._showroom_pool_download_in_progress = False
-        self._showroom_team_preview_ready = False
         self.session_summary_var = tk.StringVar(value="No active iRacing session detected yet.")
         self.session_status_summary_var = tk.StringVar(value="Join a session and the driver list will appear here.")
         self.session_driver_action_summary_var = tk.StringVar(value="Select a driver to manage fixed paints.")
@@ -19018,40 +19013,14 @@ class DownloaderUI:
 
         ttk.Label(teams_tab, text="Download a team's Trading Paints assets by Team ID and car. This uses the session-aware team manifest and saves car, helmet, and suit files when they exist.").grid(row=0, column=0, columnspan=4, sticky="w")
         ttk.Label(teams_tab, text="Team ID").grid(row=1, column=0, sticky="w", pady=(10, 0))
-        self.showroom_team_id_entry = ttk.Entry(teams_tab, textvariable=self.showroom_team_id_var, width=16)
-        self.showroom_team_id_entry.grid(row=1, column=1, sticky="w", pady=(10, 0))
+        ttk.Entry(teams_tab, textvariable=self.showroom_team_id_var, width=16).grid(row=1, column=1, sticky="w", pady=(10, 0))
         ttk.Label(teams_tab, text="Car ID, URL, name, or directory").grid(row=2, column=0, sticky="w", pady=(8, 0))
-        self.showroom_team_car_entry = ttk.Entry(teams_tab, textvariable=self.showroom_team_car_var, width=56)
-        self.showroom_team_car_entry.grid(row=2, column=1, columnspan=3, sticky="ew", pady=(8, 0))
-        ttk.Label(teams_tab, text="Requesting member ID").grid(row=3, column=0, sticky="w", pady=(8, 0))
-        self.showroom_team_request_member_id_entry = ttk.Entry(teams_tab, textvariable=self.showroom_team_request_member_id_var, width=16)
-        self.showroom_team_request_member_id_entry.grid(row=3, column=1, sticky="w", pady=(8, 0))
-        ttk.Label(teams_tab, text="Driver member ID").grid(row=3, column=2, sticky="e", padx=(12, 6), pady=(8, 0))
-        self.showroom_team_driver_member_id_entry = ttk.Entry(teams_tab, textvariable=self.showroom_team_driver_member_id_var, width=16)
-        self.showroom_team_driver_member_id_entry.grid(row=3, column=3, sticky="w", pady=(8, 0))
-        ttk.Label(teams_tab, text="Car number").grid(row=4, column=0, sticky="w", pady=(8, 0))
-        self.showroom_team_car_number_entry = ttk.Entry(teams_tab, textvariable=self.showroom_team_car_number_var, width=8)
-        self.showroom_team_car_number_entry.grid(row=4, column=1, sticky="w", pady=(8, 0))
-        ttk.Label(teams_tab, text="Member IDs are optional. Leave them blank to use the minimal synthetic team context.", foreground="#555555", justify="left", wraplength=560).grid(row=4, column=2, columnspan=2, sticky="w", padx=(12, 0), pady=(8, 0))
-        team_quick_actions = ttk.Frame(teams_tab)
-        team_quick_actions.grid(row=5, column=0, columnspan=4, sticky="w", pady=(10, 0))
-        ttk.Button(team_quick_actions, text="Use selected session driver", command=self.fill_showroom_team_from_selected_driver).pack(side="left")
-        ttk.Button(team_quick_actions, text="Clear", command=self.clear_showroom_team_inputs).pack(side="left", padx=(8, 0))
-        ttk.Button(team_quick_actions, text="Open paint folder", command=self.open_paint_folder).pack(side="left", padx=(8, 0))
-        ttk.Button(team_quick_actions, text="Open showroom", command=self.open_tp_showroom).pack(side="left", padx=(8, 0))
-        self.showroom_team_preview_label = ttk.Label(teams_tab, textvariable=self.showroom_team_preview_var, justify="left", foreground="#555555", wraplength=880)
-        self.showroom_team_preview_label.grid(row=6, column=0, columnspan=4, sticky="w", pady=(10, 0))
+        ttk.Entry(teams_tab, textvariable=self.showroom_team_car_var, width=56).grid(row=2, column=1, columnspan=3, sticky="ew", pady=(8, 0))
         team_actions = ttk.Frame(teams_tab)
-        team_actions.grid(row=7, column=0, columnspan=4, sticky="w", pady=(10, 0))
-        self.showroom_team_download_buttons = []
-        team_iracing_button = ttk.Button(team_actions, text="Download to iRacing paints", command=self.download_showroom_team_now)
-        team_iracing_button.pack(side="left")
-        self.showroom_team_download_buttons.append(team_iracing_button)
-        team_custom_button = ttk.Button(team_actions, text="Download to custom folder", command=lambda: self.download_showroom_team_now(custom_folder=True))
-        team_custom_button.pack(side="left", padx=(8, 0))
-        self.showroom_team_download_buttons.append(team_custom_button)
-        ttk.Label(teams_tab, textvariable=self.showroom_team_status_var, justify="left", foreground="#555555", wraplength=880).grid(row=8, column=0, columnspan=4, sticky="w", pady=(10, 0))
-        self._wire_showroom_team_inputs()
+        team_actions.grid(row=3, column=0, columnspan=4, sticky="w", pady=(10, 0))
+        ttk.Button(team_actions, text="Download to iRacing paints", command=self.download_showroom_team_now).pack(side="left")
+        ttk.Button(team_actions, text="Download to custom folder", command=lambda: self.download_showroom_team_now(custom_folder=True)).pack(side="left", padx=(8, 0))
+        ttk.Label(teams_tab, textvariable=self.showroom_team_status_var, justify="left", foreground="#555555", wraplength=880).grid(row=4, column=0, columnspan=4, sticky="w", pady=(10, 0))
 
         ttk.Label(showroom_download_box, text=f"Default destination: {default_random_pool_dir()}", foreground="#555555", justify="left", wraplength=920).grid(row=2, column=0, sticky="w", pady=(10, 0))
         ttk.Label(showroom_download_box, textvariable=self.showroom_download_custom_folder_var, foreground="#555555", justify="left", wraplength=920).grid(row=3, column=0, sticky="w", pady=(4, 0))
@@ -22491,175 +22460,6 @@ class DownloaderUI:
         destination = Path(selected)
         return destination, f"custom folder {destination}"
 
-    def _wire_showroom_team_inputs(self) -> None:
-        if getattr(self, "_showroom_team_inputs_wired", False):
-            self._refresh_showroom_team_preview()
-            return
-        self._showroom_team_inputs_wired = True
-        for var in (
-            self.showroom_team_id_var,
-            self.showroom_team_car_var,
-            self.showroom_team_request_member_id_var,
-            self.showroom_team_driver_member_id_var,
-            self.showroom_team_car_number_var,
-        ):
-            try:
-                var.trace_add("write", lambda *_args: self._refresh_showroom_team_preview())
-            except Exception:
-                pass
-        self._refresh_showroom_team_preview()
-
-    def _validate_showroom_team_positive_int(self, value: object, label: str, *, required: bool = False) -> tuple[int | None, str]:
-        text = str(value or "").strip()
-        if not text:
-            if required:
-                return None, f"Enter a valid {label}."
-            return 0, ""
-        try:
-            parsed = int(text)
-        except Exception:
-            return None, f"{label} must be a number."
-        if parsed <= 0:
-            return None, f"{label} must be greater than zero."
-        return parsed, ""
-
-    def _set_showroom_team_preview_tone(self, tone: str) -> None:
-        label = getattr(self, "showroom_team_preview_label", None)
-        if label is None:
-            return
-        color = {
-            "ready": "#1a6f37",
-            "error": "#b3261e",
-            "busy": "#8a5a00",
-        }.get(str(tone or "").strip().lower(), "#555555")
-        try:
-            label.configure(foreground=color)
-        except Exception:
-            pass
-
-    def _showroom_team_preview_state(self) -> tuple[bool, str, str]:
-        team_text = str(self.showroom_team_id_var.get() or "").strip()
-        team_id, error = self._validate_showroom_team_positive_int(team_text, "Team ID", required=True)
-        if error:
-            tone = "error" if team_text else "neutral"
-            return False, error, tone
-
-        request_member_id, error = self._validate_showroom_team_positive_int(
-            self.showroom_team_request_member_id_var.get(),
-            "requesting member ID",
-        )
-        if error:
-            return False, error, "error"
-        driver_member_id, error = self._validate_showroom_team_positive_int(
-            self.showroom_team_driver_member_id_var.get(),
-            "driver member ID",
-        )
-        if error:
-            return False, error, "error"
-
-        car_value = str(self.showroom_team_car_var.get() or "").strip()
-        if not car_value:
-            return False, "Enter a TP car ID, dashboard URL, car name, or iRacing car directory.", "neutral"
-        try:
-            target = resolve_tp_team_paint_target(car_value, int(team_id or 0), default_tp_showroom_mapping_path())
-        except Exception as exc:
-            message = str(exc).strip() or "Could not resolve that car."
-            return False, f"{message} Try a Trading Paints car ID, URL, exact car name, or iRacing directory.", "error"
-
-        directories = list(target.directories)
-        shown_directories = ", ".join(directories[:3])
-        if len(directories) > 3:
-            shown_directories += f", +{len(directories) - 3} more"
-        source_bits: list[str] = []
-        if target.mid > 0:
-            source_bits.append(f"TP car ID {target.mid}")
-        if target.slug:
-            source_bits.append(target.slug)
-        source_label = " / ".join(source_bits) if source_bits else "manual car match"
-        car_number = str(self.showroom_team_car_number_var.get() or "0").strip() or "0"
-        request_label = str(request_member_id) if request_member_id else "synthetic"
-        driver_label = str(driver_member_id) if driver_member_id else "synthetic"
-        return (
-            True,
-            f"Ready: Team {team_id} -> {target.display_name} ({source_label}). "
-            f"Directories: {shown_directories}. Member context: request {request_label}, driver {driver_label}, car #{car_number}.",
-            "ready",
-        )
-
-    def _update_showroom_team_action_state(self) -> None:
-        ready = bool(getattr(self, "_showroom_team_preview_ready", False))
-        enabled = ready and not bool(getattr(self, "_showroom_pool_download_in_progress", False))
-        for button in getattr(self, "showroom_team_download_buttons", []):
-            try:
-                button.state(["!disabled"] if enabled else ["disabled"])
-            except Exception:
-                pass
-
-    def _refresh_showroom_team_preview(self) -> None:
-        try:
-            ready, message, tone = self._showroom_team_preview_state()
-        except Exception as exc:
-            ready = False
-            message = f"Team preview unavailable: {exc}"
-            tone = "error"
-        self._showroom_team_preview_ready = bool(ready)
-        try:
-            self.showroom_team_preview_var.set(message)
-        except Exception:
-            pass
-        if bool(getattr(self, "_showroom_pool_download_in_progress", False)):
-            tone = "busy"
-        self._set_showroom_team_preview_tone(tone)
-        self._update_showroom_team_action_state()
-
-    def fill_showroom_team_from_selected_driver(self) -> None:
-        selected = self._require_selected_session_driver()
-        if selected is None:
-            self.showroom_team_status_var.set("Select a driver in the Session tab first, then use this shortcut again.")
-            self._refresh_showroom_team_preview()
-            return
-        snapshot, row, user = selected
-        team_id = 0
-        try:
-            if str(row.target_kind or "").lower() == "team":
-                team_id = int(row.target_id or 0)
-        except Exception:
-            team_id = 0
-        if team_id <= 0:
-            try:
-                team_id = int(user.team_id or 0)
-            except Exception:
-                team_id = 0
-        if team_id > 0:
-            self.showroom_team_id_var.set(str(team_id))
-        self.showroom_team_car_var.set(str(user.directory or row.directory or ""))
-        self.showroom_team_car_number_var.set(str(user.number or row.number or "0").strip() or "0")
-        request_member_id = getattr(snapshot.current_session, "local_user_id", None) if snapshot.current_session is not None else None
-        try:
-            request_member_id = int(request_member_id or 0)
-        except Exception:
-            request_member_id = 0
-        if request_member_id <= 0:
-            request_member_id = int(user.user_id or 0)
-        if request_member_id > 0:
-            self.showroom_team_request_member_id_var.set(str(request_member_id))
-        if int(user.user_id or 0) > 0:
-            self.showroom_team_driver_member_id_var.set(str(int(user.user_id)))
-        if team_id > 0:
-            self.showroom_team_status_var.set(f"Filled team download fields from selected driver: {row.display_name}.")
-        else:
-            self.showroom_team_status_var.set(f"Filled car and member fields from {row.display_name}. Enter the Team ID to finish.")
-        self._refresh_showroom_team_preview()
-
-    def clear_showroom_team_inputs(self) -> None:
-        self.showroom_team_id_var.set("")
-        self.showroom_team_car_var.set("")
-        self.showroom_team_request_member_id_var.set("")
-        self.showroom_team_driver_member_id_var.set("")
-        self.showroom_team_car_number_var.set("0")
-        self.showroom_team_status_var.set("Team download fields cleared.")
-        self._refresh_showroom_team_preview()
-
     def _showroom_team_download_destination(self, custom_folder: bool) -> tuple[Path, str] | None:
         if not custom_folder:
             destination = default_paints_dir(self.config)
@@ -22674,10 +22474,26 @@ class DownloaderUI:
         return destination, f"custom folder {destination}"
 
     def _parse_showroom_team_positive_int(self, value: object, label: str, *, required: bool = False) -> int | None:
-        parsed, error = self._validate_showroom_team_positive_int(value, label, required=required)
-        if error:
+        text = str(value or "").strip()
+        if not text:
+            if required:
+                try:
+                    self.messagebox.showerror(APP_NAME, f"Enter a valid {label}.", parent=self.root)
+                except Exception:
+                    pass
+                return None
+            return 0
+        try:
+            parsed = int(text)
+        except Exception:
             try:
-                self.messagebox.showerror(APP_NAME, error, parent=self.root)
+                self.messagebox.showerror(APP_NAME, f"{label} must be a number.", parent=self.root)
+            except Exception:
+                pass
+            return None
+        if parsed <= 0:
+            try:
+                self.messagebox.showerror(APP_NAME, f"{label} must be greater than zero.", parent=self.root)
             except Exception:
                 pass
             return None
@@ -22924,22 +22740,11 @@ class DownloaderUI:
         if getattr(self, "_showroom_pool_download_in_progress", False):
             self._append_log("Showroom download is already running.")
             return
-        self._refresh_showroom_team_preview()
         team_id = self._parse_showroom_team_positive_int(self.showroom_team_id_var.get(), "Team ID", required=True)
         if team_id is None:
             return
-        request_member_id = self._parse_showroom_team_positive_int(
-            self.showroom_team_request_member_id_var.get(),
-            "requesting member ID",
-        )
-        if request_member_id is None:
-            return
-        driver_member_id = self._parse_showroom_team_positive_int(
-            self.showroom_team_driver_member_id_var.get(),
-            "driver member ID",
-        )
-        if driver_member_id is None:
-            return
+        request_member_id = 0
+        driver_member_id = 0
         car_value = str(self.showroom_team_car_var.get() or "").strip()
         if not car_value:
             try:
@@ -22947,15 +22752,13 @@ class DownloaderUI:
             except Exception:
                 pass
             return
-        car_number = str(self.showroom_team_car_number_var.get() or "0").strip() or "0"
+        car_number = "0"
         destination_info = self._showroom_team_download_destination(custom_folder)
         if destination_info is None:
             return
         destination, destination_label = destination_info
         self._showroom_pool_download_in_progress = True
-        self._update_showroom_team_action_state()
-        self._set_showroom_team_preview_tone("busy")
-        self.showroom_team_status_var.set(f"Resolving team {team_id} manifest and downloading car, helmet, and suit assets to {destination_label}...")
+        self.showroom_team_status_var.set(f"Downloading team {team_id} paints for {car_value} to {destination_label}...")
         self._append_log(
             "Manual Trading Paints team download started: "
             f"team_id={team_id}, car={car_value}, request_member_id={request_member_id or 0}, "
@@ -22987,7 +22790,6 @@ class DownloaderUI:
 
             def _finish() -> None:
                 self._showroom_pool_download_in_progress = False
-                self._refresh_showroom_team_preview()
                 if error:
                     self.showroom_team_status_var.set(f"Team paint download failed: {error}")
                     self._append_log(f"Manual Trading Paints team download failed: {error}")

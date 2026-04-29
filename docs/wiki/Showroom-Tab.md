@@ -40,7 +40,7 @@ The collection importer is meant for:
 
 Use the **Teams** tab when you know a Trading Paints Team ID and the target car.
 
-In 6.3.1 and newer, this form updates as you type. The preview shows whether the Team ID and car can be used, which Trading Paints car or manual directory match was resolved, and which member context will be sent with the manifest request.
+In 6.3.2 and newer, the Teams form only asks for the required Team ID and car value. Optional manifest context is handled internally.
 
 Accepted car values:
 
@@ -50,8 +50,6 @@ Accepted car values:
 - iRacing paint directory
 
 The app builds session-aware team manifest payloads and filters the response to the requested Team ID. Car-related assets must also match the resolved iRacing car directory. Helmet and suit assets are saved when Trading Paints includes them for that team.
-
-The **Use selected session driver** shortcut can copy the selected Session tab driver into the Teams form. For team-racing entries it fills the Team ID, car directory, car number, requesting member ID, and driver member ID; for normal driver entries it fills the car and member context and leaves the Team ID for you to enter.
 
 ## Destinations
 
@@ -77,7 +75,7 @@ The no-browser release is centered on public showroom access:
 - no Trading Paints login is required for the main public path
 - public non-numbered, non-PRO assets are the intended direct-download target
 
-In 6.2.0, the manual team downloader follows the same no-browser posture. It uses Trading Paints manifest endpoints and does not require local Trading Paints cookies or a stored login.
+In 6.3.2, the manual team downloader follows the same no-browser posture. It uses Trading Paints manifest endpoints and does not require local Trading Paints cookies or a stored login.
 
 ## Relationship to RandomPool and collection pool
 

@@ -1,5 +1,5 @@
 #ifndef AppVersion
-#define AppVersion "6.3.1"
+#define AppVersion "6.3.2"
 #endif
 
 #define AppName "Nishizumi Paints"
