@@ -40,6 +40,8 @@ The collection importer is meant for:
 
 Use the **Teams** tab when you know a Trading Paints Team ID and the target car.
 
+In 6.3.1 and newer, this form updates as you type. The preview shows whether the Team ID and car can be used, which Trading Paints car or manual directory match was resolved, and which member context will be sent with the manifest request.
+
 Accepted car values:
 
 - Trading Paints car ID
@@ -48,6 +50,8 @@ Accepted car values:
 - iRacing paint directory
 
 The app builds session-aware team manifest payloads and filters the response to the requested Team ID. Car-related assets must also match the resolved iRacing car directory. Helmet and suit assets are saved when Trading Paints includes them for that team.
+
+The **Use selected session driver** shortcut can copy the selected Session tab driver into the Teams form. For team-racing entries it fills the Team ID, car directory, car number, requesting member ID, and driver member ID; for normal driver entries it fills the car and member context and leaves the Team ID for you to enter.
 
 ## Destinations
 

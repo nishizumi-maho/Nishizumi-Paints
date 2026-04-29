@@ -2,6 +2,14 @@
 
 All notable user-facing changes to Nishizumi Paints are documented here.
 
+## [6.3.1] - 2026-04-29
+
+### Changed
+
+- Made **Showroom > Teams** more interactive with live Team ID/car validation, a ready preview, and clearer download progress text.
+- Added quick actions in **Showroom > Teams** to fill fields from the selected Session driver, clear the form, open the paint folder, and open Trading Paints showroom.
+- Team download buttons now stay disabled until the required Team ID and car resolve cleanly.
+
 ## [6.3.0] - 2026-04-29
 
 ### Added
