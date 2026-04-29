@@ -33,6 +33,8 @@ For each session user, the app attempts to resolve normal Trading Paints assets 
 
 This stage decides which normal TP files already exist for the session before fallback even starts.
 
+For Team sessions, team assets are preferred per item. If the team has no car, helmet, or suit for the active car, the app can retarget the current in-car driver's personal asset for that same item to the team file path. The session fingerprint includes the active driver's iRacing ID, so a driver swap in the same team car triggers a refresh instead of reusing the previous driver's files.
+
 ## 4. Download stage
 
 Resolved download items are queued and fetched using the configured worker mode.

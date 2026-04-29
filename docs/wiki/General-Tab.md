@@ -41,8 +41,11 @@ This area controls how the app treats the local user and live-session paint clea
 - delete live session paints
 - do not apply random paints in team events
 - do not apply random paints to myself
+- use driver personal paints when team paints are missing
 
 That last option is important when the user wants fallback for everybody else but never wants the app to replace their own visible car with a random result.
+
+The team-driver option is enabled by default. In Team sessions, the app tries the team's car, helmet, and suit first. If one item is missing for the team, it uses the personal paint for the driver currently in the car. When the active driver changes, the app refreshes the team target for the new driver. If neither the team nor that driver has the item, the normal random fallback rules apply; if random paints in team events are disabled, iRacing keeps its default item.
 
 ## Download worker mode
 

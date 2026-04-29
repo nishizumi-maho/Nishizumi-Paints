@@ -2,6 +2,15 @@
 
 All notable user-facing changes to Nishizumi Paints are documented here.
 
+## [6.6] - 2026-04-29
+
+### Stable Release
+
+- Added **Use driver personal paints when team paints are missing**, enabled by default in the General tab.
+- In Team sessions, missing team car, helmet, or suit assets now fall back to the current in-car driver's personal paint for that same item before random fallback is considered.
+- Team driver swaps inside the same session are now detected by the active driver's iRacing ID, so the app clears stale team files and refreshes paints for the new driver.
+- If neither the team nor the active driver has an item, normal random fallback still applies; when **Do not apply random paints in team events** is checked, the item is left to iRacing's default.
+
 ## [6.5.2] - 2026-04-29
 
 ### Stable Release
