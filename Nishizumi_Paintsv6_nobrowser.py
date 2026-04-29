@@ -43,13 +43,14 @@ from requests.adapters import HTTPAdapter
 # Browserless copy: Trading Paints browser automation is intentionally disabled.
 sync_playwright = None
 APP_NAME = "Nishizumi Paints"
-APP_VERSION = "6.3.2"
+APP_VERSION = "6.3.3"
 APP_REGISTRY_NAME = "NishizumiPaints"
 APP_CONFIG_DIRNAME = "NishizumiPaints"
 APP_TOOLTIP = f"{APP_NAME} {APP_VERSION}"
 APP_USER_AGENT = f"nishizumi-paints/{APP_VERSION}"
 TP_SHOWROOM_DEFAULT_SOURCE = "trending"
 TP_SHOWROOM_SOURCE_ORDER = ("trending", "newest", "favorited", "raced")
+TP_SHOWROOM_DEFAULT_SOURCES = ",".join(TP_SHOWROOM_SOURCE_ORDER)
 TP_SHOWROOM_SOURCE_LABELS = {
     "trending": "Trending",
     "newest": "Newest",
@@ -869,7 +870,7 @@ def normalize_tp_showroom_sources(value: object) -> str:
     selected = {normalize_tp_showroom_source(item) for item in raw_items if str(item or "").strip()}
     ordered = [source for source in TP_SHOWROOM_SOURCE_ORDER if source in selected]
     if not ordered:
-        ordered = [TP_SHOWROOM_DEFAULT_SOURCE]
+        ordered = list(TP_SHOWROOM_SOURCE_ORDER)
     return ",".join(ordered)
 
 
@@ -4447,7 +4448,7 @@ def assign_driver_paint_override_from_showroom_public(
     scheme_id: str = "",
     source_link: str = "",
     source_label: str = "manual",
-    showroom_sources: object = TP_SHOWROOM_DEFAULT_SOURCE,
+    showroom_sources: object = TP_SHOWROOM_DEFAULT_SOURCES,
     retries: int = 3,
     retry_backoff_seconds: float = 1.5,
     cancel_event: threading.Event | None = None,
@@ -4523,7 +4524,7 @@ def assign_driver_paint_override_from_showroom(
     scheme_id: str = "",
     source_link: str = "",
     source_label: str = "manual",
-    showroom_sources: object = TP_SHOWROOM_DEFAULT_SOURCE,
+    showroom_sources: object = TP_SHOWROOM_DEFAULT_SOURCES,
     retries: int = 3,
     retry_backoff_seconds: float = 1.5,
     cancel_event: threading.Event | None = None,
@@ -5754,7 +5755,7 @@ def choose_showroom_paint_direct(
     pages: int = TP_SHOWROOM_MAX_PAGES,
     prefer_official: bool = False,
     choice_mode: str = "random",
-    showroom_sources: object = TP_SHOWROOM_DEFAULT_SOURCE,
+    showroom_sources: object = TP_SHOWROOM_DEFAULT_SOURCES,
     exclude_scheme_ids: set[str] | None = None,
     exclude_recent_scheme_ids: set[str] | None = None,
     showroom_cars: list[dict] | None = None,
@@ -5878,7 +5879,7 @@ def choose_showroom_accessory_direct(
     pages: int = TP_SHOWROOM_MAX_PAGES,
     prefer_official: bool = False,
     choice_mode: str = "random",
-    showroom_sources: object = TP_SHOWROOM_DEFAULT_SOURCE,
+    showroom_sources: object = TP_SHOWROOM_DEFAULT_SOURCES,
     exclude_scheme_ids: set[str] | None = None,
     exclude_recent_scheme_ids: set[str] | None = None,
     showroom_cars: list[dict] | None = None,
@@ -6571,7 +6572,7 @@ def download_showroom_paints_to_random_pool(
     slug: str = "",
     count: int = 5,
     pages: int = TP_SHOWROOM_MAX_PAGES,
-    showroom_sources: object = TP_SHOWROOM_DEFAULT_SOURCE,
+    showroom_sources: object = TP_SHOWROOM_DEFAULT_SOURCES,
     mapping_path: Path | None = None,
     random_pool_dir: Path | None = None,
     max_pool_gb: float = 5.0,
@@ -12249,7 +12250,7 @@ def apply_tp_showroom_fallbacks_public(
     disable_random_for_local_user: bool = False,
     mapping_path: Path | None = None,
     detect_showroom_total_pages: bool = False,
-    showroom_sources: object = TP_SHOWROOM_DEFAULT_SOURCE,
+    showroom_sources: object = TP_SHOWROOM_DEFAULT_SOURCES,
     retries: int = 3,
     retry_backoff_seconds: float = 1.5,
     saved_callback: Callable[[list[SavedFile], str], None] | None = None,
@@ -12617,7 +12618,7 @@ def apply_tp_showroom_fallbacks(
     primary_fast_mode: bool = False,
     mule_profile_mode: bool = False,
     detect_showroom_total_pages: bool = False,
-    showroom_sources: object = TP_SHOWROOM_DEFAULT_SOURCE,
+    showroom_sources: object = TP_SHOWROOM_DEFAULT_SOURCES,
     retries: int = 3,
     retry_backoff_seconds: float = 1.5,
     tp_fallback_lanes_mode: str = "session_total",
@@ -15787,7 +15788,7 @@ def process_session(
     tp_collection_pool_sources: str = "",
     tp_collection_pool_allow_showroom_fallback: bool = True,
     tp_collection_pool_repeat_when_strict: bool = False,
-    tp_showroom_sources: str = TP_SHOWROOM_DEFAULT_SOURCE,
+    tp_showroom_sources: str = TP_SHOWROOM_DEFAULT_SOURCES,
     progress_callback: Callable[..., None] | None = None,
     reload_reader: IracingSdkReader | None = None,
     auto_refresh_paints: bool = False,
@@ -16765,7 +16766,8 @@ class AppConfig:
     tp_collection_pool_sources: str = ""
     tp_collection_pool_allow_showroom_fallback: bool = True
     tp_collection_pool_repeat_when_strict: bool = False
-    tp_showroom_sources: str = TP_SHOWROOM_DEFAULT_SOURCE
+    tp_showroom_sources: str = TP_SHOWROOM_DEFAULT_SOURCES
+    tp_showroom_sources_default_all_migrated: bool = True
     quick_start_completed: bool = False
     keep_tp_paints_in_random_pool: bool = False
     max_random_pool_gb: float = 5.0
@@ -16926,7 +16928,11 @@ class ConfigStore:
         config.tp_collection_pool_repeat_when_strict = bool(getattr(config, "tp_collection_pool_repeat_when_strict", False))
         if config.tp_collection_pool_allow_showroom_fallback:
             config.tp_collection_pool_repeat_when_strict = False
-        config.tp_showroom_sources = normalize_tp_showroom_sources(getattr(config, "tp_showroom_sources", TP_SHOWROOM_DEFAULT_SOURCE))
+        config.tp_showroom_sources = normalize_tp_showroom_sources(getattr(config, "tp_showroom_sources", TP_SHOWROOM_DEFAULT_SOURCES))
+        if not bool(raw.get("tp_showroom_sources_default_all_migrated", False)):
+            if "tp_showroom_sources" not in raw or config.tp_showroom_sources == TP_SHOWROOM_DEFAULT_SOURCE:
+                config.tp_showroom_sources = TP_SHOWROOM_DEFAULT_SOURCES
+        config.tp_showroom_sources_default_all_migrated = True
         config.quick_start_completed = bool(getattr(config, "quick_start_completed", False))
         config.keep_tp_paints_in_random_pool = bool(getattr(config, "keep_tp_paints_in_random_pool", False))
         config.max_random_pool_gb = clamp_random_pool_gb(getattr(config, "max_random_pool_gb", 5.0), 5.0)
@@ -16983,7 +16989,8 @@ class ConfigStore:
         safe.tp_collection_pool_repeat_when_strict = bool(getattr(safe, "tp_collection_pool_repeat_when_strict", False))
         if safe.tp_collection_pool_allow_showroom_fallback:
             safe.tp_collection_pool_repeat_when_strict = False
-        safe.tp_showroom_sources = normalize_tp_showroom_sources(getattr(safe, "tp_showroom_sources", TP_SHOWROOM_DEFAULT_SOURCE))
+        safe.tp_showroom_sources = normalize_tp_showroom_sources(getattr(safe, "tp_showroom_sources", TP_SHOWROOM_DEFAULT_SOURCES))
+        safe.tp_showroom_sources_default_all_migrated = True
         safe.quick_start_completed = bool(getattr(safe, "quick_start_completed", False))
         safe.keep_tp_paints_in_random_pool = bool(safe.keep_tp_paints_in_random_pool)
         safe.max_random_pool_gb = clamp_random_pool_gb(safe.max_random_pool_gb, 5.0)
@@ -17909,7 +17916,7 @@ class DownloaderService:
                             tp_collection_pool_sources=getattr(config, "tp_collection_pool_sources", ""),
                             tp_collection_pool_allow_showroom_fallback=bool(getattr(config, "tp_collection_pool_allow_showroom_fallback", True)),
                             tp_collection_pool_repeat_when_strict=bool(getattr(config, "tp_collection_pool_repeat_when_strict", False)),
-                            tp_showroom_sources=normalize_tp_showroom_sources(getattr(config, "tp_showroom_sources", TP_SHOWROOM_DEFAULT_SOURCE)),
+                            tp_showroom_sources=normalize_tp_showroom_sources(getattr(config, "tp_showroom_sources", TP_SHOWROOM_DEFAULT_SOURCES)),
                             progress_callback=lambda rows, saved_items=None, _session=session, _existing=previous_rows, _replay=replay_mode_active: self._update_runtime_progress_snapshot(
                                 _session,
                                 last_saved,
@@ -18329,7 +18336,7 @@ class DownloaderUI:
         self.random_pool_helmet_size_gb_var = tk.DoubleVar(value=clamp_random_pool_category_gb(getattr(self.config, "max_random_pool_helmet_gb", 1.0), 1.0))
         self.random_pool_suit_size_gb_var = tk.DoubleVar(value=clamp_random_pool_category_gb(getattr(self.config, "max_random_pool_suit_gb", 1.0), 1.0))
         self.iracing_documents_dir_var = tk.StringVar(value=normalize_optional_path(getattr(self.config, "iracing_documents_dir", "")) or str(default_iracing_documents_dir()))
-        showroom_sources = tp_showroom_sources_list(getattr(self.config, "tp_showroom_sources", TP_SHOWROOM_DEFAULT_SOURCE))
+        showroom_sources = tp_showroom_sources_list(getattr(self.config, "tp_showroom_sources", TP_SHOWROOM_DEFAULT_SOURCES))
         self.tp_showroom_source_vars = {
             source: tk.BooleanVar(value=source in showroom_sources)
             for source in TP_SHOWROOM_SOURCE_ORDER
@@ -19674,7 +19681,7 @@ class DownloaderUI:
                     scheme_id=scheme_id,
                     source_link=source_link,
                     source_label=source_label,
-                    showroom_sources=getattr(config, "tp_showroom_sources", TP_SHOWROOM_DEFAULT_SOURCE),
+                    showroom_sources=getattr(config, "tp_showroom_sources", TP_SHOWROOM_DEFAULT_SOURCES),
                     retries=positive_int(config.retries, 3),
                     retry_backoff_seconds=max(config.retry_backoff_seconds, 0.1),
                 )
@@ -20744,6 +20751,7 @@ class DownloaderUI:
                 self.tp_collection_pool_repeat_var.get() and not self.tp_collection_pool_allow_showroom_var.get()
             ),
             tp_showroom_sources=self._read_tp_showroom_sources_ui(),
+            tp_showroom_sources_default_all_migrated=True,
             quick_start_completed=bool(getattr(self.config, "quick_start_completed", False)),
             keep_tp_paints_in_random_pool=bool(self.keep_tp_pool_var.get()),
             max_random_pool_gb=max_random_pool_gb,
@@ -22568,7 +22576,7 @@ class DownloaderUI:
                     slug=slug,
                     count=count,
                     pages=pages,
-                    showroom_sources=getattr(self.config, "tp_showroom_sources", TP_SHOWROOM_DEFAULT_SOURCE),
+                    showroom_sources=getattr(self.config, "tp_showroom_sources", TP_SHOWROOM_DEFAULT_SOURCES),
                     mapping_path=default_tp_showroom_mapping_path(),
                     random_pool_dir=destination,
                     **self._showroom_pool_limits(),
@@ -22828,7 +22836,7 @@ class DownloaderUI:
 
     def open_tp_showroom(self) -> None:
         try:
-            sources = tp_showroom_sources_list(getattr(self.config, "tp_showroom_sources", TP_SHOWROOM_DEFAULT_SOURCE))
+            sources = tp_showroom_sources_list(getattr(self.config, "tp_showroom_sources", TP_SHOWROOM_DEFAULT_SOURCES))
             source = sources[0] if sources else TP_SHOWROOM_DEFAULT_SOURCE
             webbrowser.open(tp_showroom_filter_url_for_source(source))
             self._append_log("Opened Trading Paints showroom in your browser.")

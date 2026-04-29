@@ -2,6 +2,13 @@
 
 All notable user-facing changes to Nishizumi Paints are documented here.
 
+## [6.3.3] - 2026-04-29
+
+### Changed
+
+- New and migrated default showroom source settings now enable all four sources: **Trending**, **Newest**, **Most favorited**, and **Most raced (ever)**.
+- Empty showroom source selections are normalized back to all four sources instead of only **Trending**.
+
 ## [6.3.2] - 2026-04-29
 
 ### Changed
