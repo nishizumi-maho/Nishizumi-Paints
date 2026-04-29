@@ -2,6 +2,14 @@
 
 All notable user-facing changes to Nishizumi Paints are documented here.
 
+## [6.5.1] - 2026-04-29
+
+### Experimental
+
+- Removed the old local AI roster prefill workflow that could still run at startup or after AI roster sync.
+- Fixed the warning `Local AI roster prefill failed: name 'LocalAIRosterPrefillResult' is not defined`.
+- Kept current AI random fallback and local AI roster live-update behavior intact; only the stale prefill path was removed.
+
 ## [6.5] - 2026-04-29
 
 ### Stable Release

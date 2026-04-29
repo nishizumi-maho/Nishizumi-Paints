@@ -43,7 +43,7 @@ from requests.adapters import HTTPAdapter
 # Browserless copy: Trading Paints browser automation is intentionally disabled.
 sync_playwright = None
 APP_NAME = "Nishizumi Paints"
-APP_VERSION = "6.5"
+APP_VERSION = "6.5.1"
 APP_REGISTRY_NAME = "NishizumiPaints"
 APP_CONFIG_DIRNAME = "NishizumiPaints"
 APP_TOOLTIP = f"{APP_NAME} {APP_VERSION}"
@@ -14648,288 +14648,6 @@ def create_generic_ai_roster_from_random_fallbacks(
         f"Created local AI roster '{AI_GENERIC_RANDOM_ROSTER_NAME}' at {roster_dir} with {cars_with_paint}/{len(ai_users)} car paint(s) "
         f"and {accessories_with_paint} helmet/suit file(s). Recreate the AI race and select this roster to see the random paints."
     )
-def _prefill_local_ai_roster_accessory(
-    *,
-    roster_dir: Path,
-    driver: dict,
-    kind: str,
-    used_scheme_ids: set[str],
-    recent_scheme_ids: set[str],
-    showroom_cache: dict[str, object],
-    temp_root: Path,
-    temp_paints_root: Path,
-    retries: int,
-    retry_backoff_seconds: float,
-    detect_showroom_total_pages: bool,
-    cancel_event: threading.Event | None = None,
-) -> tuple[bool, int, str]:
-    for _attempt in range(1, 5):
-        if _cancel_requested(cancel_event):
-            return False, 0, "cancelled"
-        result = choose_showroom_accessory_direct(
-            accessory_kind=kind,
-            pages=TP_SHOWROOM_MAX_PAGES,
-            prefer_official=False,
-            choice_mode="random",
-            exclude_scheme_ids=used_scheme_ids,
-            exclude_recent_scheme_ids=recent_scheme_ids,
-            showroom_cars=list(showroom_cache.get("cars") or []),
-            showroom_sampled_pages=set(showroom_cache.get("sampled_pages") or set()),
-            detected_total_pages=int(showroom_cache.get("detected_total_pages") or 0),
-            detect_total_pages=detect_showroom_total_pages,
-            minimum_unused_choices=1,
-            allow_reuse_existing_scheme=False,
-            log=logging.debug,
-            cancel_event=cancel_event,
-        )
-        _update_prefill_showroom_cache(showroom_cache, result)
-        if not result.ok:
-            return False, 0, result.message
-        scheme_id = str(result.chosen_scheme_id or "").strip()
-        if scheme_id:
-            used_scheme_ids.add(scheme_id)
-        saved_items = _download_public_showroom_result_for_ai_roster_prefill(
-            kind=kind,
-            directory=kind,
-            result=result,
-            temp_dir=temp_root,
-            temp_paints_dir=temp_paints_root,
-            retries=retries,
-            retry_backoff_seconds=retry_backoff_seconds,
-            cancel_event=cancel_event,
-        )
-        copied, copied_files = _copy_prefill_saved_items_to_ai_roster_driver(
-            kind=kind,
-            scheme_id=scheme_id,
-            saved_items=saved_items,
-            roster_dir=roster_dir,
-            driver=driver,
-        )
-        if copied:
-            return True, copied_files, scheme_id
-        if saved_items:
-            delete_saved(saved_items, paints_root=temp_paints_root)
-    return False, 0, f"public showroom {kind} asset was unavailable"
-def prefill_local_ai_rosters_from_showroom(
-    *,
-    ai_rosters_dir: Path,
-    temp_dir: Path,
-    retries: int,
-    retry_backoff_seconds: float,
-    include_cars: bool = True,
-    include_helmets: bool = True,
-    include_suits: bool = True,
-    mapping_path: Path | None = None,
-    detect_showroom_total_pages: bool = False,
-    cancel_event: threading.Event | None = None,
-) -> LocalAIRosterPrefillResult:
-    result = LocalAIRosterPrefillResult()
-    if not (include_cars or include_helmets or include_suits):
-        return result
-    if ai_rosters_dir is None or not ai_rosters_dir.exists():
-        return result
-    mapping_path = mapping_path or default_tp_showroom_mapping_path()
-    temp_root = temp_dir / f"local_ai_roster_prefill_{os.getpid()}_{int(time.time() * 1000)}"
-    temp_paints_root = temp_root / "paint"
-    recent_schemes = load_tp_recent_schemes()
-    recent_changed = False
-    showroom_cache_by_directory: dict[str, dict[str, object]] = {}
-    showroom_cache_by_accessory_kind: dict[str, dict[str, object]] = {}
-    local_names: list[str] = []
-    logging.info("Local AI roster prefill scan started.")
-    try:
-        for roster_dir in sorted(ai_rosters_dir.iterdir(), key=lambda item: item.name.casefold()):
-            if _cancel_requested(cancel_event):
-                break
-            if not roster_dir.is_dir() or not (roster_dir / "roster.json").exists():
-                continue
-            result.rosters_scanned += 1
-            if not _ai_roster_dir_is_local(roster_dir):
-                continue
-            result.local_rosters += 1
-            local_names.append(roster_dir.name)
-            try:
-                _payload, drivers = _read_ai_roster_payload(roster_dir)
-            except Exception as exc:  # noqa: BLE001
-                result.failed += 1
-                logging.warning("Local AI roster prefill could not read %s: %s", roster_dir.name, exc)
-                continue
-            if not drivers:
-                continue
-            used_car_scheme_ids = _ai_roster_existing_scheme_ids(drivers, ("carTgaName",))
-            used_helmet_scheme_ids = _ai_roster_existing_scheme_ids(drivers, ("helmetTgaName",))
-            used_suit_scheme_ids = _ai_roster_existing_scheme_ids(drivers, ("suitTgaName",))
-            roster_changed = False
-            roster_driver_updates = 0
-            roster_files_copied = 0
-            roster_cars = 0
-            roster_helmets = 0
-            roster_suits = 0
-            for driver_index, driver in enumerate(drivers, start=1):
-                if _cancel_requested(cancel_event):
-                    break
-                if not isinstance(driver, dict):
-                    continue
-                driver_changed = False
-                driver_name = str(driver.get("driverName") or driver.get("name") or f"driver {driver_index}").strip()
-                directory = str(driver.get("carPath") or "").strip().replace("\\", " ")
-                if include_cars and _ai_roster_driver_needs_asset(roster_dir, driver, "carTgaName"):
-                    directory_key = canonicalize_car_directory(directory).lower()
-                    showroom_cache = showroom_cache_by_directory.setdefault(
-                        directory_key,
-                        {"cars": [], "sampled_pages": set(), "detected_total_pages": 0},
-                    )
-                    recent_scheme_ids = {
-                        str(item).strip()
-                        for item in recent_schemes.get(directory_key, [])
-                        if str(item).strip()
-                    }
-                    ok, copied_files, scheme_id = _prefill_local_ai_roster_car(
-                        roster_dir=roster_dir,
-                        driver=driver,
-                        directory=directory,
-                        mapping_path=mapping_path,
-                        used_scheme_ids=used_car_scheme_ids,
-                        recent_scheme_ids=recent_scheme_ids,
-                        showroom_cache=showroom_cache,
-                        temp_root=temp_root,
-                        temp_paints_root=temp_paints_root,
-                        retries=retries,
-                        retry_backoff_seconds=retry_backoff_seconds,
-                        detect_showroom_total_pages=detect_showroom_total_pages,
-                        cancel_event=cancel_event,
-                    )
-                    if ok:
-                        roster_changed = True
-                        driver_changed = True
-                        roster_files_copied += copied_files
-                        roster_cars += 1
-                        if scheme_id:
-                            remember_tp_recent_scheme(recent_schemes, directory_key, scheme_id)
-                            recent_changed = True
-                    else:
-                        result.failed += 1
-                        logging.info("Local AI roster prefill skipped car for %s in %s: %s", driver_name, roster_dir.name, scheme_id)
-                if include_helmets and _ai_roster_driver_needs_asset(roster_dir, driver, "helmetTgaName"):
-                    showroom_cache = showroom_cache_by_accessory_kind.setdefault(
-                        "helmet",
-                        {"cars": [], "sampled_pages": set(), "detected_total_pages": 0},
-                    )
-                    recent_scheme_ids = {
-                        str(item).strip()
-                        for item in recent_schemes.get(TP_DRIVER_HELMET_CACHE_KEY, [])
-                        if str(item).strip()
-                    }
-                    ok, copied_files, scheme_id = _prefill_local_ai_roster_accessory(
-                        roster_dir=roster_dir,
-                        driver=driver,
-                        kind="helmet",
-                        used_scheme_ids=used_helmet_scheme_ids,
-                        recent_scheme_ids=recent_scheme_ids,
-                        showroom_cache=showroom_cache,
-                        temp_root=temp_root,
-                        temp_paints_root=temp_paints_root,
-                        retries=retries,
-                        retry_backoff_seconds=retry_backoff_seconds,
-                        detect_showroom_total_pages=detect_showroom_total_pages,
-                        cancel_event=cancel_event,
-                    )
-                    if ok:
-                        roster_changed = True
-                        driver_changed = True
-                        roster_files_copied += copied_files
-                        roster_helmets += 1
-                        if scheme_id:
-                            remember_tp_recent_scheme(recent_schemes, TP_DRIVER_HELMET_CACHE_KEY, scheme_id)
-                            recent_changed = True
-                    else:
-                        result.failed += 1
-                        logging.info("Local AI roster prefill skipped helmet for %s in %s: %s", driver_name, roster_dir.name, scheme_id)
-                if include_suits and _ai_roster_driver_needs_asset(roster_dir, driver, "suitTgaName"):
-                    showroom_cache = showroom_cache_by_accessory_kind.setdefault(
-                        "suit",
-                        {"cars": [], "sampled_pages": set(), "detected_total_pages": 0},
-                    )
-                    recent_scheme_ids = {
-                        str(item).strip()
-                        for item in recent_schemes.get(TP_DRIVER_SUIT_CACHE_KEY, [])
-                        if str(item).strip()
-                    }
-                    ok, copied_files, scheme_id = _prefill_local_ai_roster_accessory(
-                        roster_dir=roster_dir,
-                        driver=driver,
-                        kind="suit",
-                        used_scheme_ids=used_suit_scheme_ids,
-                        recent_scheme_ids=recent_scheme_ids,
-                        showroom_cache=showroom_cache,
-                        temp_root=temp_root,
-                        temp_paints_root=temp_paints_root,
-                        retries=retries,
-                        retry_backoff_seconds=retry_backoff_seconds,
-                        detect_showroom_total_pages=detect_showroom_total_pages,
-                        cancel_event=cancel_event,
-                    )
-                    if ok:
-                        roster_changed = True
-                        driver_changed = True
-                        roster_files_copied += copied_files
-                        roster_suits += 1
-                        if scheme_id:
-                            remember_tp_recent_scheme(recent_schemes, TP_DRIVER_SUIT_CACHE_KEY, scheme_id)
-                            recent_changed = True
-                    else:
-                        result.failed += 1
-                        logging.info("Local AI roster prefill skipped suit for %s in %s: %s", driver_name, roster_dir.name, scheme_id)
-                if driver_changed:
-                    roster_driver_updates += 1
-            if roster_changed:
-                roster_item = AIWebRosterItem(roster_id="", name=roster_dir.name, roster_file="")
-                _write_ai_roster_files(
-                    roster_dir,
-                    {"drivers": drivers},
-                    drivers,
-                    roster_item,
-                    is_local=True,
-                    source_name="Local AI roster public showroom prefill",
-                )
-                result.rosters_updated += 1
-                result.drivers_updated += roster_driver_updates
-                result.files_copied += roster_files_copied
-                result.cars += roster_cars
-                result.helmets += roster_helmets
-                result.suits += roster_suits
-                logging.info(
-                    "Local AI roster prefill updated %s: %s driver(s), %s car(s), %s helmet(s), %s suit(s), %s copied file(s). Recreate/select this AI roster before starting the race so iRacing reads the new paint references.",
-                    roster_dir.name,
-                    roster_driver_updates,
-                    roster_cars,
-                    roster_helmets,
-                    roster_suits,
-                    roster_files_copied,
-                )
-        if recent_changed:
-            save_tp_recent_schemes(recent_schemes)
-    finally:
-        try:
-            shutil.rmtree(temp_root, ignore_errors=True)
-        except Exception:
-            logging.debug("Could not clean local AI roster prefill temp folder %s", temp_root, exc_info=True)
-    if result.local_rosters <= 0:
-        logging.info("Local AI roster prefill scan complete: no local AI roster folders found in %s.", ai_rosters_dir)
-    elif result.rosters_updated <= 0 and result.failed > 0:
-        logging.info("Local AI roster prefill scan complete: %s local roster(s) checked; no roster was updated and %s asset(s) were unavailable or unmapped.", result.local_rosters, result.failed)
-    elif result.rosters_updated <= 0:
-        logging.info("Local AI roster prefill scan complete: %s local roster(s) checked; no missing enabled paint references.", result.local_rosters)
-    else:
-        logging.info(
-            "Local AI roster prefill scan complete: %s/%s local roster(s) updated, %s driver(s), %s copied file(s), %s failed asset(s).",
-            result.rosters_updated,
-            result.local_rosters,
-            result.drivers_updated,
-            result.files_copied,
-            result.failed,
-        )
-    return result
 def import_saved_paint_groups_to_ai_livery(saved: list[SavedFile], session: Session | None, ai_livery_root: Path, only_local_user: bool = False) -> tuple[int, int]:
     grouped: dict[tuple[str, int, bool], dict[PaintType, Path]] = {}
     local_user_id = session.local_user_id if session is not None else None
@@ -16662,7 +16380,7 @@ def process_session(
             skipped_ai_random_kinds.append("suits")
         if skipped_ai_random_kinds:
             logging.info(
-                "Local AI roster active for %s: skipping session random AI %s so local roster paints stay stable. Local roster prefill runs at app startup and after AI roster sync to fill missing files before the race is created.",
+                "Local AI roster active for %s: skipping session random AI %s so local roster paints stay stable. Live random fallback can still update the active local roster when matching fallback files are available.",
                 active_roster_dir.name if active_roster_dir is not None else (session.ai_roster_name or session.ai_roster_id or "active AI roster"),
                 ", ".join(skipped_ai_random_kinds),
             )
@@ -18017,7 +17735,6 @@ class DownloaderService:
         last_replay_dir_token = _replay_dir_change_token(replay_dir)
         inactive_cleanup_done = False
         reopen_sdk_after_inactive = False
-        local_ai_roster_prefill_done = False
         def _maybe_sync_replay_packs(
             config: AppConfig,
             *,
@@ -18048,36 +17765,6 @@ class DownloaderService:
             )
             last_replay_dir_token = _replay_dir_change_token(replay_dir)
             next_replay_pack_full_scan_at = now + REPLAY_PACK_FULL_SCAN_SECONDS
-        def _maybe_prefill_local_ai_rosters(config: AppConfig, *, force: bool = False) -> None:
-            nonlocal local_ai_roster_prefill_done
-            if local_ai_roster_prefill_done and not force:
-                return
-            local_ai_roster_prefill_done = True
-            include_cars = bool(getattr(config, "random_fallback_ai", True))
-            include_helmets = bool(getattr(config, "random_helmets_ai", getattr(config, "random_helmets", True)))
-            include_suits = bool(getattr(config, "random_suits_ai", getattr(config, "random_suits", True)))
-            if not (include_cars or include_helmets or include_suits):
-                logging.debug("Local AI roster prefill skipped because AI random paints are disabled.")
-                return
-            try:
-                self._set_status("Prefilling local AI rosters")
-                prefill_local_ai_rosters_from_showroom(
-                    ai_rosters_dir=default_ai_rosters_dir(config),
-                    temp_dir=temp_dir,
-                    retries=positive_int(config.retries, 3),
-                    retry_backoff_seconds=max(config.retry_backoff_seconds, 0.1),
-                    include_cars=include_cars,
-                    include_helmets=include_helmets,
-                    include_suits=include_suits,
-                    mapping_path=default_tp_showroom_mapping_path(),
-                    detect_showroom_total_pages=False,
-                    cancel_event=self._stop_event,
-                )
-            except Exception as exc:  # noqa: BLE001
-                logging.warning("Local AI roster prefill failed: %s", exc)
-                logging.debug("Local AI roster prefill traceback\n%s", traceback.format_exc())
-            finally:
-                self._set_status("Watching")
         self._update_runtime_snapshot(current_session, last_saved, last_known_member_id, session_rows=session_rows, replay_mode_active=replay_mode_active)
         try:
             while not self._stop_event.is_set():
@@ -18099,7 +17786,6 @@ class DownloaderService:
                     next_replay_pack_full_scan_at = 0.0
                     last_replay_dir_token = _replay_dir_change_token(replay_dir)
                     logging.info("Using custom iRacing replay folder: %s", replay_dir)
-                _maybe_prefill_local_ai_rosters(config)
                 _maybe_sync_replay_packs(config, current_session_arg=current_session, saved_arg=last_saved)
                 if self._force_refresh_event.is_set() and sdk_reader is not None:
                     sdk_reader.last_update = None
@@ -18137,7 +17823,6 @@ class DownloaderService:
                         )
                         last_ai_roster_sync_member_id = member_id_for_sync
                         self._set_status("Watching")
-                    _maybe_prefill_local_ai_rosters(config, force=True)
                 ai_roster_override_member_id = normalize_tp_member_id(getattr(config, "ai_roster_member_id_override", 0))
                 if (
                     config.sync_ai_rosters_from_server
@@ -18155,7 +17840,6 @@ class DownloaderService:
                     )
                     last_ai_roster_sync_member_id = ai_roster_override_member_id
                     self._set_status("Watching")
-                    _maybe_prefill_local_ai_rosters(config, force=True)
                 if self._global_texture_reload_event.is_set():
                     self._global_texture_reload_event.clear()
                     if sdk_reader is None:
@@ -18265,7 +17949,6 @@ class DownloaderService:
                     )
                     last_ai_roster_sync_member_id = member_id_for_auto_ai_sync
                     self._set_status("Watching")
-                    _maybe_prefill_local_ai_rosters(config, force=True)
                 current_fingerprint = session.fingerprint()
                 replay_mode_active = bool(
                     getattr(config, "auto_manage_replay_packs", True)

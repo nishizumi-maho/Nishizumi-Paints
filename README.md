@@ -23,7 +23,7 @@ Nishizumi Paints is a Windows desktop companion for iRacing that downloads Tradi
 ## Install
 
 1. Download the latest setup executable from the [Releases](https://github.com/nishizumi-maho/Nishizumi-Paints/releases/latest) page.
-2. Run `NishizumiPaints-Setup-6.5.exe`.
+2. Run the downloaded `NishizumiPaints-Setup-*.exe`.
 3. Keep the startup and background options enabled if you want the app to keep monitoring from the tray.
 4. Finish the Quick Start wizard after first launch.
 
