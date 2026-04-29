@@ -43,7 +43,7 @@ from requests.adapters import HTTPAdapter
 # Browserless copy: Trading Paints browser automation is intentionally disabled.
 sync_playwright = None
 APP_NAME = "Nishizumi Paints"
-APP_VERSION = "6.4"
+APP_VERSION = "6.4.1"
 APP_REGISTRY_NAME = "NishizumiPaints"
 APP_CONFIG_DIRNAME = "NishizumiPaints"
 APP_TOOLTIP = f"{APP_NAME} {APP_VERSION}"
@@ -18901,19 +18901,21 @@ class DownloaderUI:
         self.online_section_state_var = tk.StringVar(value="OFF")
         self.online_section_hint_var = tk.StringVar(value="Saved here for later use.")
         self.local_backup_hint_var = tk.StringVar(value="Local backup pool settings live in Random Step 3.")
-        self.showroom_download_mid_var = tk.StringVar(value="")
-        self.showroom_download_slug_var = tk.StringVar(value="")
+        self.showroom_download_car_var = tk.StringVar(value="")
         self.showroom_collection_sources_var = tk.StringVar(value="")
         self.showroom_download_count_var = tk.IntVar(value=5)
         self.showroom_download_pages_var = tk.IntVar(value=TP_SHOWROOM_MAX_PAGES)
-        self.showroom_download_status_var = tk.StringVar(value="Enter a Trading Paints car ID to download public non-PRO paints into the RandomPool.")
+        self.showroom_download_status_var = tk.StringVar(value="Choose a car to download random public non-PRO paints into the RandomPool.")
         self.showroom_download_custom_folder_var = tk.StringVar(value="Custom folder: not selected.")
         self.showroom_car_choices = tp_showroom_car_choice_labels(default_tp_showroom_mapping_path())
+        self.showroom_download_car_suggestions_var = tk.StringVar(value="")
         self.showroom_member_id_var = tk.StringVar(value="")
         self.showroom_member_car_var = tk.StringVar(value="")
+        self.showroom_member_car_suggestions_var = tk.StringVar(value="")
         self.showroom_member_status_var = tk.StringVar(value="Enter a Member ID and car to download that member's car, helmet, and suit paints.")
         self.showroom_team_id_var = tk.StringVar(value="")
         self.showroom_team_car_var = tk.StringVar(value="")
+        self.showroom_team_car_suggestions_var = tk.StringVar(value="")
         self.showroom_team_status_var = tk.StringVar(value="Enter a Team ID and car to download team paints into the iRacing paint folder.")
         self._showroom_download_custom_folder_path = ""
         self._showroom_pool_download_in_progress = False
@@ -19514,19 +19516,17 @@ class DownloaderUI:
         teams_tab = ttk.Frame(showroom_mode_tabs, padding=8)
         for tab in (car_id_tab, links_tab, collection_tab, members_tab, teams_tab):
             tab.columnconfigure(1, weight=1)
-        showroom_mode_tabs.add(car_id_tab, text="Car ID")
+        showroom_mode_tabs.add(car_id_tab, text="Car")
         showroom_mode_tabs.add(links_tab, text="Showroom links")
         showroom_mode_tabs.add(collection_tab, text="Collection")
         showroom_mode_tabs.add(members_tab, text="Member ID")
         showroom_mode_tabs.add(teams_tab, text="Teams")
 
-        ttk.Label(car_id_tab, text="Download random public paints for one TP car ID. Category is inferred internally; slug is optional.").grid(row=0, column=0, columnspan=4, sticky="w")
-        ttk.Label(car_id_tab, text="TP car ID").grid(row=1, column=0, sticky="w", pady=(10, 0))
-        ttk.Entry(car_id_tab, textvariable=self.showroom_download_mid_var, width=12).grid(row=1, column=1, sticky="w", pady=(10, 0))
-        ttk.Button(car_id_tab, text="Find TP car ID", command=self.open_tp_showroom).grid(row=1, column=2, sticky="w", padx=(12, 0), pady=(10, 0))
-        ttk.Label(car_id_tab, text="Open a car page; the car ID is the number in the URL after the category.", foreground="#555555", justify="left", wraplength=420).grid(row=1, column=3, sticky="w", padx=(10, 0), pady=(10, 0))
-        ttk.Label(car_id_tab, text="Slug (optional)").grid(row=2, column=0, sticky="w", pady=(8, 0))
-        ttk.Entry(car_id_tab, textvariable=self.showroom_download_slug_var, width=32).grid(row=2, column=1, sticky="w", pady=(8, 0))
+        ttk.Label(car_id_tab, text="Choose a car to download random public non-PRO paints from the selected Showroom sources.").grid(row=0, column=0, columnspan=4, sticky="w")
+        ttk.Label(car_id_tab, text="Car").grid(row=1, column=0, sticky="w", pady=(10, 0))
+        self.showroom_download_car_combo = ttk.Combobox(car_id_tab, textvariable=self.showroom_download_car_var, values=self.showroom_car_choices, width=42, height=18)
+        self.showroom_download_car_combo.grid(row=1, column=1, columnspan=3, sticky="w", pady=(10, 0))
+        ttk.Label(car_id_tab, textvariable=self.showroom_download_car_suggestions_var, foreground="#555555", justify="left", wraplength=680).grid(row=2, column=1, columnspan=3, sticky="w", pady=(4, 0))
         ttk.Label(car_id_tab, text="Paints").grid(row=3, column=0, sticky="w", pady=(8, 0))
         ttk.Spinbox(car_id_tab, from_=1, to=100, width=6, textvariable=self.showroom_download_count_var).grid(row=3, column=1, sticky="w", pady=(8, 0))
         ttk.Label(car_id_tab, text="Max pages").grid(row=3, column=2, sticky="e", padx=(12, 6), pady=(8, 0))
@@ -19535,6 +19535,7 @@ class DownloaderUI:
         car_id_actions.grid(row=4, column=0, columnspan=4, sticky="w", pady=(10, 0))
         ttk.Button(car_id_actions, text="Download to RandomPool", command=self.download_showroom_random_pool_now).pack(side="left")
         ttk.Button(car_id_actions, text="Download to custom folder", command=lambda: self.download_showroom_random_pool_now(custom_folder=True)).pack(side="left", padx=(8, 0))
+        self._bind_showroom_car_combobox(self.showroom_download_car_combo, self.showroom_download_car_var, self.showroom_download_car_suggestions_var)
 
         ttk.Label(links_tab, text="Paste one or more specific Trading Paints showroom paint links, one per line. Car paints are sorted by mapped iRacing directory; helmets and suits go into the accessory pool.").grid(row=0, column=0, columnspan=3, sticky="w")
         self.showroom_links_text = self.tk.Text(links_tab, height=5, width=88, wrap="word")
@@ -19557,25 +19558,31 @@ class DownloaderUI:
         ttk.Label(members_tab, text="Member ID").grid(row=1, column=0, sticky="w", pady=(10, 0))
         ttk.Entry(members_tab, textvariable=self.showroom_member_id_var, width=16).grid(row=1, column=1, sticky="w", pady=(10, 0))
         ttk.Label(members_tab, text="Car").grid(row=2, column=0, sticky="w", pady=(8, 0))
-        ttk.Combobox(members_tab, textvariable=self.showroom_member_car_var, values=self.showroom_car_choices, width=56).grid(row=2, column=1, columnspan=3, sticky="ew", pady=(8, 0))
+        self.showroom_member_car_combo = ttk.Combobox(members_tab, textvariable=self.showroom_member_car_var, values=self.showroom_car_choices, width=42, height=18)
+        self.showroom_member_car_combo.grid(row=2, column=1, columnspan=3, sticky="w", pady=(8, 0))
+        ttk.Label(members_tab, textvariable=self.showroom_member_car_suggestions_var, foreground="#555555", justify="left", wraplength=680).grid(row=3, column=1, columnspan=3, sticky="w", pady=(4, 0))
         member_actions = ttk.Frame(members_tab)
-        member_actions.grid(row=3, column=0, columnspan=4, sticky="w", pady=(10, 0))
+        member_actions.grid(row=4, column=0, columnspan=4, sticky="w", pady=(10, 0))
         ttk.Button(member_actions, text="Download car to iRacing paints", command=self.download_showroom_member_now).pack(side="left")
         ttk.Button(member_actions, text="Download car to custom folder", command=lambda: self.download_showroom_member_now(custom_folder=True)).pack(side="left", padx=(8, 0))
         ttk.Button(member_actions, text="Download all to member folder...", command=self.download_showroom_member_all_now).pack(side="left", padx=(8, 0))
-        ttk.Label(members_tab, textvariable=self.showroom_member_status_var, justify="left", foreground="#555555", wraplength=880).grid(row=4, column=0, columnspan=4, sticky="w", pady=(10, 0))
+        ttk.Label(members_tab, textvariable=self.showroom_member_status_var, justify="left", foreground="#555555", wraplength=880).grid(row=5, column=0, columnspan=4, sticky="w", pady=(10, 0))
+        self._bind_showroom_car_combobox(self.showroom_member_car_combo, self.showroom_member_car_var, self.showroom_member_car_suggestions_var)
 
         ttk.Label(teams_tab, text="Download a team's Trading Paints assets by Team ID and car. This uses the session-aware team manifest and saves car, helmet, and suit files when they exist.").grid(row=0, column=0, columnspan=4, sticky="w")
         ttk.Label(teams_tab, text="Team ID").grid(row=1, column=0, sticky="w", pady=(10, 0))
         ttk.Entry(teams_tab, textvariable=self.showroom_team_id_var, width=16).grid(row=1, column=1, sticky="w", pady=(10, 0))
         ttk.Label(teams_tab, text="Car").grid(row=2, column=0, sticky="w", pady=(8, 0))
-        ttk.Combobox(teams_tab, textvariable=self.showroom_team_car_var, values=self.showroom_car_choices, width=56).grid(row=2, column=1, columnspan=3, sticky="ew", pady=(8, 0))
+        self.showroom_team_car_combo = ttk.Combobox(teams_tab, textvariable=self.showroom_team_car_var, values=self.showroom_car_choices, width=42, height=18)
+        self.showroom_team_car_combo.grid(row=2, column=1, columnspan=3, sticky="w", pady=(8, 0))
+        ttk.Label(teams_tab, textvariable=self.showroom_team_car_suggestions_var, foreground="#555555", justify="left", wraplength=680).grid(row=3, column=1, columnspan=3, sticky="w", pady=(4, 0))
         team_actions = ttk.Frame(teams_tab)
-        team_actions.grid(row=3, column=0, columnspan=4, sticky="w", pady=(10, 0))
+        team_actions.grid(row=4, column=0, columnspan=4, sticky="w", pady=(10, 0))
         ttk.Button(team_actions, text="Download to iRacing paints", command=self.download_showroom_team_now).pack(side="left")
         ttk.Button(team_actions, text="Download to custom folder", command=lambda: self.download_showroom_team_now(custom_folder=True)).pack(side="left", padx=(8, 0))
         ttk.Button(team_actions, text="Download all to team folder...", command=self.download_showroom_team_all_now).pack(side="left", padx=(8, 0))
-        ttk.Label(teams_tab, textvariable=self.showroom_team_status_var, justify="left", foreground="#555555", wraplength=880).grid(row=4, column=0, columnspan=4, sticky="w", pady=(10, 0))
+        ttk.Label(teams_tab, textvariable=self.showroom_team_status_var, justify="left", foreground="#555555", wraplength=880).grid(row=5, column=0, columnspan=4, sticky="w", pady=(10, 0))
+        self._bind_showroom_car_combobox(self.showroom_team_car_combo, self.showroom_team_car_var, self.showroom_team_car_suggestions_var)
 
         ttk.Label(showroom_download_box, text=f"Default destination: {default_random_pool_dir()}", foreground="#555555", justify="left", wraplength=920).grid(row=2, column=0, sticky="w", pady=(10, 0))
         ttk.Label(showroom_download_box, textvariable=self.showroom_download_custom_folder_var, foreground="#555555", justify="left", wraplength=920).grid(row=3, column=0, sticky="w", pady=(4, 0))
@@ -22864,7 +22871,7 @@ class DownloaderUI:
         self.ttk.Label(p4, text=explain, wraplength=520, justify="left", foreground="#444444").pack(anchor="w", pady=(8, 0))
         self.quick_start_tp_status_label = self.ttk.Label(p4, textvariable=self.tp_auth_profile_summary_var, wraplength=520, justify="left", foreground="#176d2b")
         self.quick_start_tp_status_label.pack(anchor="w", pady=(10, 0))
-        self.ttk.Label(p4, text="The Random tab controls automatic session fallback. The Showroom tab lets you manually pre-fill the standard RandomPool for any TP car ID you choose.", wraplength=520, justify="left", foreground="#176d2b").pack(anchor="w", pady=(12, 0))
+        self.ttk.Label(p4, text="The Random tab controls automatic session fallback. The Showroom tab lets you manually pre-fill the standard RandomPool for any Trading Paints car you choose.", wraplength=520, justify="left", foreground="#176d2b").pack(anchor="w", pady=(12, 0))
         pages.append(p4)
 
         p5 = _page_container()
@@ -23074,34 +23081,110 @@ class DownloaderUI:
             "max_pool_suit_gb": clamp_random_pool_category_gb(getattr(self.config, "max_random_pool_suit_gb", 1.0), 1.0),
         }
 
+    def _showroom_car_choice_matches(self, query: object, limit: int = 18) -> list[str]:
+        choices = list(getattr(self, "showroom_car_choices", []) or [])
+        text = str(query or "").strip()
+        if not text:
+            return choices[:max(1, int(limit or 18))]
+        normalized_query = _tp_normalized_vehicle_name(text)
+        query_lower = text.lower()
+        scored: list[tuple[int, float, str]] = []
+        for label in choices:
+            label_text = str(label or "")
+            normalized_label = _tp_normalized_vehicle_name(label_text)
+            if not normalized_label:
+                continue
+            score = 0.0
+            if normalized_query and normalized_label.startswith(normalized_query):
+                score = 1.0
+            elif normalized_query and normalized_query in normalized_label:
+                score = 0.92
+            elif query_lower and query_lower in label_text.lower():
+                score = 0.9
+            else:
+                score = SequenceMatcher(None, normalized_query, normalized_label).ratio()
+            if score >= 0.52:
+                scored.append((0 if normalized_label.startswith(normalized_query) else 1, score, label_text))
+        scored.sort(key=lambda item: (item[0], -item[1], item[2].lower()))
+        return [label for _prefix, _score, label in scored[:max(1, int(limit or 18))]]
+
+    def _set_showroom_car_suggestions(self, suggestions_var: Any, matches: list[str]) -> None:
+        if suggestions_var is None:
+            return
+        if not matches:
+            suggestions_var.set("No matching cars.")
+            return
+        suggestions_var.set("Suggestions: " + " | ".join(matches[:4]))
+
+    def _post_showroom_car_combobox(self, combo: Any) -> None:
+        try:
+            combo.event_generate("<Down>")
+            return
+        except Exception:
+            pass
+        try:
+            combo.tk.call("ttk::combobox::Post", str(combo))
+        except Exception:
+            pass
+
+    def _refresh_showroom_car_combobox(self, combo: Any, value_var: Any, suggestions_var: Any, *, open_dropdown: bool = False) -> None:
+        matches = self._showroom_car_choice_matches(value_var.get() if value_var is not None else "")
+        try:
+            combo.configure(values=matches if matches else list(getattr(self, "showroom_car_choices", []) or []))
+        except Exception:
+            pass
+        self._set_showroom_car_suggestions(suggestions_var, matches)
+        if open_dropdown:
+            try:
+                self.root.after(80, lambda cmb=combo: self._post_showroom_car_combobox(cmb))
+            except Exception:
+                self._post_showroom_car_combobox(combo)
+
+    def _bind_showroom_car_combobox(self, combo: Any, value_var: Any, suggestions_var: Any) -> None:
+        def _open(_event: object = None) -> None:
+            self._refresh_showroom_car_combobox(combo, value_var, suggestions_var, open_dropdown=True)
+
+        def _typed(_event: object = None) -> None:
+            self._refresh_showroom_car_combobox(combo, value_var, suggestions_var)
+
+        try:
+            combo.bind("<FocusIn>", _open, add="+")
+            combo.bind("<Button-1>", _open, add="+")
+            combo.bind("<KeyRelease>", _typed, add="+")
+            combo.bind("<<ComboboxSelected>>", _typed, add="+")
+        except Exception:
+            pass
+        self._refresh_showroom_car_combobox(combo, value_var, suggestions_var)
+
     def download_showroom_random_pool_now(self, custom_folder: bool = False) -> None:
         if getattr(self, "_showroom_pool_download_in_progress", False):
             self._append_log("Showroom RandomPool download is already running.")
             return
-        try:
-            mid = int(str(self.showroom_download_mid_var.get() or "").strip())
-        except Exception:
+        car_value = str(self.showroom_download_car_var.get() or "").strip()
+        if not car_value:
             try:
-                self.messagebox.showerror(APP_NAME, "Enter a valid Trading Paints car ID.", parent=self.root)
+                self.messagebox.showerror(APP_NAME, "Choose or enter a Trading Paints car.", parent=self.root)
             except Exception:
                 pass
             return
+        try:
+            target = _resolve_tp_paint_car_target(car_value, default_tp_showroom_mapping_path())
+        except Exception as exc:
+            try:
+                self.messagebox.showerror(APP_NAME, f"Could not resolve that Trading Paints car.\n\n{exc}", parent=self.root)
+            except Exception:
+                pass
+            return
+        mid = int(target.mid or 0)
         if mid <= 0:
             try:
-                self.messagebox.showerror(APP_NAME, "Trading Paints car ID must be greater than zero.", parent=self.root)
+                self.messagebox.showerror(APP_NAME, "That car is missing a Trading Paints car ID in the local mapping.", parent=self.root)
             except Exception:
                 pass
             return
-        directory = ""
+        directory = target.directories[0] if target.directories else ""
         category = ""
-        slug = str(self.showroom_download_slug_var.get() or "").strip()
-        mapping = _tp_showroom_mapping_entry_for_mid(mid, default_tp_showroom_mapping_path())
-        if mapping is not None:
-            mapped_directory, entry = mapping
-            directory = mapped_directory
-            if not slug:
-                slug = str(entry.get("slug") or f"car-{mid}").strip()
-            category = str(entry.get("category") or "").strip()
+        slug = target.slug
         try:
             count = max(1, min(100, int(self.showroom_download_count_var.get())))
         except Exception:
@@ -23118,8 +23201,10 @@ class DownloaderUI:
         destination, destination_label = destination_info
 
         self._showroom_pool_download_in_progress = True
-        self.showroom_download_status_var.set(f"Downloading up to {count} public non-PRO paint(s) for TP car ID {mid} to {destination_label}...")
-        self._append_log(f"Manual public showroom download started: mid={mid}, directory={directory or '(auto bucket)'}, slug={slug or '(optional auto)'}, count={count}, pages={pages}, destination={destination}.")
+        source_label = tp_showroom_sources_label(getattr(self.config, "tp_showroom_sources", TP_SHOWROOM_DEFAULT_SOURCES))
+        display_name = target.display_name or car_value
+        self.showroom_download_status_var.set(f"Downloading up to {count} random public non-PRO paint(s) for {display_name} to {destination_label}...")
+        self._append_log(f"Manual public showroom download started: car={display_name}, mid={mid}, source_pool={source_label}, count={count}, pages={pages}, destination={destination}.")
 
         def ui_log(message: str) -> None:
             self.root.after(0, lambda msg=message: self._append_log(msg))
@@ -23313,7 +23398,7 @@ class DownloaderUI:
         car_value = str(self.showroom_member_car_var.get() or "").strip()
         if not car_value:
             try:
-                self.messagebox.showerror(APP_NAME, "Choose or enter a TP car ID, dashboard URL, car name, or iRacing car directory.", parent=self.root)
+                self.messagebox.showerror(APP_NAME, "Choose or enter a Trading Paints car.", parent=self.root)
             except Exception:
                 pass
             return
@@ -23436,7 +23521,7 @@ class DownloaderUI:
         car_value = str(self.showroom_team_car_var.get() or "").strip()
         if not car_value:
             try:
-                self.messagebox.showerror(APP_NAME, "Enter a TP car ID, dashboard URL, car name, or iRacing car directory.", parent=self.root)
+                self.messagebox.showerror(APP_NAME, "Choose or enter a Trading Paints car.", parent=self.root)
             except Exception:
                 pass
             return

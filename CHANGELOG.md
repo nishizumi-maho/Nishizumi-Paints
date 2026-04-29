@@ -2,6 +2,15 @@
 
 All notable user-facing changes to Nishizumi Paints are documented here.
 
+## [6.4.1] - 2026-04-29
+
+### Changed
+
+- Reworked the Showroom car download tab so users choose a Trading Paints car directly instead of typing a TP car ID or slug.
+- Added the same click-to-open searchable car dropdown to Showroom car, Member ID, and Teams downloads.
+- Reduced the car field width and added live suggestions below each car selector while typing.
+- Manual random car downloads keep using the selected Showroom source pool and randomly fetch from any enabled source.
+
 ## [6.4] - 2026-04-29
 
 ### Added
