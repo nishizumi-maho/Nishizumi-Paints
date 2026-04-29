@@ -43,7 +43,7 @@ from requests.adapters import HTTPAdapter
 # Browserless copy: Trading Paints browser automation is intentionally disabled.
 sync_playwright = None
 APP_NAME = "Nishizumi Paints"
-APP_VERSION = "6.5.1"
+APP_VERSION = "6.5.2"
 APP_REGISTRY_NAME = "NishizumiPaints"
 APP_CONFIG_DIRNAME = "NishizumiPaints"
 APP_TOOLTIP = f"{APP_NAME} {APP_VERSION}"
@@ -16999,7 +16999,7 @@ class AppConfig:
     random_suits_ai: bool = True
     random_accessory_defaults_migrated: bool = True
     disable_random_in_team_events: bool = True
-    disable_random_for_local_user: bool = False
+    disable_random_for_local_user: bool = True
     tp_fallback_mode: str = "online"
     tp_manifest_member_id_override: int = 0
     tp_primary_fast_mode: bool = True
@@ -17154,7 +17154,7 @@ class ConfigStore:
         config.random_helmets = bool(config.random_helmets_real_drivers or config.random_helmets_ai)
         config.random_suits = bool(config.random_suits_real_drivers or config.random_suits_ai)
         config.disable_random_in_team_events = bool(getattr(config, "disable_random_in_team_events", True))
-        config.disable_random_for_local_user = bool(getattr(config, "disable_random_for_local_user", False))
+        config.disable_random_for_local_user = bool(getattr(config, "disable_random_for_local_user", True))
         config.tp_fallback_mode = str(getattr(config, "tp_fallback_mode", "online") or "online").strip().lower()
         if config.tp_fallback_mode not in {"local", "online"}:
             config.tp_fallback_mode = "online"
@@ -17226,7 +17226,7 @@ class ConfigStore:
         safe.random_helmets = bool(safe.random_helmets_real_drivers or safe.random_helmets_ai)
         safe.random_suits = bool(safe.random_suits_real_drivers or safe.random_suits_ai)
         safe.disable_random_in_team_events = bool(getattr(safe, "disable_random_in_team_events", True))
-        safe.disable_random_for_local_user = bool(getattr(safe, "disable_random_for_local_user", False))
+        safe.disable_random_for_local_user = bool(getattr(safe, "disable_random_for_local_user", True))
         safe.tp_fallback_lanes_mode = normalize_tp_fallback_lanes_mode(getattr(safe, "tp_fallback_lanes_mode", "session_total"))
         safe.tp_manual_max_lanes = max(1, min(100, positive_int(getattr(safe, "tp_manual_max_lanes", 1), 1)))
         safe.tp_process_all_online_fallbacks_together = bool(getattr(safe, "tp_process_all_online_fallbacks_together", True))
@@ -18107,7 +18107,7 @@ class DownloaderService:
                             random_suits_real_drivers=bool(getattr(config, "random_suits_real_drivers", getattr(config, "random_suits", True))),
                             random_suits_ai=bool(getattr(config, "random_suits_ai", getattr(config, "random_suits", True))),
                             disable_random_in_team_events=bool(getattr(config, "disable_random_in_team_events", True)),
-                            disable_random_for_local_user=bool(getattr(config, "disable_random_for_local_user", False)),
+                            disable_random_for_local_user=bool(getattr(config, "disable_random_for_local_user", True)),
                             ai_collection_skip_random_cars=bool(getattr(config, "ai_collection_skip_random_cars", True)),
                             ai_collection_skip_random_helmets=bool(getattr(config, "ai_collection_skip_random_helmets", True)),
                             ai_collection_skip_random_suits=bool(getattr(config, "ai_collection_skip_random_suits", True)),
@@ -18540,7 +18540,7 @@ class DownloaderUI:
         self.random_suits_real_var = tk.BooleanVar(value=bool(getattr(self.config, "random_suits_real_drivers", getattr(self.config, "random_suits", True))))
         self.random_suits_ai_var = tk.BooleanVar(value=bool(getattr(self.config, "random_suits_ai", getattr(self.config, "random_suits", True))))
         self.disable_random_in_team_events_var = tk.BooleanVar(value=bool(getattr(self.config, "disable_random_in_team_events", True)))
-        self.disable_random_for_local_user_var = tk.BooleanVar(value=bool(getattr(self.config, "disable_random_for_local_user", False)))
+        self.disable_random_for_local_user_var = tk.BooleanVar(value=bool(getattr(self.config, "disable_random_for_local_user", True)))
         self.tp_fallback_mode_var = tk.StringVar(value=str(getattr(self.config, "tp_fallback_mode", "online") or "online").strip().lower().title())
         self.keep_tp_pool_var = tk.BooleanVar(value=getattr(self.config, "keep_tp_paints_in_random_pool", False))
         self.random_pool_size_gb_var = tk.DoubleVar(value=clamp_random_pool_gb(getattr(self.config, "max_random_pool_gb", 5.0), 5.0))
