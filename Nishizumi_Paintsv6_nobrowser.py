@@ -43,7 +43,7 @@ from requests.adapters import HTTPAdapter
 # Browserless copy: Trading Paints browser automation is intentionally disabled.
 sync_playwright = None
 APP_NAME = "Nishizumi Paints"
-APP_VERSION = "6.3.3"
+APP_VERSION = "6.4"
 APP_REGISTRY_NAME = "NishizumiPaints"
 APP_CONFIG_DIRNAME = "NishizumiPaints"
 APP_TOOLTIP = f"{APP_NAME} {APP_VERSION}"
@@ -6727,8 +6727,27 @@ def download_showroom_paints_to_random_pool(
             pass
 
 @dataclass(frozen=True)
+class TPPaintCarTarget:
+    raw_car: str
+    directories: tuple[str, ...]
+    mid: int = 0
+    slug: str = ""
+    display_name: str = ""
+
+
+@dataclass(frozen=True)
 class TPTeamPaintTarget:
     team_id: int
+    raw_car: str
+    directories: tuple[str, ...]
+    mid: int = 0
+    slug: str = ""
+    display_name: str = ""
+
+
+@dataclass(frozen=True)
+class TPMemberPaintTarget:
+    member_id: int
     raw_car: str
     directories: tuple[str, ...]
     mid: int = 0
@@ -6751,6 +6770,13 @@ def _tp_team_extract_mid_slug(value: object) -> tuple[int, str]:
         mid = _to_int_or_none(match.group("mid")) or 0
         slug = urllib.parse.unquote(match.group("slug") or "").strip()
         return mid, slug
+    label_match = re.search(
+        r"\b(?:tp\s*)?(?:car\s*)?id\s*[:#-]?\s*(?P<mid>\d{1,6})\b",
+        raw,
+        flags=re.IGNORECASE,
+    )
+    if label_match:
+        return int(label_match.group("mid")), ""
     if raw.isdigit():
         return int(raw), ""
     return 0, ""
@@ -6808,7 +6834,7 @@ def _tp_team_mapping_entries_for_mid(mid: int, mapping_path: Path | None = None)
     return matches
 
 
-def resolve_tp_team_paint_target(car_value: object, team_id: int, mapping_path: Path | None = None) -> TPTeamPaintTarget:
+def _resolve_tp_paint_car_target(car_value: object, mapping_path: Path | None = None) -> TPPaintCarTarget:
     raw = str(car_value or "").strip()
     if not raw:
         raise ValueError("Enter a TP car ID, dashboard URL, car name, or iRacing car directory.")
@@ -6857,14 +6883,67 @@ def resolve_tp_team_paint_target(car_value: object, team_id: int, mapping_path: 
         directories = _tp_team_directory_variants(directory_values)
     if not directories:
         raise ValueError(f"Could not resolve an iRacing paint directory for {raw!r}.")
-    return TPTeamPaintTarget(
-        team_id=int(team_id),
+    return TPPaintCarTarget(
         raw_car=raw,
         directories=directories,
         mid=int(mid or 0),
         slug=slug,
         display_name=display_name,
     )
+
+
+def resolve_tp_team_paint_target(car_value: object, team_id: int, mapping_path: Path | None = None) -> TPTeamPaintTarget:
+    target = _resolve_tp_paint_car_target(car_value, mapping_path)
+    return TPTeamPaintTarget(
+        team_id=int(team_id),
+        raw_car=target.raw_car,
+        directories=target.directories,
+        mid=target.mid,
+        slug=target.slug,
+        display_name=target.display_name,
+    )
+
+
+def resolve_tp_member_paint_target(car_value: object, member_id: int, mapping_path: Path | None = None) -> TPMemberPaintTarget:
+    target_member_id = normalize_tp_member_id(member_id)
+    if target_member_id <= 0:
+        raise ValueError("Member ID must be greater than zero.")
+    target = _resolve_tp_paint_car_target(car_value, mapping_path)
+    return TPMemberPaintTarget(
+        member_id=int(target_member_id),
+        raw_car=target.raw_car,
+        directories=target.directories,
+        mid=target.mid,
+        slug=target.slug,
+        display_name=target.display_name,
+    )
+
+
+def tp_showroom_car_choice_labels(mapping_path: Path | None = None) -> list[str]:
+    try:
+        mapping_doc = _load_tp_showroom_mapping(mapping_path)
+    except Exception:
+        return []
+    cars_map = mapping_doc.get("cars") or {}
+    choices: list[tuple[str, str]] = []
+    seen: set[tuple[int, str]] = set()
+    for directory_key, raw_entry in cars_map.items():
+        if not isinstance(raw_entry, dict):
+            continue
+        status = str(raw_entry.get("status") or "mapped").strip().lower()
+        if status in {"unsupported", "disabled", "missing"}:
+            continue
+        mid = _to_int_or_none(raw_entry.get("mid")) or 0
+        name = str(raw_entry.get("tp_name") or raw_entry.get("iracing_name") or raw_entry.get("slug") or directory_key).strip()
+        if not name:
+            continue
+        key = (int(mid), _tp_normalized_vehicle_name(name))
+        if key in seen:
+            continue
+        seen.add(key)
+        label = f"{name} (TP ID {mid})" if mid > 0 else name
+        choices.append((_tp_normalized_vehicle_name(name), label))
+    return [label for _sort_key, label in sorted(choices, key=lambda item: (item[0], item[1].lower()))]
 
 
 def _tp_team_fetch_payloads(
@@ -6909,8 +6988,7 @@ def _tp_team_fetch_payloads(
     return payloads
 
 
-def _parse_tp_team_fetch_manifest(xml_text: str, target: TPTeamPaintTarget) -> list[DownloadFile]:
-    root = ET.fromstring(xml_text)
+def _parse_tp_team_fetch_manifest_root(root: ET.Element, target: TPTeamPaintTarget) -> list[DownloadFile]:
     directory_keys = {str(item or "").strip().lower() for item in target.directories if str(item or "").strip()}
     directory_keys.update(canonicalize_car_directory(item).lower() for item in target.directories if str(item or "").strip())
     files: list[DownloadFile] = []
@@ -6950,6 +7028,10 @@ def _parse_tp_team_fetch_manifest(xml_text: str, target: TPTeamPaintTarget) -> l
             )
         )
     return files
+
+
+def _parse_tp_team_fetch_manifest(xml_text: str, target: TPTeamPaintTarget) -> list[DownloadFile]:
+    return _parse_tp_team_fetch_manifest_root(ET.fromstring(xml_text), target)
 
 
 def _dedupe_tp_team_download_items(items: Iterable[DownloadFile]) -> list[DownloadFile]:
@@ -7133,6 +7215,453 @@ def download_tp_team_paints_to_folder(
         "downloaded": len(downloaded_files),
         "saved": len(saved_items),
         "target": target,
+        "destination": destination,
+        "saved_files": saved_paths,
+        "logs": logs,
+        "message": f"Saved {len(saved_items)} team paint file(s)." if ok else "Team assets were found, but none could be saved.",
+    }
+
+
+def _tp_manifest_target_directory_keys(directories: Iterable[object]) -> set[str]:
+    keys: set[str] = set()
+    for item in directories:
+        text = str(item or "").strip()
+        if not text:
+            continue
+        keys.add(text.lower())
+        keys.add(canonicalize_car_directory(text).lower())
+    return {key for key in keys if key}
+
+
+def _tp_member_manifest_items_for_target(
+    items: Iterable[DownloadFile],
+    target: TPMemberPaintTarget,
+    *,
+    include_accessories: bool = True,
+) -> list[DownloadFile]:
+    directory_keys = _tp_manifest_target_directory_keys(target.directories)
+    matched: list[DownloadFile] = []
+    for item in items:
+        download_id = item.download_id
+        if bool(download_id.is_team_paint):
+            continue
+        if _is_car_related_paint_type(download_id.paint_type):
+            directory = str(download_id.directory or "").strip()
+            if directory_keys and directory.lower() not in directory_keys and canonicalize_car_directory(directory).lower() not in directory_keys:
+                continue
+            matched.append(item)
+        elif include_accessories and download_id.paint_type in {PaintType.HELMET, PaintType.SUIT}:
+            matched.append(item)
+    return _dedupe_tp_team_download_items(matched)
+
+
+def _tp_member_all_manifest_items(items: Iterable[DownloadFile]) -> list[DownloadFile]:
+    allowed = {PaintType.CAR, PaintType.CAR_DECAL, PaintType.CAR_NUMBER, PaintType.CAR_SPEC, PaintType.HELMET, PaintType.SUIT}
+    return _dedupe_tp_team_download_items(
+        item
+        for item in items
+        if item.download_id.paint_type in allowed and not bool(item.download_id.is_team_paint)
+    )
+
+
+def _download_tp_manifest_items_to_folder(
+    *,
+    items: list[DownloadFile],
+    destination_dir: Path,
+    temp_dirname: str,
+    retries: int = 3,
+    retry_backoff_seconds: float = 1.5,
+    log: Callable[[str], None] | None = None,
+    cancel_event: threading.Event | None = None,
+) -> tuple[list[DownloadedFile], list[SavedFile], list[str]]:
+    logs: list[str] = []
+
+    def write(message: str) -> None:
+        logs.append(message)
+        if log:
+            log(message)
+
+    destination = Path(destination_dir)
+    destination.mkdir(parents=True, exist_ok=True)
+    temp_root = default_temp_dir() / temp_dirname
+    temp_session_id = SessionId(int(time.time() * 1000), None)
+    downloaded_files: list[DownloadedFile] = []
+    for index, item in enumerate(items, start=1):
+        if _cancel_requested(cancel_event):
+            break
+        downloaded = download_file(
+            temp_session_id,
+            temp_root,
+            item,
+            retries=max(1, int(retries)),
+            retry_backoff_seconds=retry_backoff_seconds,
+            ordinal=index,
+            total=len(items),
+            cancel_event=cancel_event,
+        )
+        if downloaded is None:
+            write(f"Asset unavailable or failed: {item.download_id.paint_type.value} {item.url}")
+            continue
+        downloaded_files.append(downloaded)
+    saved_items: list[SavedFile] = []
+    for downloaded in downloaded_files:
+        if _cancel_requested(cancel_event):
+            break
+        saved = move_or_extract(
+            downloaded,
+            destination,
+            retries=max(1, int(retries)),
+            retry_backoff_seconds=retry_backoff_seconds,
+            cancel_event=cancel_event,
+        )
+        if saved:
+            saved_items.extend(saved)
+    for item in saved_items:
+        write(f"Saved paint: {item.file_path}")
+    return downloaded_files, saved_items, logs
+
+
+def download_tp_member_paints_to_folder(
+    *,
+    member_id: int,
+    car_value: str,
+    destination_dir: Path,
+    mapping_path: Path | None = None,
+    include_accessories: bool = True,
+    retries: int = 3,
+    retry_backoff_seconds: float = 1.5,
+    log: Callable[[str], None] | None = None,
+    cancel_event: threading.Event | None = None,
+) -> dict[str, object]:
+    logs: list[str] = []
+
+    def write(message: str) -> None:
+        logs.append(message)
+        if log:
+            log(message)
+
+    target_member_id = normalize_tp_member_id(member_id)
+    if target_member_id <= 0:
+        raise ValueError("Member ID must be greater than zero.")
+    target = resolve_tp_member_paint_target(car_value, target_member_id, mapping_path=mapping_path)
+    write(
+        "Resolved member target: member_id={member_id}, car={car}, directories={dirs}.".format(
+            member_id=target_member_id,
+            car=target.display_name or target.raw_car,
+            dirs=", ".join(target.directories),
+        )
+    )
+    manifest_items = fetch_user_files(
+        target_member_id,
+        retries=max(1, int(retries)),
+        retry_backoff_seconds=retry_backoff_seconds,
+        cancel_event=cancel_event,
+    )
+    items = _tp_member_manifest_items_for_target(
+        manifest_items,
+        target,
+        include_accessories=include_accessories,
+    )
+    if not items:
+        return {
+            "ok": False,
+            "downloaded": 0,
+            "saved": 0,
+            "target": target,
+            "destination": Path(destination_dir),
+            "saved_files": [],
+            "logs": logs,
+            "message": "No member paint assets were returned for that Member ID and car directory.",
+        }
+    downloaded_files, saved_items, download_logs = _download_tp_manifest_items_to_folder(
+        items=items,
+        destination_dir=Path(destination_dir),
+        temp_dirname="MemberPaintDownloads",
+        retries=retries,
+        retry_backoff_seconds=retry_backoff_seconds,
+        log=write,
+        cancel_event=cancel_event,
+    )
+    logs.extend(line for line in download_logs if line not in logs)
+    saved_paths = [str(item.file_path) for item in saved_items]
+    ok = bool(saved_items)
+    return {
+        "ok": ok,
+        "downloaded": len(downloaded_files),
+        "saved": len(saved_items),
+        "target": target,
+        "destination": Path(destination_dir),
+        "saved_files": saved_paths,
+        "logs": logs,
+        "message": f"Saved {len(saved_items)} member paint file(s)." if ok else "Member assets were found, but none could be saved.",
+    }
+
+
+def download_tp_member_all_paints_to_folder(
+    *,
+    member_id: int,
+    destination_dir: Path,
+    retries: int = 3,
+    retry_backoff_seconds: float = 1.5,
+    log: Callable[[str], None] | None = None,
+    cancel_event: threading.Event | None = None,
+) -> dict[str, object]:
+    logs: list[str] = []
+
+    def write(message: str) -> None:
+        logs.append(message)
+        if log:
+            log(message)
+
+    target_member_id = normalize_tp_member_id(member_id)
+    if target_member_id <= 0:
+        raise ValueError("Member ID must be greater than zero.")
+    destination = Path(destination_dir)
+    destination.mkdir(parents=True, exist_ok=True)
+    write(f"Fetching all public Trading Paints manifest assets for member {target_member_id}.")
+    manifest_items = fetch_user_files(
+        target_member_id,
+        retries=max(1, int(retries)),
+        retry_backoff_seconds=retry_backoff_seconds,
+        cancel_event=cancel_event,
+    )
+    items = _tp_member_all_manifest_items(manifest_items)
+    if not items:
+        return {
+            "ok": False,
+            "downloaded": 0,
+            "saved": 0,
+            "destination": destination,
+            "saved_files": [],
+            "logs": logs,
+            "message": "No public member paint assets were returned for that Member ID.",
+        }
+    downloaded_files, saved_items, download_logs = _download_tp_manifest_items_to_folder(
+        items=items,
+        destination_dir=destination,
+        temp_dirname="MemberPaintDownloads",
+        retries=retries,
+        retry_backoff_seconds=retry_backoff_seconds,
+        log=write,
+        cancel_event=cancel_event,
+    )
+    logs.extend(line for line in download_logs if line not in logs)
+    saved_paths = [str(item.file_path) for item in saved_items]
+    ok = bool(saved_items)
+    return {
+        "ok": ok,
+        "downloaded": len(downloaded_files),
+        "saved": len(saved_items),
+        "destination": destination,
+        "saved_files": saved_paths,
+        "logs": logs,
+        "message": f"Saved {len(saved_items)} member paint file(s)." if ok else "Member assets were found, but none could be saved.",
+    }
+
+
+def iter_tp_team_paint_targets(team_id: int, mapping_path: Path | None = None) -> list[TPTeamPaintTarget]:
+    target_team_id = int(team_id)
+    if target_team_id <= 0:
+        raise ValueError("Team ID must be greater than zero.")
+    mapping_doc = _load_tp_showroom_mapping(mapping_path)
+    cars_map = mapping_doc.get("cars") or {}
+    seeds: list[tuple[str, int, str]] = []
+    seen: set[tuple[str, object]] = set()
+    for directory_key, raw_entry in cars_map.items():
+        if not isinstance(raw_entry, dict):
+            continue
+        status = str(raw_entry.get("status") or "mapped").strip().lower()
+        if status in {"unsupported", "disabled", "missing"}:
+            continue
+        mid = _to_int_or_none(raw_entry.get("mid")) or 0
+        display_name = str(raw_entry.get("tp_name") or raw_entry.get("iracing_name") or raw_entry.get("slug") or directory_key).strip()
+        key: tuple[str, object] = ("mid", int(mid)) if mid > 0 else ("directory", str(directory_key).strip().lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        seed_value = str(mid) if mid > 0 else str(directory_key)
+        seeds.append((display_name.lower(), mid, seed_value))
+    targets: list[TPTeamPaintTarget] = []
+    for _name, _mid, seed_value in sorted(seeds):
+        try:
+            targets.append(resolve_tp_team_paint_target(seed_value, target_team_id, mapping_path=mapping_path))
+        except Exception:
+            logging.debug("Skipping team all-paints target seed %s", seed_value, exc_info=True)
+    return targets
+
+
+def _tp_team_bulk_fetch_rows(targets: Iterable[TPTeamPaintTarget]) -> list[tuple[TPTeamPaintTarget, str]]:
+    rows: list[tuple[TPTeamPaintTarget, str]] = []
+    seen: set[tuple[int, str]] = set()
+    for target in targets:
+        for directory in target.directories:
+            safe_directory = str(directory or "").strip()
+            if not safe_directory:
+                continue
+            key = (int(target.team_id), safe_directory.lower())
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append((target, safe_directory))
+    return rows
+
+
+def _tp_team_bulk_payload(team_id: int, rows: list[tuple[TPTeamPaintTarget, str]]) -> dict[str, str]:
+    target_team_id = int(team_id)
+    return {
+        "team": "1",
+        "user": str(target_team_id),
+        "night": "10:00 am",
+        "series": "0",
+        "league": "0",
+        "numbers": "False",
+        "list": ",".join(f"{target_team_id}={directory}={target_team_id}=0=" for _target, directory in rows),
+    }
+
+
+def _chunk_tp_team_rows(rows: list[tuple[TPTeamPaintTarget, str]], size: int = 24) -> Iterable[list[tuple[TPTeamPaintTarget, str]]]:
+    batch_size = max(1, int(size or 24))
+    for index in range(0, len(rows), batch_size):
+        yield rows[index:index + batch_size]
+
+
+def fetch_tp_team_all_paint_files(
+    team_id: int,
+    *,
+    mapping_path: Path | None = None,
+    retries: int = 2,
+    retry_backoff_seconds: float = 1.5,
+    log: Callable[[str], None] | None = None,
+    cancel_event: threading.Event | None = None,
+) -> tuple[list[DownloadFile], list[str]]:
+    logs: list[str] = []
+
+    def write(message: str) -> None:
+        logs.append(message)
+        if log:
+            log(message)
+
+    target_team_id = int(team_id)
+    targets = iter_tp_team_paint_targets(target_team_id, mapping_path=mapping_path)
+    rows = _tp_team_bulk_fetch_rows(targets)
+    batches = list(_chunk_tp_team_rows(rows))
+    found: list[DownloadFile] = []
+    attempts = 0
+    accessory_logged = False
+    write(f"Team all-paints scan started for Team ID {target_team_id}: checking {len(targets)} mapped Trading Paints car(s) in {len(batches)} manifest batch(es).")
+    checked_rows = 0
+    for batch_index, batch_rows in enumerate(batches, start=1):
+        if _cancel_requested(cancel_event):
+            break
+        if batch_index > 1 and (batch_index - 1) % 5 == 0:
+            write(f"Team all-paints scan progress: checked {checked_rows}/{len(rows)} car directory entries, found {len(_dedupe_tp_team_download_items(found))} unique asset(s).")
+        batch_targets: list[TPTeamPaintTarget] = []
+        seen_targets: set[TPTeamPaintTarget] = set()
+        for target, _directory in batch_rows:
+            if target in seen_targets:
+                continue
+            seen_targets.add(target)
+            batch_targets.append(target)
+        payload = _tp_team_bulk_payload(target_team_id, batch_rows)
+        batch_items: list[DownloadFile] = []
+        for endpoint in TRADING_PAINTS_FETCH_CONTEXT_URLS:
+            attempts += 1
+            for attempt in range(1, max(1, int(retries)) + 1):
+                if _cancel_requested(cancel_event):
+                    break
+                try:
+                    http = get_thread_http_session()
+                    resp = http.post(endpoint, data=payload, timeout=25)
+                    resp.raise_for_status()
+                    root = ET.fromstring(resp.text)
+                    for target in batch_targets:
+                        batch_items.extend(_parse_tp_team_fetch_manifest_root(root, target))
+                    break
+                except (requests.RequestException, ET.ParseError) as exc:
+                    if attempt >= max(1, int(retries)):
+                        logging.debug("Team all-paints manifest batch failed via %s; batch=%s; error=%s", endpoint, batch_index, exc)
+                        break
+                    delay = compute_retry_delay(retry_backoff_seconds, attempt)
+                    if cancel_event is not None:
+                        cancel_event.wait(delay)
+                    else:
+                        time.sleep(delay)
+            if batch_items:
+                break
+        checked_rows += len(batch_rows)
+        if batch_items:
+            deduped_batch_items = _dedupe_tp_team_download_items(batch_items)
+            found.extend(deduped_batch_items)
+            car_items = [item for item in deduped_batch_items if _is_car_related_paint_type(item.download_id.paint_type)]
+            if car_items:
+                car_dirs = sorted({item.download_id.directory for item in car_items})
+                write(f"Team all-paints matched {len(car_items)} car file(s) in batch {batch_index}: {', '.join(car_dirs[:8])}{'...' if len(car_dirs) > 8 else ''}.")
+            accessories = [item for item in deduped_batch_items if item.download_id.paint_type in {PaintType.HELMET, PaintType.SUIT}]
+            if accessories and not accessory_logged:
+                accessory_logged = True
+                write(f"Team all-paints matched {len(accessories)} team accessory file(s).")
+    deduped = _dedupe_tp_team_download_items(found)
+    write(f"Team all-paints scan completed: {len(deduped)} unique team asset(s) after {attempts} payload attempt(s).")
+    return deduped, logs
+
+
+def download_tp_team_all_paints_to_folder(
+    *,
+    team_id: int,
+    destination_dir: Path,
+    mapping_path: Path | None = None,
+    retries: int = 2,
+    retry_backoff_seconds: float = 1.5,
+    log: Callable[[str], None] | None = None,
+    cancel_event: threading.Event | None = None,
+) -> dict[str, object]:
+    logs: list[str] = []
+
+    def write(message: str) -> None:
+        logs.append(message)
+        if log:
+            log(message)
+
+    target_team_id = int(team_id)
+    if target_team_id <= 0:
+        raise ValueError("Team ID must be greater than zero.")
+    destination = Path(destination_dir)
+    destination.mkdir(parents=True, exist_ok=True)
+    items, fetch_logs = fetch_tp_team_all_paint_files(
+        target_team_id,
+        mapping_path=mapping_path,
+        retries=max(1, int(retries)),
+        retry_backoff_seconds=retry_backoff_seconds,
+        log=write,
+        cancel_event=cancel_event,
+    )
+    logs.extend(line for line in fetch_logs if line not in logs)
+    if not items:
+        return {
+            "ok": False,
+            "downloaded": 0,
+            "saved": 0,
+            "destination": destination,
+            "saved_files": [],
+            "logs": logs,
+            "message": "No team assets were returned for that Team ID across the mapped cars.",
+        }
+    downloaded_files, saved_items, download_logs = _download_tp_manifest_items_to_folder(
+        items=items,
+        destination_dir=destination,
+        temp_dirname="TeamPaintDownloads",
+        retries=retries,
+        retry_backoff_seconds=retry_backoff_seconds,
+        log=write,
+        cancel_event=cancel_event,
+    )
+    logs.extend(line for line in download_logs if line not in logs)
+    saved_paths = [str(item.file_path) for item in saved_items]
+    ok = bool(saved_items)
+    return {
+        "ok": ok,
+        "downloaded": len(downloaded_files),
+        "saved": len(saved_items),
         "destination": destination,
         "saved_files": saved_paths,
         "logs": logs,
@@ -18379,6 +18908,10 @@ class DownloaderUI:
         self.showroom_download_pages_var = tk.IntVar(value=TP_SHOWROOM_MAX_PAGES)
         self.showroom_download_status_var = tk.StringVar(value="Enter a Trading Paints car ID to download public non-PRO paints into the RandomPool.")
         self.showroom_download_custom_folder_var = tk.StringVar(value="Custom folder: not selected.")
+        self.showroom_car_choices = tp_showroom_car_choice_labels(default_tp_showroom_mapping_path())
+        self.showroom_member_id_var = tk.StringVar(value="")
+        self.showroom_member_car_var = tk.StringVar(value="")
+        self.showroom_member_status_var = tk.StringVar(value="Enter a Member ID and car to download that member's car, helmet, and suit paints.")
         self.showroom_team_id_var = tk.StringVar(value="")
         self.showroom_team_car_var = tk.StringVar(value="")
         self.showroom_team_status_var = tk.StringVar(value="Enter a Team ID and car to download team paints into the iRacing paint folder.")
@@ -18966,7 +19499,7 @@ class DownloaderUI:
         showroom_download_box.columnconfigure(0, weight=1)
         ttk.Label(
             showroom_download_box,
-            text="Choose one source mode at a time. Public showroom sources go to the standard RandomPool unless you use the one-time custom folder button. Team paints install into the iRacing paint folder by default.",
+            text="Choose one source mode at a time. Public showroom sources go to the standard RandomPool unless you use the one-time custom folder button. Member and Team paints install into the iRacing paint folder by default.",
             foreground="#0b63b6",
             justify="left",
             wraplength=920,
@@ -18977,12 +19510,14 @@ class DownloaderUI:
         car_id_tab = ttk.Frame(showroom_mode_tabs, padding=8)
         links_tab = ttk.Frame(showroom_mode_tabs, padding=8)
         collection_tab = ttk.Frame(showroom_mode_tabs, padding=8)
+        members_tab = ttk.Frame(showroom_mode_tabs, padding=8)
         teams_tab = ttk.Frame(showroom_mode_tabs, padding=8)
-        for tab in (car_id_tab, links_tab, collection_tab, teams_tab):
+        for tab in (car_id_tab, links_tab, collection_tab, members_tab, teams_tab):
             tab.columnconfigure(1, weight=1)
         showroom_mode_tabs.add(car_id_tab, text="Car ID")
         showroom_mode_tabs.add(links_tab, text="Showroom links")
         showroom_mode_tabs.add(collection_tab, text="Collection")
+        showroom_mode_tabs.add(members_tab, text="Member ID")
         showroom_mode_tabs.add(teams_tab, text="Teams")
 
         ttk.Label(car_id_tab, text="Download random public paints for one TP car ID. Category is inferred internally; slug is optional.").grid(row=0, column=0, columnspan=4, sticky="w")
@@ -19018,15 +19553,28 @@ class DownloaderUI:
         ttk.Button(collection_actions, text="Download collection to RandomPool", command=self.download_showroom_collection_now).pack(side="left")
         ttk.Button(collection_actions, text="Download collection to custom folder", command=lambda: self.download_showroom_collection_now(custom_folder=True)).pack(side="left", padx=(8, 0))
 
+        ttk.Label(members_tab, text="Download a member's Trading Paints assets by Member ID and car. The car field can be typed or selected from the Trading Paints car list.").grid(row=0, column=0, columnspan=4, sticky="w")
+        ttk.Label(members_tab, text="Member ID").grid(row=1, column=0, sticky="w", pady=(10, 0))
+        ttk.Entry(members_tab, textvariable=self.showroom_member_id_var, width=16).grid(row=1, column=1, sticky="w", pady=(10, 0))
+        ttk.Label(members_tab, text="Car").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        ttk.Combobox(members_tab, textvariable=self.showroom_member_car_var, values=self.showroom_car_choices, width=56).grid(row=2, column=1, columnspan=3, sticky="ew", pady=(8, 0))
+        member_actions = ttk.Frame(members_tab)
+        member_actions.grid(row=3, column=0, columnspan=4, sticky="w", pady=(10, 0))
+        ttk.Button(member_actions, text="Download car to iRacing paints", command=self.download_showroom_member_now).pack(side="left")
+        ttk.Button(member_actions, text="Download car to custom folder", command=lambda: self.download_showroom_member_now(custom_folder=True)).pack(side="left", padx=(8, 0))
+        ttk.Button(member_actions, text="Download all to member folder...", command=self.download_showroom_member_all_now).pack(side="left", padx=(8, 0))
+        ttk.Label(members_tab, textvariable=self.showroom_member_status_var, justify="left", foreground="#555555", wraplength=880).grid(row=4, column=0, columnspan=4, sticky="w", pady=(10, 0))
+
         ttk.Label(teams_tab, text="Download a team's Trading Paints assets by Team ID and car. This uses the session-aware team manifest and saves car, helmet, and suit files when they exist.").grid(row=0, column=0, columnspan=4, sticky="w")
         ttk.Label(teams_tab, text="Team ID").grid(row=1, column=0, sticky="w", pady=(10, 0))
         ttk.Entry(teams_tab, textvariable=self.showroom_team_id_var, width=16).grid(row=1, column=1, sticky="w", pady=(10, 0))
-        ttk.Label(teams_tab, text="Car ID, URL, name, or directory").grid(row=2, column=0, sticky="w", pady=(8, 0))
-        ttk.Entry(teams_tab, textvariable=self.showroom_team_car_var, width=56).grid(row=2, column=1, columnspan=3, sticky="ew", pady=(8, 0))
+        ttk.Label(teams_tab, text="Car").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        ttk.Combobox(teams_tab, textvariable=self.showroom_team_car_var, values=self.showroom_car_choices, width=56).grid(row=2, column=1, columnspan=3, sticky="ew", pady=(8, 0))
         team_actions = ttk.Frame(teams_tab)
         team_actions.grid(row=3, column=0, columnspan=4, sticky="w", pady=(10, 0))
         ttk.Button(team_actions, text="Download to iRacing paints", command=self.download_showroom_team_now).pack(side="left")
         ttk.Button(team_actions, text="Download to custom folder", command=lambda: self.download_showroom_team_now(custom_folder=True)).pack(side="left", padx=(8, 0))
+        ttk.Button(team_actions, text="Download all to team folder...", command=self.download_showroom_team_all_now).pack(side="left", padx=(8, 0))
         ttk.Label(teams_tab, textvariable=self.showroom_team_status_var, justify="left", foreground="#555555", wraplength=880).grid(row=4, column=0, columnspan=4, sticky="w", pady=(10, 0))
 
         ttk.Label(showroom_download_box, text=f"Default destination: {default_random_pool_dir()}", foreground="#555555", justify="left", wraplength=920).grid(row=2, column=0, sticky="w", pady=(10, 0))
@@ -22481,6 +23029,17 @@ class DownloaderUI:
         destination = Path(selected)
         return destination, f"custom folder {destination}"
 
+    def _showroom_group_download_destination(self, folder_name: str) -> tuple[Path, str] | None:
+        selected = str(getattr(self, "_showroom_download_custom_folder_path", "") or "").strip()
+        if not selected:
+            selected = self.choose_showroom_custom_folder()
+        if not selected:
+            self._append_log("Grouped showroom download cancelled before a folder was selected.")
+            return None
+        safe_folder = sanitize_paint_directory(folder_name, fallback="showroom_download")
+        destination = Path(selected) / safe_folder
+        return destination, f"group folder {destination}"
+
     def _parse_showroom_team_positive_int(self, value: object, label: str, *, required: bool = False) -> int | None:
         text = str(value or "").strip()
         if not text:
@@ -22744,6 +23303,127 @@ class DownloaderUI:
 
         threading.Thread(target=_worker, name="NishizumiShowroomCollectionDownload", daemon=True).start()
 
+    def download_showroom_member_now(self, custom_folder: bool = False) -> None:
+        if getattr(self, "_showroom_pool_download_in_progress", False):
+            self._append_log("Showroom download is already running.")
+            return
+        member_id = self._parse_showroom_team_positive_int(self.showroom_member_id_var.get(), "Member ID", required=True)
+        if member_id is None:
+            return
+        car_value = str(self.showroom_member_car_var.get() or "").strip()
+        if not car_value:
+            try:
+                self.messagebox.showerror(APP_NAME, "Choose or enter a TP car ID, dashboard URL, car name, or iRacing car directory.", parent=self.root)
+            except Exception:
+                pass
+            return
+        destination_info = self._showroom_team_download_destination(custom_folder)
+        if destination_info is None:
+            return
+        destination, destination_label = destination_info
+        self._showroom_pool_download_in_progress = True
+        self.showroom_member_status_var.set(f"Downloading member {member_id} paints for {car_value} to {destination_label}...")
+        self._append_log(f"Manual Trading Paints member download started: member_id={member_id}, car={car_value}, destination={destination}.")
+
+        def ui_log(message: str) -> None:
+            self.root.after(0, lambda msg=message: self._append_log(msg))
+
+        def _worker() -> None:
+            result: dict[str, object] | None = None
+            error = ""
+            try:
+                result = download_tp_member_paints_to_folder(
+                    member_id=int(member_id),
+                    car_value=car_value,
+                    destination_dir=destination,
+                    mapping_path=default_tp_showroom_mapping_path(),
+                    retries=max(1, int(getattr(self.config, "download_retries", 3) or 3)),
+                    retry_backoff_seconds=float(getattr(self.config, "retry_backoff_seconds", 1.5) or 1.5),
+                    log=ui_log,
+                )
+            except Exception as exc:
+                logging.debug("Manual Trading Paints member download failed", exc_info=True)
+                error = str(exc) or exc.__class__.__name__
+
+            def _finish() -> None:
+                self._showroom_pool_download_in_progress = False
+                if error:
+                    self.showroom_member_status_var.set(f"Member paint download failed: {error}")
+                    self._append_log(f"Manual Trading Paints member download failed: {error}")
+                    try:
+                        self.messagebox.showerror(APP_NAME, f"Member paint download failed.\n\n{error}", parent=self.root)
+                    except Exception:
+                        pass
+                    return
+                assert result is not None
+                saved = int(result.get("saved") or 0)
+                downloaded = int(result.get("downloaded") or 0)
+                message = str(result.get("message") or "").strip()
+                if saved > 0:
+                    self.showroom_member_status_var.set(f"Done: saved {saved} member paint file(s), downloaded {downloaded} asset(s), to {destination_label}.")
+                else:
+                    self.showroom_member_status_var.set(message or "No member paint files were saved for that Member ID and car.")
+
+            self.root.after(0, _finish)
+
+        threading.Thread(target=_worker, name="NishizumiShowroomMemberDownload", daemon=True).start()
+
+    def download_showroom_member_all_now(self) -> None:
+        if getattr(self, "_showroom_pool_download_in_progress", False):
+            self._append_log("Showroom download is already running.")
+            return
+        member_id = self._parse_showroom_team_positive_int(self.showroom_member_id_var.get(), "Member ID", required=True)
+        if member_id is None:
+            return
+        destination_info = self._showroom_group_download_destination(str(member_id))
+        if destination_info is None:
+            return
+        destination, destination_label = destination_info
+        self._showroom_pool_download_in_progress = True
+        self.showroom_member_status_var.set(f"Downloading all public member {member_id} paints to {destination_label}...")
+        self._append_log(f"Manual Trading Paints member all-paints download started: member_id={member_id}, destination={destination}.")
+
+        def ui_log(message: str) -> None:
+            self.root.after(0, lambda msg=message: self._append_log(msg))
+
+        def _worker() -> None:
+            result: dict[str, object] | None = None
+            error = ""
+            try:
+                result = download_tp_member_all_paints_to_folder(
+                    member_id=int(member_id),
+                    destination_dir=destination,
+                    retries=max(1, int(getattr(self.config, "download_retries", 3) or 3)),
+                    retry_backoff_seconds=float(getattr(self.config, "retry_backoff_seconds", 1.5) or 1.5),
+                    log=ui_log,
+                )
+            except Exception as exc:
+                logging.debug("Manual Trading Paints member all-paints download failed", exc_info=True)
+                error = str(exc) or exc.__class__.__name__
+
+            def _finish() -> None:
+                self._showroom_pool_download_in_progress = False
+                if error:
+                    self.showroom_member_status_var.set(f"Member all-paints download failed: {error}")
+                    self._append_log(f"Manual Trading Paints member all-paints download failed: {error}")
+                    try:
+                        self.messagebox.showerror(APP_NAME, f"Member all-paints download failed.\n\n{error}", parent=self.root)
+                    except Exception:
+                        pass
+                    return
+                assert result is not None
+                saved = int(result.get("saved") or 0)
+                downloaded = int(result.get("downloaded") or 0)
+                message = str(result.get("message") or "").strip()
+                if saved > 0:
+                    self.showroom_member_status_var.set(f"Done: saved {saved} member paint file(s), downloaded {downloaded} asset(s), to {destination_label}.")
+                else:
+                    self.showroom_member_status_var.set(message or "No public member paints were saved for that Member ID.")
+
+            self.root.after(0, _finish)
+
+        threading.Thread(target=_worker, name="NishizumiShowroomMemberAllDownload", daemon=True).start()
+
     def download_showroom_team_now(self, custom_folder: bool = False) -> None:
         if getattr(self, "_showroom_pool_download_in_progress", False):
             self._append_log("Showroom download is already running.")
@@ -22818,6 +23498,63 @@ class DownloaderUI:
             self.root.after(0, _finish)
 
         threading.Thread(target=_worker, name="NishizumiShowroomTeamDownload", daemon=True).start()
+
+    def download_showroom_team_all_now(self) -> None:
+        if getattr(self, "_showroom_pool_download_in_progress", False):
+            self._append_log("Showroom download is already running.")
+            return
+        team_id = self._parse_showroom_team_positive_int(self.showroom_team_id_var.get(), "Team ID", required=True)
+        if team_id is None:
+            return
+        destination_info = self._showroom_group_download_destination(f"team_{team_id}")
+        if destination_info is None:
+            return
+        destination, destination_label = destination_info
+        self._showroom_pool_download_in_progress = True
+        self.showroom_team_status_var.set(f"Downloading all team {team_id} paints to {destination_label}...")
+        self._append_log(f"Manual Trading Paints team all-paints download started: team_id={team_id}, destination={destination}.")
+
+        def ui_log(message: str) -> None:
+            self.root.after(0, lambda msg=message: self._append_log(msg))
+
+        def _worker() -> None:
+            result: dict[str, object] | None = None
+            error = ""
+            try:
+                result = download_tp_team_all_paints_to_folder(
+                    team_id=int(team_id),
+                    destination_dir=destination,
+                    mapping_path=default_tp_showroom_mapping_path(),
+                    retries=max(1, int(getattr(self.config, "download_retries", 3) or 3)),
+                    retry_backoff_seconds=float(getattr(self.config, "retry_backoff_seconds", 1.5) or 1.5),
+                    log=ui_log,
+                )
+            except Exception as exc:
+                logging.debug("Manual Trading Paints team all-paints download failed", exc_info=True)
+                error = str(exc) or exc.__class__.__name__
+
+            def _finish() -> None:
+                self._showroom_pool_download_in_progress = False
+                if error:
+                    self.showroom_team_status_var.set(f"Team all-paints download failed: {error}")
+                    self._append_log(f"Manual Trading Paints team all-paints download failed: {error}")
+                    try:
+                        self.messagebox.showerror(APP_NAME, f"Team all-paints download failed.\n\n{error}", parent=self.root)
+                    except Exception:
+                        pass
+                    return
+                assert result is not None
+                saved = int(result.get("saved") or 0)
+                downloaded = int(result.get("downloaded") or 0)
+                message = str(result.get("message") or "").strip()
+                if saved > 0:
+                    self.showroom_team_status_var.set(f"Done: saved {saved} team paint file(s), downloaded {downloaded} asset(s), to {destination_label}.")
+                else:
+                    self.showroom_team_status_var.set(message or "No team paint files were saved for that Team ID.")
+
+            self.root.after(0, _finish)
+
+        threading.Thread(target=_worker, name="NishizumiShowroomTeamAllDownload", daemon=True).start()
 
     def open_tp_auth_profile(self) -> None:
         self._append_log("This no-browser copy does not create or use a Trading Paints browser profile.")

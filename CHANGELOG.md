@@ -2,6 +2,15 @@
 
 All notable user-facing changes to Nishizumi Paints are documented here.
 
+## [6.4] - 2026-04-29
+
+### Added
+
+- Added **Showroom > Member ID** for downloading a member's car, helmet, and suit paints by Member ID and selected car.
+- Added one-click all-paints downloads for Member ID targets, saving all returned cars plus helmet and suit into an organized member folder.
+- Added one-click all-paints downloads for Teams, scanning mapped Trading Paints cars in manifest batches and saving found cars plus helmet and suit into an organized team folder.
+- Added editable car dropdowns for Member ID and Teams so users can pick a Trading Paints car from the bundled mapping instead of typing IDs or directories.
+
 ## [6.3.3] - 2026-04-29
 
 ### Changed

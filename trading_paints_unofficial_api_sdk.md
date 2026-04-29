@@ -5,15 +5,16 @@
 
 ## 1. Scope
 
-The current Nishizumi Paints 6.2.0 codebase talks to Trading Paints in five practical ways:
+The current Nishizumi Paints 6.4 codebase talks to Trading Paints in six practical ways:
 
 1. session-aware manifest lookups for real live-session paints
 2. single-user manifest fallback lookups
 3. public showroom JSON and direct asset downloads for cars, helmets, and suits
 4. collection and AI-roster metadata lookups
 5. manual team paint manifest lookups by Team ID and car directory
+6. manual member paint manifest lookups by Member ID, including all-paints folder exports
 
-The public showroom path is now the main no-browser fallback flow. Legacy authenticated showroom endpoints still exist in the script for compatibility and historical logic, but they are no longer the primary 6.2.0 path.
+The public showroom path is now the main no-browser fallback flow. Legacy authenticated showroom endpoints still exist in the script for compatibility and historical logic, but they are no longer the primary 6.4 path.
 
 ## 2. Endpoint catalog
 
@@ -43,6 +44,7 @@ Purpose:
 
 - resolve team-owned car, helmet, and suit assets for a known Team ID and car directory without using a browser login
 - filter the XML response to `<teamid>{team_id}</teamid>` before accepting files
+- batch all-team exports by sending comma-separated `list` entries, then filtering the returned XML per mapped car directory
 
 ### 2.2 Single-user manifest fallback
 
@@ -57,6 +59,7 @@ Purpose:
 
 - resolve paint files for one member without full session context
 - the `ts` variant is used as an uncached poll when the app needs to observe a fresh manifest
+- power manual **Showroom > Member ID** downloads for one selected car or every returned car, helmet, and suit for that member
 
 ### 2.3 Public showroom JSON
 
@@ -179,6 +182,14 @@ list=0=amvantageevogt3=404314=0=
 ```
 
 The app also tries conservative variants that include an optional requesting member ID, optional driver member ID, and the resolved Trading Paints car ID when known. A response is accepted only when the XML node has the requested `teamid`. For car, decal, number, and spec files, the XML `directory` must also match the resolved iRacing car directory. Helmet and suit nodes are allowed through by Team ID because their directories are `helmets` and `suits`.
+
+For all-team exports, multiple car requests are sent in one payload by comma-separating the `list` entries:
+
+```text
+list=404314=acuraarx06gtp=404314=0=,404314=amvantageevogt3=404314=0=
+```
+
+The app still filters every returned XML node by Team ID and by mapped car directory before saving files.
 
 ## 4. Manifest XML shape
 
