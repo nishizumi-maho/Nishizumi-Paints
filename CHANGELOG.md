@@ -2,6 +2,22 @@
 
 All notable user-facing changes to Nishizumi Paints are documented here.
 
+## [6.3.0] - 2026-04-29
+
+### Added
+
+- Added Advanced mode controls for choosing which public Trading Paints showroom sources random fallback can use:
+  - Trending
+  - Newest
+  - Most favorited
+  - Most raced (ever)
+- Multiple selected showroom sources are mixed randomly per fallback attempt.
+
+### Changed
+
+- Random showroom fallback still defaults to **Trending** for existing and new users.
+- Public showroom logs now include the source used for each random fallback paint.
+
 ## [6.2.0] - 2026-04-25
 
 ### Added

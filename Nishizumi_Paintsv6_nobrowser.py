@@ -43,13 +43,28 @@ from requests.adapters import HTTPAdapter
 # Browserless copy: Trading Paints browser automation is intentionally disabled.
 sync_playwright = None
 APP_NAME = "Nishizumi Paints"
-APP_VERSION = "6.2.0"
+APP_VERSION = "6.3.0"
 APP_REGISTRY_NAME = "NishizumiPaints"
 APP_CONFIG_DIRNAME = "NishizumiPaints"
 APP_TOOLTIP = f"{APP_NAME} {APP_VERSION}"
 APP_USER_AGENT = f"nishizumi-paints/{APP_VERSION}"
+TP_SHOWROOM_DEFAULT_SOURCE = "trending"
+TP_SHOWROOM_SOURCE_ORDER = ("trending", "newest", "favorited", "raced")
+TP_SHOWROOM_SOURCE_LABELS = {
+    "trending": "Trending",
+    "newest": "Newest",
+    "favorited": "Most favorited",
+    "raced": "Most raced (ever)",
+}
+TP_SHOWROOM_SOURCE_SORTS = {
+    "trending": "popular",
+    "newest": "date",
+    "favorited": "bookmarks",
+    "raced": "users",
+}
+TP_SHOWROOM_BASE_PARAMS = "search=&reuse=1&family=1&hasnumber=1&from=everyone&stampednums=1&official_only=0"
 DEFAULT_SHOWROOM_PARAMS = (
-    "sort=popular&ad=DESC&search=&reuse=1&family=1&hasnumber=1&from=everyone&stampednums=1&official_only=0"
+    f"sort={TP_SHOWROOM_SOURCE_SORTS[TP_SHOWROOM_DEFAULT_SOURCE]}&ad=DESC&{TP_SHOWROOM_BASE_PARAMS}"
 )
 TP_SHOWROOM_FETCH_PAGE_SIZE = 24
 TP_SHOWROOM_MAX_PAGES = 20
@@ -807,6 +822,84 @@ def normalize_ui_mode_preference(value: str | None) -> str:
     if mode in {"easy", "basic", "simple"} or mode.startswith("easy_") or mode.endswith("_easy"):
         return "easy"
     return "advanced"
+
+
+def normalize_tp_showroom_source(value: object) -> str:
+    token = re.sub(r"[^a-z0-9]+", "_", str(value or "").strip().lower()).strip("_")
+    aliases = {
+        "popular": "trending",
+        "trend": "trending",
+        "trending": "trending",
+        "date": "newest",
+        "new": "newest",
+        "newest": "newest",
+        "recent": "newest",
+        "bookmarks": "favorited",
+        "bookmark": "favorited",
+        "favorites": "favorited",
+        "favorite": "favorited",
+        "favourites": "favorited",
+        "favourite": "favorited",
+        "favorited": "favorited",
+        "most_favorited": "favorited",
+        "most_favourited": "favorited",
+        "users": "raced",
+        "user": "raced",
+        "races": "raced",
+        "race": "raced",
+        "raced": "raced",
+        "most_raced": "raced",
+        "most_raced_ever": "raced",
+    }
+    return aliases.get(token, TP_SHOWROOM_DEFAULT_SOURCE)
+
+
+def normalize_tp_showroom_sources(value: object) -> str:
+    if isinstance(value, (list, tuple, set)):
+        raw_items = list(value)
+    else:
+        text = str(value or "").strip()
+        normalized_text = re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")
+        if normalized_text in {"all", "mixed", "mix", "merge", "merged", "mesclar", "todos"}:
+            raw_items = list(TP_SHOWROOM_SOURCE_ORDER)
+        elif re.search(r"[,;|\n]", text):
+            raw_items = [part.strip() for part in re.split(r"[,;|\n]+", text) if part.strip()]
+        else:
+            raw_items = [text]
+    selected = {normalize_tp_showroom_source(item) for item in raw_items if str(item or "").strip()}
+    ordered = [source for source in TP_SHOWROOM_SOURCE_ORDER if source in selected]
+    if not ordered:
+        ordered = [TP_SHOWROOM_DEFAULT_SOURCE]
+    return ",".join(ordered)
+
+
+def tp_showroom_sources_list(value: object) -> list[str]:
+    return [item for item in normalize_tp_showroom_sources(value).split(",") if item]
+
+
+def tp_showroom_source_label(source: object) -> str:
+    return TP_SHOWROOM_SOURCE_LABELS.get(normalize_tp_showroom_source(source), TP_SHOWROOM_SOURCE_LABELS[TP_SHOWROOM_DEFAULT_SOURCE])
+
+
+def tp_showroom_sources_label(value: object) -> str:
+    return ", ".join(tp_showroom_source_label(source) for source in tp_showroom_sources_list(value))
+
+
+def choose_tp_showroom_source(value: object) -> str:
+    sources = tp_showroom_sources_list(value)
+    return random.choice(sources) if sources else TP_SHOWROOM_DEFAULT_SOURCE
+
+
+def tp_showroom_params_for_source(source: object) -> str:
+    source_key = normalize_tp_showroom_source(source)
+    sort_key = TP_SHOWROOM_SOURCE_SORTS.get(source_key, TP_SHOWROOM_SOURCE_SORTS[TP_SHOWROOM_DEFAULT_SOURCE])
+    return f"sort={sort_key}&ad=DESC&{TP_SHOWROOM_BASE_PARAMS}"
+
+
+def tp_showroom_filter_url_for_source(source: object) -> str:
+    source_key = normalize_tp_showroom_source(source)
+    sort_key = TP_SHOWROOM_SOURCE_SORTS.get(source_key, TP_SHOWROOM_SOURCE_SORTS[TP_SHOWROOM_DEFAULT_SOURCE])
+    return f"https://www.tradingpaints.com/showroom/filter/from=everyone,sort={sort_key},ad=DESC,pos=0"
 
 
 def is_shift_pressed_at_startup() -> bool:
@@ -4354,6 +4447,7 @@ def assign_driver_paint_override_from_showroom_public(
     scheme_id: str = "",
     source_link: str = "",
     source_label: str = "manual",
+    showroom_sources: object = TP_SHOWROOM_DEFAULT_SOURCE,
     retries: int = 3,
     retry_backoff_seconds: float = 1.5,
     cancel_event: threading.Event | None = None,
@@ -4373,6 +4467,7 @@ def assign_driver_paint_override_from_showroom_public(
         pages=TP_SHOWROOM_MAX_PAGES,
         prefer_official=False,
         choice_mode="random",
+        showroom_sources=showroom_sources,
         forced_scheme_id=forced_scheme_id,
         forced_scheme_title=forced_title,
         log=logging.info,
@@ -4409,7 +4504,8 @@ def assign_driver_paint_override_from_showroom_public(
         cache_saved_driver_paint_override(saved_items, entry)
         entry = remember_driver_paint_override(entry)
         title = str(result.chosen_title or "").strip()
-        logs.append(f"Public showroom driver override saved for {label} ({user.user_id}) car: scheme {chosen_scheme_id}{f' - {title}' if title else ''}.")
+        source_text = tp_showroom_source_label(result.showroom_source or showroom_sources)
+        logs.append(f"Public showroom driver override saved for {label} ({user.user_id}) car: scheme {chosen_scheme_id}{f' - {title}' if title else ''} [{source_text}].")
     elif not saved_items:
         logs.append(f"Public showroom selected car scheme {chosen_scheme_id or '(unknown)'} for {label}, but the asset was unavailable or no files were saved.")
     return saved_items, logs, entry
@@ -4427,6 +4523,7 @@ def assign_driver_paint_override_from_showroom(
     scheme_id: str = "",
     source_link: str = "",
     source_label: str = "manual",
+    showroom_sources: object = TP_SHOWROOM_DEFAULT_SOURCE,
     retries: int = 3,
     retry_backoff_seconds: float = 1.5,
     cancel_event: threading.Event | None = None,
@@ -4444,6 +4541,7 @@ def assign_driver_paint_override_from_showroom(
             scheme_id=scheme_id,
             source_link=source_link,
             source_label=source_label,
+            showroom_sources=showroom_sources,
             retries=retries,
             retry_backoff_seconds=retry_backoff_seconds,
             cancel_event=cancel_event,
@@ -4702,6 +4800,7 @@ class TPShowroomSyncResult:
     reused_recent_history: bool = False
     showroom_cars: list[dict] = field(default_factory=list)
     showroom_sampled_pages: list[int] = field(default_factory=list)
+    showroom_source: str = ""
     detected_total_pages: int = 0
     baseline_manifest_urls: dict[str, str] = field(default_factory=dict)
     original_scheme_link: str = ""
@@ -5471,10 +5570,12 @@ def _tp_fetch_showroom_page_batch_http(
     slug: str,
     page_index: int,
     timeout_seconds: float = 20.0,
+    showroom_source: str = TP_SHOWROOM_DEFAULT_SOURCE,
 ) -> list[dict]:
     start_url = f"https://www.tradingpaints.com/showroom/{category}/{mid}/{slug}"
     pos = max(0, int(page_index)) * TP_SHOWROOM_FETCH_PAGE_SIZE
-    showroom_url = f"https://www.tradingpaints.com/js/showroom.php?mid={mid}&{DEFAULT_SHOWROOM_PARAMS}&pos={pos}&ts={int(time.time()*1000)}"
+    showroom_params = tp_showroom_params_for_source(showroom_source)
+    showroom_url = f"https://www.tradingpaints.com/js/showroom.php?mid={mid}&{showroom_params}&pos={pos}&ts={int(time.time()*1000)}"
     headers = {
         "X-Requested-With": "XMLHttpRequest",
         "Accept": "application/json, text/javascript, */*; q=0.01",
@@ -5503,6 +5604,7 @@ def _detect_tp_showroom_total_pages_http(
     slug: str,
     max_pages: int = 50,
     timeout_seconds: float = 45.0,
+    showroom_source: str = TP_SHOWROOM_DEFAULT_SOURCE,
     log: Callable[[str], None] | None = None,
 ) -> int:
     page_limit = max(1, min(int(max_pages or 50), 50))
@@ -5525,6 +5627,7 @@ def _detect_tp_showroom_total_pages_http(
             slug=slug,
             page_index=idx,
             timeout_seconds=min(15.0, max(1.0, remaining)),
+            showroom_source=showroom_source,
         )
         exists = bool(batch)
         page_has_results[idx] = exists
@@ -5534,7 +5637,7 @@ def _detect_tp_showroom_total_pages_http(
         first_page_exists = _page_exists(0)
         if not first_page_exists:
             if log:
-                log(f"Trading Paints public showroom total pages detected for {category}/{mid}/{slug}: 0 page(s) in {time.monotonic() - started:.2f}s")
+                log(f"Trading Paints public showroom total pages detected for {category}/{mid}/{slug} [{tp_showroom_source_label(showroom_source)}]: 0 page(s) in {time.monotonic() - started:.2f}s")
             return 0
         probe = 1
         while probe < page_limit and _page_exists(probe):
@@ -5551,14 +5654,14 @@ def _detect_tp_showroom_total_pages_http(
                 high = mid_page - 1
         total_pages = last_good + 1
         if log:
-            log(f"Trading Paints public showroom total pages detected for {category}/{mid}/{slug}: {total_pages} page(s) in {time.monotonic() - started:.2f}s")
+            log(f"Trading Paints public showroom total pages detected for {category}/{mid}/{slug} [{tp_showroom_source_label(showroom_source)}]: {total_pages} page(s) in {time.monotonic() - started:.2f}s")
         return total_pages
     except TimeoutError:
         total_pages = (last_good + 1) if first_page_exists else 0
         if log:
             log(
                 f"Trading Paints public showroom total page detection hit the timeout for {category}/{mid}/{slug}; "
-                f"using {total_pages} confirmed page(s) after {time.monotonic() - started:.2f}s."
+                f"using {total_pages} confirmed page(s) from {tp_showroom_source_label(showroom_source)} after {time.monotonic() - started:.2f}s."
             )
         return total_pages
 
@@ -5568,6 +5671,7 @@ def _fetch_tp_showroom_pool_http(
     mid: int,
     category: str,
     slug: str,
+    showroom_source: str = TP_SHOWROOM_DEFAULT_SOURCE,
     existing_cars: list[dict] | None = None,
     sampled_pages: set[int] | None = None,
     min_unused_count: int = 1,
@@ -5622,6 +5726,7 @@ def _fetch_tp_showroom_pool_http(
             category=category,
             slug=slug,
             page_index=next_page,
+            showroom_source=showroom_source,
         )
         for car in batch:
             scheme_id = str(car.get("id") or "").strip()
@@ -5637,7 +5742,7 @@ def _fetch_tp_showroom_pool_http(
     if log and newly_sampled:
         sampled_human = ", ".join(str(page_idx + 1) for page_idx in sorted(sampled))
         log(
-            f"Trading Paints public showroom pool fetched for {category}/{mid}/{slug}: {len(cars)} unique scheme(s) across {len(sampled)} sampled page(s) [pages: {sampled_human}]"
+            f"Trading Paints public showroom pool fetched for {category}/{mid}/{slug} [{tp_showroom_source_label(showroom_source)}]: {len(cars)} unique scheme(s) across {len(sampled)} sampled page(s) [pages: {sampled_human}]"
         )
     return cars, sampled
 
@@ -5649,6 +5754,7 @@ def choose_showroom_paint_direct(
     pages: int = TP_SHOWROOM_MAX_PAGES,
     prefer_official: bool = False,
     choice_mode: str = "random",
+    showroom_sources: object = TP_SHOWROOM_DEFAULT_SOURCE,
     exclude_scheme_ids: set[str] | None = None,
     exclude_recent_scheme_ids: set[str] | None = None,
     showroom_cars: list[dict] | None = None,
@@ -5673,6 +5779,7 @@ def choose_showroom_paint_direct(
     category = str(entry.get("category") or "Road").strip() or "Road"
     slug = str(entry.get("slug") or f"car-{mid}").strip() or f"car-{mid}"
     page_limit = max(1, min(int(pages or TP_SHOWROOM_MAX_PAGES), 50))
+    showroom_source = choose_tp_showroom_source(showroom_sources)
     forced_id = str(forced_scheme_id or "").strip()
     if forced_id:
         title = str(forced_scheme_title or f"scheme {forced_id}").strip()
@@ -5689,6 +5796,7 @@ def choose_showroom_paint_direct(
                 category=category,
                 slug=slug,
                 max_pages=50,
+                showroom_source=showroom_source,
                 log=log,
             )
         if resolved_total_pages > 0:
@@ -5697,6 +5805,7 @@ def choose_showroom_paint_direct(
             mid=mid,
             category=category,
             slug=slug,
+            showroom_source=showroom_source,
             existing_cars=showroom_cars,
             sampled_pages=showroom_sampled_pages,
             min_unused_count=minimum_unused_choices,
@@ -5720,6 +5829,7 @@ def choose_showroom_paint_direct(
                 showroom_count=len(showroom_cars),
                 showroom_cars=showroom_cars,
                 showroom_sampled_pages=sorted(sampled_pages),
+                showroom_source=showroom_source,
                 message="No unused public showroom paints remain for this car in the sampled pages.",
             )
         try:
@@ -5731,11 +5841,11 @@ def choose_showroom_paint_direct(
                 exclude_recent_scheme_ids=exclude_recent_scheme_ids,
             )
         except Exception as exc:
-            return TPShowroomSyncResult(ok=False, showroom_count=len(showroom_cars), showroom_cars=showroom_cars, showroom_sampled_pages=sorted(sampled_pages), message=str(exc))
+            return TPShowroomSyncResult(ok=False, showroom_count=len(showroom_cars), showroom_cars=showroom_cars, showroom_sampled_pages=sorted(sampled_pages), showroom_source=showroom_source, message=str(exc))
     scheme_id = str(chosen.get("id") or "").strip()
     title = str(chosen.get("title") or chosen.get("name") or forced_scheme_title or "").strip()
     if not scheme_id:
-        return TPShowroomSyncResult(ok=False, showroom_count=len(showroom_cars), showroom_cars=showroom_cars, showroom_sampled_pages=sorted(sampled_pages), message="Trading Paints showroom returned a paint without an id.")
+        return TPShowroomSyncResult(ok=False, showroom_count=len(showroom_cars), showroom_cars=showroom_cars, showroom_sampled_pages=sorted(sampled_pages), showroom_source=showroom_source, message="Trading Paints showroom returned a paint without an id.")
     source_link = _tp_showroom_link_from_car(chosen)
     direct_items = _tp_build_public_showroom_car_direct_items(
         user_id=0,
@@ -5757,6 +5867,7 @@ def choose_showroom_paint_direct(
         reused_recent_history=bool(reused_recent_history),
         showroom_cars=showroom_cars,
         showroom_sampled_pages=sorted(sampled_pages),
+        showroom_source=showroom_source,
         detected_total_pages=page_limit,
     )
 
@@ -5767,6 +5878,7 @@ def choose_showroom_accessory_direct(
     pages: int = TP_SHOWROOM_MAX_PAGES,
     prefer_official: bool = False,
     choice_mode: str = "random",
+    showroom_sources: object = TP_SHOWROOM_DEFAULT_SOURCE,
     exclude_scheme_ids: set[str] | None = None,
     exclude_recent_scheme_ids: set[str] | None = None,
     showroom_cars: list[dict] | None = None,
@@ -5789,6 +5901,7 @@ def choose_showroom_accessory_direct(
     category = "Driver"
     slug = "Helmets" if normalized_kind == "helmet" else "Suits"
     page_limit = max(1, min(int(pages or TP_SHOWROOM_MAX_PAGES), 50))
+    showroom_source = choose_tp_showroom_source(showroom_sources)
     forced_id = str(forced_scheme_id or "").strip()
     if forced_id:
         title = str(forced_scheme_title or f"scheme {forced_id}").strip()
@@ -5805,6 +5918,7 @@ def choose_showroom_accessory_direct(
                 category=category,
                 slug=slug,
                 max_pages=50,
+                showroom_source=showroom_source,
                 log=log,
             )
         if resolved_total_pages > 0:
@@ -5813,6 +5927,7 @@ def choose_showroom_accessory_direct(
             mid=mid,
             category=category,
             slug=slug,
+            showroom_source=showroom_source,
             existing_cars=showroom_cars,
             sampled_pages=showroom_sampled_pages,
             min_unused_count=minimum_unused_choices,
@@ -5836,6 +5951,7 @@ def choose_showroom_accessory_direct(
                 showroom_count=len(showroom_cars),
                 showroom_cars=showroom_cars,
                 showroom_sampled_pages=sorted(sampled_pages),
+                showroom_source=showroom_source,
                 message=f"No unused public showroom {normalized_kind} paints remain in the sampled pages.",
             )
         try:
@@ -5847,11 +5963,11 @@ def choose_showroom_accessory_direct(
                 exclude_recent_scheme_ids=exclude_recent_scheme_ids,
             )
         except Exception as exc:
-            return TPShowroomSyncResult(ok=False, showroom_count=len(showroom_cars), showroom_cars=showroom_cars, showroom_sampled_pages=sorted(sampled_pages), message=str(exc))
+            return TPShowroomSyncResult(ok=False, showroom_count=len(showroom_cars), showroom_cars=showroom_cars, showroom_sampled_pages=sorted(sampled_pages), showroom_source=showroom_source, message=str(exc))
     scheme_id = str(chosen.get("id") or "").strip()
     title = str(chosen.get("title") or chosen.get("name") or forced_scheme_title or "").strip()
     if not scheme_id:
-        return TPShowroomSyncResult(ok=False, showroom_count=len(showroom_cars), showroom_cars=showroom_cars, showroom_sampled_pages=sorted(sampled_pages), message="Trading Paints showroom returned a paint without an id.")
+        return TPShowroomSyncResult(ok=False, showroom_count=len(showroom_cars), showroom_cars=showroom_cars, showroom_sampled_pages=sorted(sampled_pages), showroom_source=showroom_source, message="Trading Paints showroom returned a paint without an id.")
     source_link = _tp_showroom_link_from_car(chosen)
     direct_items = _tp_build_public_showroom_accessory_direct_items(
         user_id=0,
@@ -5873,6 +5989,7 @@ def choose_showroom_accessory_direct(
         reused_recent_history=bool(reused_recent_history),
         showroom_cars=showroom_cars,
         showroom_sampled_pages=sorted(sampled_pages),
+        showroom_source=showroom_source,
         detected_total_pages=page_limit,
     )
 
@@ -6454,6 +6571,7 @@ def download_showroom_paints_to_random_pool(
     slug: str = "",
     count: int = 5,
     pages: int = TP_SHOWROOM_MAX_PAGES,
+    showroom_sources: object = TP_SHOWROOM_DEFAULT_SOURCE,
     mapping_path: Path | None = None,
     random_pool_dir: Path | None = None,
     max_pool_gb: float = 5.0,
@@ -6492,6 +6610,7 @@ def download_showroom_paints_to_random_pool(
     slug = str(slug or f"car-{target_mid}").strip() or f"car-{target_mid}"
     target_count = max(1, min(int(count or 1), 100))
     page_limit = max(1, min(int(pages or TP_SHOWROOM_MAX_PAGES), 50))
+    showroom_source = choose_tp_showroom_source(showroom_sources)
     random_pool_dir = random_pool_dir or default_random_pool_dir()
     temp_root = default_temp_dir() / "ShowroomPoolDownloads"
     temp_paints_root = default_temp_dir() / "ShowroomPoolPaints" / f"manual_{int(time.time() * 1000)}_{random.randint(1000, 9999)}"
@@ -6499,11 +6618,12 @@ def download_showroom_paints_to_random_pool(
     saved_items: list[SavedFile] = []
     downloaded_schemes: list[str] = []
     try:
-        write(f"Fetching public Trading Paints showroom pages for car ID {target_mid} ({category}/{slug}).")
+        write(f"Fetching public Trading Paints showroom pages for car ID {target_mid} ({category}/{slug}) from {tp_showroom_source_label(showroom_source)}.")
         pool, sampled_pages = _fetch_tp_showroom_pool_http(
             mid=target_mid,
             category=category,
             slug=slug,
+            showroom_source=showroom_source,
             min_unused_count=max(target_count, target_count * 2),
             min_random_pages=min(page_limit, max(1, min(5, target_count))),
             max_pages=page_limit,
@@ -12129,6 +12249,7 @@ def apply_tp_showroom_fallbacks_public(
     disable_random_for_local_user: bool = False,
     mapping_path: Path | None = None,
     detect_showroom_total_pages: bool = False,
+    showroom_sources: object = TP_SHOWROOM_DEFAULT_SOURCE,
     retries: int = 3,
     retry_backoff_seconds: float = 1.5,
     saved_callback: Callable[[list[SavedFile], str], None] | None = None,
@@ -12137,7 +12258,10 @@ def apply_tp_showroom_fallbacks_public(
     logs: list[str] = []
     fallback_saved: list[SavedFile] = []
     summary = RandomFallbackSummary()
+    showroom_sources_text = normalize_tp_showroom_sources(showroom_sources)
+    showroom_source_keys = tp_showroom_sources_list(showroom_sources_text)
     logs.append("Trading Paints online fallback is using public showroom direct downloads. No Trading Paints login, browser profile, or manifest member ID is required.")
+    logs.append(f"Trading Paints public showroom random source(s): {tp_showroom_sources_label(showroom_sources_text)}.")
     if detect_showroom_total_pages:
         logs.append("Trading Paints public showroom total page detection is skipped for random fallback so downloads can start immediately.")
         detect_showroom_total_pages = False
@@ -12170,8 +12294,8 @@ def apply_tp_showroom_fallbacks_public(
     skipped_team_event_targets = 0
     skipped_local_targets = 0
     temp_root = default_temp_dir()
-    showroom_cache_by_directory: dict[str, dict[str, object]] = {}
-    showroom_cache_by_accessory_kind: dict[str, dict[str, object]] = {}
+    showroom_cache_by_directory: dict[tuple[str, str], dict[str, object]] = {}
+    showroom_cache_by_accessory_kind: dict[tuple[str, str], dict[str, object]] = {}
 
     def _record_saved_items(items: list[SavedFile]) -> None:
         for item in items:
@@ -12195,8 +12319,10 @@ def apply_tp_showroom_fallbacks_public(
         normalized_kind = str(accessory_kind or "").strip().lower()
         if normalized_kind not in {"helmet", "suit"}:
             return False
+        showroom_source = choose_tp_showroom_source(showroom_source_keys)
+        accessory_cache_key = (normalized_kind, showroom_source)
         accessory_cache = showroom_cache_by_accessory_kind.setdefault(
-            normalized_kind,
+            accessory_cache_key,
             {"cars": [], "sampled_pages": set(), "detected_total_pages": 0},
         )
         recent_key = f"driver:{normalized_kind}"
@@ -12213,6 +12339,7 @@ def apply_tp_showroom_fallbacks_public(
                 pages=TP_SHOWROOM_MAX_PAGES,
                 prefer_official=False,
                 choice_mode="random",
+                showroom_sources=[showroom_source],
                 exclude_scheme_ids=used_showroom_scheme_ids,
                 exclude_recent_scheme_ids=recent_scheme_ids,
                 showroom_cars=list(accessory_cache.get("cars") or []),
@@ -12268,9 +12395,9 @@ def apply_tp_showroom_fallbacks_public(
             if result.reused_previous_scheme:
                 summary.repeated_source_uses += 1
             title = str(result.chosen_title or "").strip()
-            fallback_target_phrase = "applied to"
+            source_label = tp_showroom_source_label(result.showroom_source or showroom_source)
             logs.append(
-                f"Public showroom random {normalized_kind} fallback {fallback_target_phrase} {'AI' if user.is_ai else 'driver'} {label}: scheme {chosen_scheme_id}{f' - {title}' if title else ''}."
+                f"Public showroom random {normalized_kind} fallback applied to {'AI' if user.is_ai else 'driver'} {label}: scheme {chosen_scheme_id}{f' - {title}' if title else ''} [{source_label}]."
             )
             return True
         logs.append(f"Public showroom {normalized_kind} fallback could not cover {label}; using the local random pool backup if available.")
@@ -12323,8 +12450,10 @@ def apply_tp_showroom_fallbacks_public(
 
             if need_car:
                 directory_key = canonicalize_car_directory(user.directory).lower()
+                showroom_source = choose_tp_showroom_source(showroom_source_keys)
+                showroom_cache_key = (directory_key, showroom_source)
                 showroom_cache = showroom_cache_by_directory.setdefault(
-                    directory_key,
+                    showroom_cache_key,
                     {"cars": [], "sampled_pages": set(), "detected_total_pages": 0},
                 )
                 recent_scheme_ids = {
@@ -12341,6 +12470,7 @@ def apply_tp_showroom_fallbacks_public(
                         pages=TP_SHOWROOM_MAX_PAGES,
                         prefer_official=False,
                         choice_mode="random",
+                        showroom_sources=[showroom_source],
                         exclude_scheme_ids=used_showroom_scheme_ids,
                         exclude_recent_scheme_ids=recent_scheme_ids,
                         showroom_cars=list(showroom_cache.get("cars") or []),
@@ -12396,9 +12526,9 @@ def apply_tp_showroom_fallbacks_public(
                         summary.repeated_source_uses += 1
                     car_still_needs_local = False
                     title = str(result.chosen_title or "").strip()
-                    fallback_target_phrase = "applied to"
+                    source_label = tp_showroom_source_label(result.showroom_source or showroom_source)
                     logs.append(
-                        f"Public showroom random car fallback {fallback_target_phrase} {'AI' if user.is_ai else 'driver'} {label} on {user.directory}: scheme {chosen_scheme_id}{f' - {title}' if title else ''}."
+                        f"Public showroom random car fallback applied to {'AI' if user.is_ai else 'driver'} {label} on {user.directory}: scheme {chosen_scheme_id}{f' - {title}' if title else ''} [{source_label}]."
                     )
                     break
                 if car_still_needs_local:
@@ -12487,6 +12617,7 @@ def apply_tp_showroom_fallbacks(
     primary_fast_mode: bool = False,
     mule_profile_mode: bool = False,
     detect_showroom_total_pages: bool = False,
+    showroom_sources: object = TP_SHOWROOM_DEFAULT_SOURCE,
     retries: int = 3,
     retry_backoff_seconds: float = 1.5,
     tp_fallback_lanes_mode: str = "session_total",
@@ -12514,6 +12645,7 @@ def apply_tp_showroom_fallbacks(
         disable_random_for_local_user=disable_random_for_local_user,
         mapping_path=mapping_path,
         detect_showroom_total_pages=detect_showroom_total_pages,
+        showroom_sources=showroom_sources,
         retries=retries,
         retry_backoff_seconds=retry_backoff_seconds,
         saved_callback=saved_callback,
@@ -12542,6 +12674,7 @@ def apply_tp_showroom_fallbacks(
                 primary_fast_mode=primary_fast_mode,
                 mule_profile_mode=mule_profile_mode,
                 detect_showroom_total_pages=detect_showroom_total_pages,
+                showroom_sources=showroom_sources,
                 retries=retries,
                 retry_backoff_seconds=retry_backoff_seconds,
                 tp_fallback_lanes_mode=tp_fallback_lanes_mode,
@@ -15654,6 +15787,7 @@ def process_session(
     tp_collection_pool_sources: str = "",
     tp_collection_pool_allow_showroom_fallback: bool = True,
     tp_collection_pool_repeat_when_strict: bool = False,
+    tp_showroom_sources: str = TP_SHOWROOM_DEFAULT_SOURCE,
     progress_callback: Callable[..., None] | None = None,
     reload_reader: IracingSdkReader | None = None,
     auto_refresh_paints: bool = False,
@@ -16078,6 +16212,7 @@ def process_session(
             tp_manual_max_lanes=tp_manual_max_lanes,
             process_all_together=bool(tp_process_all_online_fallbacks_together),
             retry_timed_out_fallbacks_indefinitely=bool(tp_retry_timed_out_fallbacks_indefinitely),
+            showroom_sources=tp_showroom_sources,
             saved_callback=_on_fallback_saved_items,
             cancel_event=cancel_event,
         )
@@ -16630,6 +16765,7 @@ class AppConfig:
     tp_collection_pool_sources: str = ""
     tp_collection_pool_allow_showroom_fallback: bool = True
     tp_collection_pool_repeat_when_strict: bool = False
+    tp_showroom_sources: str = TP_SHOWROOM_DEFAULT_SOURCE
     quick_start_completed: bool = False
     keep_tp_paints_in_random_pool: bool = False
     max_random_pool_gb: float = 5.0
@@ -16790,6 +16926,7 @@ class ConfigStore:
         config.tp_collection_pool_repeat_when_strict = bool(getattr(config, "tp_collection_pool_repeat_when_strict", False))
         if config.tp_collection_pool_allow_showroom_fallback:
             config.tp_collection_pool_repeat_when_strict = False
+        config.tp_showroom_sources = normalize_tp_showroom_sources(getattr(config, "tp_showroom_sources", TP_SHOWROOM_DEFAULT_SOURCE))
         config.quick_start_completed = bool(getattr(config, "quick_start_completed", False))
         config.keep_tp_paints_in_random_pool = bool(getattr(config, "keep_tp_paints_in_random_pool", False))
         config.max_random_pool_gb = clamp_random_pool_gb(getattr(config, "max_random_pool_gb", 5.0), 5.0)
@@ -16846,6 +16983,7 @@ class ConfigStore:
         safe.tp_collection_pool_repeat_when_strict = bool(getattr(safe, "tp_collection_pool_repeat_when_strict", False))
         if safe.tp_collection_pool_allow_showroom_fallback:
             safe.tp_collection_pool_repeat_when_strict = False
+        safe.tp_showroom_sources = normalize_tp_showroom_sources(getattr(safe, "tp_showroom_sources", TP_SHOWROOM_DEFAULT_SOURCE))
         safe.quick_start_completed = bool(getattr(safe, "quick_start_completed", False))
         safe.keep_tp_paints_in_random_pool = bool(safe.keep_tp_paints_in_random_pool)
         safe.max_random_pool_gb = clamp_random_pool_gb(safe.max_random_pool_gb, 5.0)
@@ -17771,6 +17909,7 @@ class DownloaderService:
                             tp_collection_pool_sources=getattr(config, "tp_collection_pool_sources", ""),
                             tp_collection_pool_allow_showroom_fallback=bool(getattr(config, "tp_collection_pool_allow_showroom_fallback", True)),
                             tp_collection_pool_repeat_when_strict=bool(getattr(config, "tp_collection_pool_repeat_when_strict", False)),
+                            tp_showroom_sources=normalize_tp_showroom_sources(getattr(config, "tp_showroom_sources", TP_SHOWROOM_DEFAULT_SOURCE)),
                             progress_callback=lambda rows, saved_items=None, _session=session, _existing=previous_rows, _replay=replay_mode_active: self._update_runtime_progress_snapshot(
                                 _session,
                                 last_saved,
@@ -18190,8 +18329,14 @@ class DownloaderUI:
         self.random_pool_helmet_size_gb_var = tk.DoubleVar(value=clamp_random_pool_category_gb(getattr(self.config, "max_random_pool_helmet_gb", 1.0), 1.0))
         self.random_pool_suit_size_gb_var = tk.DoubleVar(value=clamp_random_pool_category_gb(getattr(self.config, "max_random_pool_suit_gb", 1.0), 1.0))
         self.iracing_documents_dir_var = tk.StringVar(value=normalize_optional_path(getattr(self.config, "iracing_documents_dir", "")) or str(default_iracing_documents_dir()))
+        showroom_sources = tp_showroom_sources_list(getattr(self.config, "tp_showroom_sources", TP_SHOWROOM_DEFAULT_SOURCE))
+        self.tp_showroom_source_vars = {
+            source: tk.BooleanVar(value=source in showroom_sources)
+            for source in TP_SHOWROOM_SOURCE_ORDER
+        }
+        self.tp_showroom_source_summary_var = tk.StringVar(value=f"Selected: {tp_showroom_sources_label(showroom_sources)}")
         self.random_pool_summary_var = tk.StringVar(value="Random pool: waiting")
-        self.public_showroom_summary_var = tk.StringVar(value="Skips numbered and PRO paints. Uses the local pool if needed.")
+        self.public_showroom_summary_var = tk.StringVar(value=f"Source: {tp_showroom_sources_label(showroom_sources)}. Skips numbered and PRO paints. Uses the local pool if needed.")
         self.tp_auth_profile_summary_var = tk.StringVar(value="No-browser copy: no Trading Paints login or embedded browser is used.")
         current_member_id = normalize_tp_member_id(getattr(self.config, "tp_manifest_member_id_override", 0))
         self.tp_manifest_member_id_var = tk.StringVar(value=str(current_member_id) if current_member_id > 0 else "")
@@ -18698,13 +18843,28 @@ class DownloaderUI:
         ttk.Label(online_left, text="Public showroom", font=("Segoe UI", 10, "bold")).grid(row=0, column=0, sticky="w")
         self.online_state_hint_label = ttk.Label(online_left, textvariable=self.online_section_hint_var, foreground="#555555", justify="left", wraplength=620)
         self.online_state_hint_label.grid(row=1, column=0, sticky="w", pady=(4, 0))
-        ttk.Label(online_left, textvariable=self.public_showroom_summary_var, justify="left", foreground="#176d2b", wraplength=620).grid(row=2, column=0, sticky="w", pady=(6, 0))
+        self.tp_showroom_sources_frame = ttk.LabelFrame(online_left, text="Showroom source", padding=8)
+        self.tp_showroom_sources_frame.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        source_options_row = ttk.Frame(self.tp_showroom_sources_frame)
+        source_options_row.grid(row=0, column=0, sticky="w")
+        self.tp_showroom_source_checkbuttons = {}
+        for source in TP_SHOWROOM_SOURCE_ORDER:
+            check = ttk.Checkbutton(
+                source_options_row,
+                text=TP_SHOWROOM_SOURCE_LABELS[source],
+                variable=self.tp_showroom_source_vars[source],
+                command=self.on_tp_showroom_sources_changed,
+            )
+            check.pack(side="left", padx=(0, 14))
+            self.tp_showroom_source_checkbuttons[source] = check
+        ttk.Label(self.tp_showroom_sources_frame, textvariable=self.tp_showroom_source_summary_var, justify="left", foreground="#555555", wraplength=620).grid(row=1, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(online_left, textvariable=self.public_showroom_summary_var, justify="left", foreground="#176d2b", wraplength=620).grid(row=3, column=0, sticky="w", pady=(6, 0))
         online_left_actions = ttk.Frame(online_left)
-        online_left_actions.grid(row=3, column=0, sticky="w", pady=(6, 0))
+        online_left_actions.grid(row=4, column=0, sticky="w", pady=(6, 0))
         ttk.Button(online_left_actions, text="Showroom", command=self.open_tp_showroom).pack(side="left")
         ttk.Button(online_left_actions, text="RandomPool", command=self.open_random_pool_folder).pack(side="left", padx=(8, 0))
         self.local_pool_frame = ttk.LabelFrame(online_left, text="Local random paints pool", padding=10)
-        self.local_pool_frame.grid(row=4, column=0, sticky="ew", pady=(8, 0))
+        self.local_pool_frame.grid(row=5, column=0, sticky="ew", pady=(8, 0))
         self.local_pool_frame.columnconfigure(0, weight=1)
         self.local_pool_frame.columnconfigure(3, weight=1)
         ttk.Label(self.local_pool_frame, text="Keeps extra local paints the app can reuse later when a driver or AI has no TP paint. This still matters even if you prefer Online.", foreground="#176d2b", justify="left", wraplength=620).grid(row=0, column=0, columnspan=4, sticky="w")
@@ -19524,6 +19684,7 @@ class DownloaderUI:
                     scheme_id=scheme_id,
                     source_link=source_link,
                     source_label=source_label,
+                    showroom_sources=getattr(config, "tp_showroom_sources", TP_SHOWROOM_DEFAULT_SOURCE),
                     retries=positive_int(config.retries, 3),
                     retry_backoff_seconds=max(config.retry_backoff_seconds, 0.1),
                 )
@@ -20052,6 +20213,35 @@ class DownloaderUI:
         except Exception:
             pass
 
+    def _read_tp_showroom_sources_ui(self) -> str:
+        source_vars = getattr(self, "tp_showroom_source_vars", {})
+        selected = [
+            source
+            for source in TP_SHOWROOM_SOURCE_ORDER
+            if source in source_vars and bool(source_vars[source].get())
+        ]
+        normalized = normalize_tp_showroom_sources(selected)
+        normalized_sources = set(tp_showroom_sources_list(normalized))
+        for source, var in source_vars.items():
+            try:
+                var.set(source in normalized_sources)
+            except Exception:
+                pass
+        return normalized
+
+    def _refresh_tp_showroom_source_summary(self) -> None:
+        sources = self._read_tp_showroom_sources_ui()
+        label = tp_showroom_sources_label(sources)
+        try:
+            self.tp_showroom_source_summary_var.set(f"Selected: {label}")
+            self.public_showroom_summary_var.set(f"Source: {label}. Skips numbered and PRO paints. Uses the local pool if needed.")
+        except Exception:
+            pass
+
+    def on_tp_showroom_sources_changed(self) -> None:
+        self._refresh_tp_showroom_source_summary()
+        self.on_setting_changed()
+
     def _update_tp_fallback_ui(self, force: bool = False) -> None:
         mode = str(self.tp_fallback_mode_var.get() or "Local").strip().lower()
         has_any_targets = bool(
@@ -20064,6 +20254,7 @@ class DownloaderUI:
         )
         self._refresh_tp_manifest_member_id_summary()
         self._refresh_tp_collection_pool_summary()
+        self._refresh_tp_showroom_source_summary()
         try:
             if has_any_targets:
                 self.source_pref_frame.grid()
@@ -20562,6 +20753,7 @@ class DownloaderUI:
             tp_collection_pool_repeat_when_strict=bool(
                 self.tp_collection_pool_repeat_var.get() and not self.tp_collection_pool_allow_showroom_var.get()
             ),
+            tp_showroom_sources=self._read_tp_showroom_sources_ui(),
             quick_start_completed=bool(getattr(self.config, "quick_start_completed", False)),
             keep_tp_paints_in_random_pool=bool(self.keep_tp_pool_var.get()),
             max_random_pool_gb=max_random_pool_gb,
@@ -22386,6 +22578,7 @@ class DownloaderUI:
                     slug=slug,
                     count=count,
                     pages=pages,
+                    showroom_sources=getattr(self.config, "tp_showroom_sources", TP_SHOWROOM_DEFAULT_SOURCE),
                     mapping_path=default_tp_showroom_mapping_path(),
                     random_pool_dir=destination,
                     **self._showroom_pool_limits(),
@@ -22655,7 +22848,9 @@ class DownloaderUI:
 
     def open_tp_showroom(self) -> None:
         try:
-            webbrowser.open("https://www.tradingpaints.com/showroom/filter/from=everyone,sort=popular,ad=DESC,pos=0")
+            sources = tp_showroom_sources_list(getattr(self.config, "tp_showroom_sources", TP_SHOWROOM_DEFAULT_SOURCE))
+            source = sources[0] if sources else TP_SHOWROOM_DEFAULT_SOURCE
+            webbrowser.open(tp_showroom_filter_url_for_source(source))
             self._append_log("Opened Trading Paints showroom in your browser.")
         except Exception as exc:
             self._append_log(f"Could not open Trading Paints showroom: {exc}")
