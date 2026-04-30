@@ -37,6 +37,17 @@ The exact source order is then refined by the General tab worker and lane option
 
 When the collection pool is active and normal public showroom coverage is turned off, the app now repeats the selected collection paints within the same session after that curated pool is exhausted.
 
+## Favorites and blocklist
+
+Random fallback now keeps a local preference file for sources you explicitly mark from the Session tab.
+
+- `Favorite` makes that source preferred the next time the same item type is randomized.
+- `Block` removes that source from future random choices.
+- Car preferences are scoped to the car directory.
+- Helmet and suit preferences are scoped by item type.
+
+The preference system applies to public showroom random choices and to the Local RandomPool. A blocked source is skipped even if it is present in the local pool.
+
 ## Step 3: Public showroom and Local RandomPool
 
 Step 3 groups the two most important supporting systems together:
