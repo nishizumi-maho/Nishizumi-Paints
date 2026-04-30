@@ -46,7 +46,7 @@ Favorites are preferred in later random fallback passes. Blocked sources are exc
 
 ### Restore previous
 
-Before the app overwrites a paint file, it stores a local history snapshot. `Restore previous` copies the latest snapshot back for the selected row and item type, registers it in the current session, and triggers a texture reload.
+Before the app overwrites a paint file, it stores a local history snapshot. `Restore previous` copies the latest snapshot back for the selected row and item type, clears any fixed override for that item, registers the restored source in the current session, and triggers a texture reload.
 
 ### Forget
 

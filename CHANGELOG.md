@@ -2,6 +2,15 @@
 
 All notable user-facing changes to Nishizumi Paints are documented here.
 
+## [6.9.1] - 2026-04-29
+
+### Experimental
+
+- Fixed **Restore previous** after a random fixed override: the app now clears the saved override and active preserve state before restoring the previous driver/session paint.
+- Restored Team driver-personal paints now return the Session row to `driver_paint` instead of staying marked as `override`.
+- Fixed repeated Team-driver preload retries for unavailable personal assets by adding a short per-session cooldown for failed user/slot attempts, including manifest failures and incomplete car-slot saves.
+- Prevented duplicate manual random/restore actions from being launched for the same selected driver item while one is still running.
+
 ## [6.9] - 2026-04-29
 
 ### Experimental
