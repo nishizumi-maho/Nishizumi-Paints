@@ -2,6 +2,16 @@
 
 All notable user-facing changes to Nishizumi Paints are documented here.
 
+## [6.8] - 2026-04-29
+
+### Experimental
+
+- Added confirmed Team driver-swap detection: the app now treats the first active-driver change as a candidate and confirms it on a follow-up read before clearing/reapplying team paints.
+- Added short post-swap refresh retries after a confirmed Team driver swap to catch late Trading Paints or iRacing updates.
+- Made the Session table compact outside Team sessions by hiding the Team-specific swap column and using a simpler Driver heading.
+- Added per-item Session tooltips explaining why car, suit, or helmet came from Team paint, driver paint, random fallback, or iRacing default.
+- Added automatic cleanup for old Team-driver preload cache files.
+
 ## [6.7] - 2026-04-29
 
 ### Experimental

@@ -8,13 +8,20 @@ The Session tab is the live monitor view. It is where the active session becomes
 - detected users and AI entries
 - car, helmet, and suit state per row
 - whether a row came from normal Trading Paints, fallback, or an override
+- in Team sessions, the current driver, last confirmed driver swap, and last refresh time
 - row-level actions such as randomize, fix, forget, or open the Trading Paints source
+
+Outside Team sessions the table hides the Team-only swap column and labels the driver column as `Driver`. When a Team target is detected, the table expands to show `Current driver`, `Last swap`, and `Last refresh`.
+
+Hover the `Car`, `Suit`, or `Helmet` cells to see the reason for that source, for example Team paint, current-driver personal paint, random fallback, or iRacing default.
 
 ## Session refresh behavior
 
 The app rebuilds this view as the iRacing SDK changes. The tab is intended to follow session transitions correctly instead of staying stuck on the previous session state.
 
 That matters because the Session tab is also the user-facing explanation of what the download pipeline decided for each driver.
+
+In Team sessions, driver swaps are confirmed before the app clears and reapplies team files. After a confirmed swap, the app also retries the same team target briefly so late Trading Paints or iRacing updates can still be picked up without restarting the app.
 
 ## Main actions
 
