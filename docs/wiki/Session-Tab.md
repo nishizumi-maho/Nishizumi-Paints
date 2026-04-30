@@ -38,6 +38,16 @@ You can ask the app to fetch a new random result for one driver. The current bui
 - trigger texture reload for that car
 - update the row metadata so `Open TP` points at the new source
 
+### Favorite and Block
+
+When the selected row is using a random fallback source, the Session tab can mark that source as a favorite or block it.
+
+Favorites are preferred in later random fallback passes. Blocked sources are excluded from later public showroom and Local RandomPool choices.
+
+### Restore previous
+
+Before the app overwrites a paint file, it stores a local history snapshot. `Restore previous` copies the latest snapshot back for the selected row and item type, registers it in the current session, and triggers a texture reload.
+
 ### Forget
 
 Forget is now meant to behave like this:

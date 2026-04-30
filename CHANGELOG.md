@@ -2,6 +2,15 @@
 
 All notable user-facing changes to Nishizumi Paints are documented here.
 
+## [6.9] - 2026-04-29
+
+### Experimental
+
+- Added random-paint favorites and blocklist support so fallback can prefer known good paints and skip blocked bad sources.
+- Added auto repair for failed Trading Paints direct downloads: normal retries run first, then partial files are cleaned and the online fallback is tried once more.
+- Added paint history snapshots before overwrites and a **Restore previous** action in the Session tab for car, helmet, and suit.
+- Added Session actions to mark the selected random fallback paint as favorite or blocked.
+
 ## [6.8] - 2026-04-29
 
 ### Experimental

@@ -43,7 +43,7 @@ from requests.adapters import HTTPAdapter
 # Browserless copy: Trading Paints browser automation is intentionally disabled.
 sync_playwright = None
 APP_NAME = "Nishizumi Paints"
-APP_VERSION = "6.8"
+APP_VERSION = "6.9"
 APP_REGISTRY_NAME = "NishizumiPaints"
 APP_CONFIG_DIRNAME = "NishizumiPaints"
 APP_TOOLTIP = f"{APP_NAME} {APP_VERSION}"
@@ -87,6 +87,11 @@ TP_SAFE_SAVE_WORKER_CAP = 16
 TP_UNAVAILABLE_DOWNLOAD_STATUS_CODES = {401, 403, 404}
 TP_RECENT_SCHEMES_FILENAME = ".nishizumi_tp_recent_schemes.json"
 DRIVER_PAINT_OVERRIDES_FILENAME = ".nishizumi_driver_paint_overrides.json"
+RANDOM_PAINT_PREFERENCES_FILENAME = ".nishizumi_random_paint_preferences.json"
+PAINT_HISTORY_DIRNAME = "PaintHistory"
+PAINT_HISTORY_INDEX_FILENAME = "history.json"
+PAINT_HISTORY_LIMIT_PER_TARGET = 12
+PAINT_HISTORY_GLOBAL_LIMIT = 3000
 TP_RECENT_SCHEMES_HISTORY_LIMIT = 256
 TP_SHOWROOM_MAPPING_FILENAME = "tp_showroom_mapping.seed.json"
 TP_SHOWROOM_MAPPING_RESOURCE = "data/tp_showroom_mapping.seed.json"
@@ -2804,6 +2809,21 @@ def default_driver_paint_overrides_path() -> Path:
         return Path(appdata) / APP_CONFIG_DIRNAME / DRIVER_PAINT_OVERRIDES_FILENAME
     return Path.home() / f".{APP_CONFIG_DIRNAME.lower()}_{DRIVER_PAINT_OVERRIDES_FILENAME}"
 
+def default_random_paint_preferences_path() -> Path:
+    appdata = os.getenv("APPDATA")
+    if appdata:
+        return Path(appdata) / APP_CONFIG_DIRNAME / RANDOM_PAINT_PREFERENCES_FILENAME
+    return Path.home() / f".{APP_CONFIG_DIRNAME.lower()}_{RANDOM_PAINT_PREFERENCES_FILENAME}"
+
+def default_paint_history_dir() -> Path:
+    appdata = os.getenv("APPDATA")
+    if appdata:
+        return Path(appdata) / "Nishizumi-Paints" / PAINT_HISTORY_DIRNAME
+    return Path.home() / "AppData" / "Roaming" / "Nishizumi-Paints" / PAINT_HISTORY_DIRNAME
+
+def default_paint_history_index_path() -> Path:
+    return default_paint_history_dir() / PAINT_HISTORY_INDEX_FILENAME
+
 def parse_tp_collection_ids_from_text(value: object) -> list[str]:
     text = str(value or "").strip()
     if not text:
@@ -3881,9 +3901,25 @@ def _iter_random_pool_accessory_sources(accessory_kind: str, random_pool_dir: Pa
     return results
 
 def _choose_random_pool_entry(directory: str, random_pool_dir: Path, ai_livery_root: Path, used_source_ids: set[str], seed_text: str) -> tuple[RandomPoolEntry | None, bool]:
-    candidates = [entry for entry in _iter_random_pool_entries_for_directory(directory, random_pool_dir, ai_livery_root) if entry.car_file is not None and entry.car_file.exists()]
+    preferences = load_random_paint_preferences()
+    blocked_source_ids = random_paint_blocked_source_ids("car", directory, preferences)
+    favorite_source_ids = random_paint_favorite_source_ids("car", directory, preferences)
+    candidates = [
+        entry
+        for entry in _iter_random_pool_entries_for_directory(directory, random_pool_dir, ai_livery_root)
+        if entry.car_file is not None
+        and entry.car_file.exists()
+        and entry.source_id not in blocked_source_ids
+    ]
     if not candidates:
         return None, False
+    favorite_candidates = [entry for entry in candidates if entry.source_id in favorite_source_ids]
+    if favorite_candidates:
+        favorite_available = [entry for entry in favorite_candidates if entry.source_id not in used_source_ids] or favorite_candidates
+        rng = random.Random(seed_text + "|favorite")
+        selected = favorite_available[rng.randrange(len(favorite_available))]
+        used_source_ids.add(selected.source_id)
+        return selected, True
     available = [entry for entry in candidates if entry.source_id not in used_source_ids]
     if not available:
         return None, False
@@ -3899,9 +3935,20 @@ def _choose_random_accessory_pool_source(
     used_source_ids: set[str],
     seed_text: str,
 ) -> tuple[Path | None, str | None]:
+    preferences = load_random_paint_preferences()
+    blocked_source_ids = random_paint_blocked_source_ids(accessory_kind, "", preferences)
+    favorite_source_ids = random_paint_favorite_source_ids(accessory_kind, "", preferences)
     candidates = _iter_random_pool_accessory_sources(accessory_kind, random_pool_dir, ai_livery_root)
+    candidates = [(path, source_id) for path, source_id in candidates if source_id not in blocked_source_ids]
     if not candidates:
         return None, None
+    favorite_candidates = [(path, source_id) for path, source_id in candidates if source_id in favorite_source_ids]
+    if favorite_candidates:
+        favorite_available = [(path, source_id) for path, source_id in favorite_candidates if source_id not in used_source_ids] or favorite_candidates
+        rng = random.Random(seed_text + "|favorite")
+        chosen_path, chosen_id = favorite_available[rng.randrange(len(favorite_available))]
+        used_source_ids.add(chosen_id)
+        return chosen_path, chosen_id
     available = [(path, source_id) for path, source_id in candidates if source_id not in used_source_ids]
     if not available:
         available = candidates
@@ -3921,6 +3968,7 @@ def _copy_source_file_to_saved_targets(source_path: Path | None, session_id: Ses
         temp_destination = destination.with_name(destination.name + ".tmp")
         temp_destination.unlink(missing_ok=True)
         shutil.copy2(source_path, temp_destination)
+        remember_previous_paint_file(destination, session_id, download_id)
         os.replace(temp_destination, destination)
         saved.append(SavedFile(session_id=session_id, download_id=download_id, file_path=destination))
     return saved
@@ -3949,6 +3997,7 @@ def _ensure_superspeedway_companion_saved_files(saved_items: list[SavedFile], pa
             temp_destination.unlink(missing_ok=True)
             try:
                 shutil.copy2(source_path, temp_destination)
+                remember_previous_paint_file(destination, item.session_id, ss_download_id)
                 os.replace(temp_destination, destination)
             except Exception as exc:  # noqa: BLE001
                 temp_destination.unlink(missing_ok=True)
@@ -3970,6 +4019,324 @@ def _driver_paint_override_key(user_id: int, kind: str, directory: str = "") -> 
     if normalized_kind in {"helmet", "suit"}:
         return f"{normalized_kind}:{safe_user_id}:driver"
     return ""
+
+def _random_paint_preference_kind(kind: str) -> str:
+    return _driver_paint_override_kind(kind)
+
+def _random_paint_preference_directory(kind: str, directory: str = "") -> str:
+    normalized_kind = _random_paint_preference_kind(kind)
+    if normalized_kind == "car":
+        return canonicalize_car_directory(directory).lower()
+    if normalized_kind in {"helmet", "suit"}:
+        return "driver"
+    return ""
+
+def _random_paint_source_type(source: object = "", source_id: object = "", scheme_id: object = "") -> str:
+    source_text = str(source or "").strip().lower()
+    source_id_text = str(source_id or "").strip()
+    scheme_id_text = str(scheme_id or "").strip()
+    if source_text in {"random_pool", "fallback_local", "local_random_pool"}:
+        return "local"
+    if source_id_text and source_id_text.startswith(("pool:", "ai_livery:", "pool_accessory:", "ai_livery_accessory:")):
+        return "local"
+    if source_text in {"showroom", "showroom_direct", "fallback_online", "public_showroom", "online"}:
+        return "online"
+    if scheme_id_text.isdigit():
+        return "online"
+    return ""
+
+def _random_paint_preference_key(
+    *,
+    kind: str,
+    directory: str = "",
+    source_type: str = "",
+    source_id: object = "",
+    scheme_id: object = "",
+    source: object = "",
+) -> str:
+    normalized_kind = _random_paint_preference_kind(kind)
+    normalized_directory = _random_paint_preference_directory(normalized_kind, directory)
+    normalized_source_type = str(source_type or "").strip().lower() or _random_paint_source_type(source, source_id, scheme_id)
+    if not normalized_kind or normalized_source_type not in {"local", "online"}:
+        return ""
+    if normalized_source_type == "online":
+        normalized_scheme_id = str(scheme_id or source_id or "").strip()
+        if not normalized_scheme_id:
+            return ""
+        return f"online:{normalized_kind}:{normalized_directory}:{normalized_scheme_id}"
+    normalized_source_id = str(source_id or scheme_id or "").strip()
+    if not normalized_source_id:
+        return ""
+    return f"local:{normalized_kind}:{normalized_directory}:{normalized_source_id}"
+
+def _normalize_random_paint_preference_entry(entry: dict[str, object]) -> dict[str, object] | None:
+    if not isinstance(entry, dict):
+        return None
+    kind = _random_paint_preference_kind(str(entry.get("kind") or ""))
+    source_type = str(entry.get("source_type") or "").strip().lower()
+    source_id = str(entry.get("source_id") or "").strip()
+    scheme_id = str(entry.get("scheme_id") or "").strip()
+    source = str(entry.get("source") or "").strip()
+    if source_type not in {"local", "online"}:
+        source_type = _random_paint_source_type(source, source_id, scheme_id)
+    directory = _random_paint_preference_directory(kind, str(entry.get("directory") or ""))
+    key = _random_paint_preference_key(
+        kind=kind,
+        directory=directory,
+        source_type=source_type,
+        source_id=source_id,
+        scheme_id=scheme_id,
+        source=source,
+    )
+    if not key:
+        return None
+    return {
+        "key": key,
+        "kind": kind,
+        "directory": directory,
+        "source_type": source_type,
+        "source_id": source_id,
+        "scheme_id": scheme_id,
+        "title": str(entry.get("title") or "").strip(),
+        "source_link": _normalize_tp_showroom_link(entry.get("source_link"), entry.get("title") or ""),
+        "source": source or ("random_pool" if source_type == "local" else "fallback_online"),
+        "created_at": float(entry.get("created_at") or time.time()),
+        "last_used_at": float(entry.get("last_used_at") or 0.0),
+        "use_count": max(0, int(entry.get("use_count") or 0)),
+    }
+
+def _empty_random_paint_preferences() -> dict[str, object]:
+    return {"version": 1, "favorites": {}, "blocked": {}}
+
+def load_random_paint_preferences(path: Path | None = None) -> dict[str, object]:
+    resolved = Path(path) if path is not None else default_random_paint_preferences_path()
+    if not resolved.exists():
+        return _empty_random_paint_preferences()
+    try:
+        raw = json.loads(resolved.read_text(encoding="utf-8"))
+    except Exception:
+        return _empty_random_paint_preferences()
+    if not isinstance(raw, dict):
+        return _empty_random_paint_preferences()
+    normalized = _empty_random_paint_preferences()
+    for bucket_name in ("favorites", "blocked"):
+        bucket = raw.get(bucket_name)
+        if not isinstance(bucket, dict):
+            continue
+        normalized_bucket: dict[str, dict[str, object]] = {}
+        for key, value in bucket.items():
+            if not isinstance(value, dict):
+                continue
+            candidate = dict(value)
+            candidate.setdefault("key", str(key or ""))
+            entry = _normalize_random_paint_preference_entry(candidate)
+            if entry is not None:
+                normalized_bucket[str(entry["key"])] = entry
+        normalized[bucket_name] = normalized_bucket
+    return normalized
+
+def save_random_paint_preferences(preferences: dict[str, object], path: Path | None = None) -> None:
+    resolved = Path(path) if path is not None else default_random_paint_preferences_path()
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    safe = _empty_random_paint_preferences()
+    for bucket_name in ("favorites", "blocked"):
+        bucket = preferences.get(bucket_name) if isinstance(preferences, dict) else None
+        if not isinstance(bucket, dict):
+            continue
+        safe_bucket: dict[str, dict[str, object]] = {}
+        for value in bucket.values():
+            if isinstance(value, dict):
+                entry = _normalize_random_paint_preference_entry(value)
+                if entry is not None:
+                    safe_bucket[str(entry["key"])] = entry
+        safe[bucket_name] = safe_bucket
+    temp = resolved.with_name(resolved.name + ".tmp")
+    temp.write_text(json.dumps(safe, indent=2, sort_keys=True), encoding="utf-8")
+    os.replace(temp, resolved)
+
+def _random_preference_entry_for_source(
+    *,
+    kind: str,
+    directory: str = "",
+    source_type: str = "",
+    source_id: object = "",
+    scheme_id: object = "",
+    title: object = "",
+    source_link: object = "",
+    source: object = "",
+) -> dict[str, object] | None:
+    normalized_kind = _random_paint_preference_kind(kind)
+    normalized_directory = _random_paint_preference_directory(normalized_kind, directory)
+    normalized_source_type = str(source_type or "").strip().lower() or _random_paint_source_type(source, source_id, scheme_id)
+    key = _random_paint_preference_key(
+        kind=normalized_kind,
+        directory=normalized_directory,
+        source_type=normalized_source_type,
+        source_id=source_id,
+        scheme_id=scheme_id,
+        source=source,
+    )
+    if not key:
+        return None
+    now = time.time()
+    entry = {
+        "key": key,
+        "kind": normalized_kind,
+        "directory": normalized_directory,
+        "source_type": normalized_source_type,
+        "source_id": str(source_id or "").strip(),
+        "scheme_id": str(scheme_id or "").strip(),
+        "title": str(title or "").strip(),
+        "source_link": _normalize_tp_showroom_link(source_link, title) or _tp_showroom_url_for_scheme_id(scheme_id, title),
+        "source": str(source or "").strip() or ("random_pool" if normalized_source_type == "local" else "fallback_online"),
+        "created_at": now,
+        "last_used_at": now,
+        "use_count": 0,
+    }
+    return _normalize_random_paint_preference_entry(entry)
+
+def remember_random_paint_favorite(entry: dict[str, object]) -> bool:
+    normalized = _normalize_random_paint_preference_entry(entry)
+    if normalized is None:
+        return False
+    preferences = load_random_paint_preferences()
+    key = str(normalized["key"])
+    favorites = preferences.setdefault("favorites", {})
+    blocked = preferences.setdefault("blocked", {})
+    if isinstance(blocked, dict):
+        blocked.pop(key, None)
+    if isinstance(favorites, dict):
+        existing = favorites.get(key) if isinstance(favorites.get(key), dict) else {}
+        normalized["created_at"] = float(existing.get("created_at") or normalized["created_at"]) if isinstance(existing, dict) else normalized["created_at"]
+        normalized["last_used_at"] = time.time()
+        normalized["use_count"] = max(0, int(existing.get("use_count") or 0)) + 1 if isinstance(existing, dict) else 1
+        favorites[key] = normalized
+    save_random_paint_preferences(preferences)
+    return True
+
+def block_random_paint_source(entry: dict[str, object]) -> bool:
+    normalized = _normalize_random_paint_preference_entry(entry)
+    if normalized is None:
+        return False
+    preferences = load_random_paint_preferences()
+    key = str(normalized["key"])
+    favorites = preferences.setdefault("favorites", {})
+    blocked = preferences.setdefault("blocked", {})
+    if isinstance(favorites, dict):
+        favorites.pop(key, None)
+    if isinstance(blocked, dict):
+        existing = blocked.get(key) if isinstance(blocked.get(key), dict) else {}
+        normalized["created_at"] = float(existing.get("created_at") or normalized["created_at"]) if isinstance(existing, dict) else normalized["created_at"]
+        normalized["last_used_at"] = time.time()
+        normalized["use_count"] = max(0, int(existing.get("use_count") or 0)) + 1 if isinstance(existing, dict) else 1
+        blocked[key] = normalized
+    save_random_paint_preferences(preferences)
+    return True
+
+def _random_paint_preference_entry_matches(entry: dict[str, object], kind: str, directory: str = "", source_type: str = "") -> bool:
+    normalized = _normalize_random_paint_preference_entry(entry)
+    if normalized is None:
+        return False
+    if str(normalized.get("kind") or "") != _random_paint_preference_kind(kind):
+        return False
+    if str(normalized.get("directory") or "") != _random_paint_preference_directory(kind, directory):
+        return False
+    if source_type and str(normalized.get("source_type") or "") != str(source_type).strip().lower():
+        return False
+    return True
+
+def random_paint_blocked_source_ids(kind: str, directory: str = "", preferences: dict[str, object] | None = None) -> set[str]:
+    prefs = preferences if isinstance(preferences, dict) else load_random_paint_preferences()
+    blocked = prefs.get("blocked") if isinstance(prefs, dict) else {}
+    if not isinstance(blocked, dict):
+        return set()
+    return {
+        str(entry.get("source_id") or "").strip()
+        for entry in blocked.values()
+        if isinstance(entry, dict)
+        and _random_paint_preference_entry_matches(entry, kind, directory, "local")
+        and str(entry.get("source_id") or "").strip()
+    }
+
+def random_paint_blocked_scheme_ids(kind: str, directory: str = "", preferences: dict[str, object] | None = None) -> set[str]:
+    prefs = preferences if isinstance(preferences, dict) else load_random_paint_preferences()
+    blocked = prefs.get("blocked") if isinstance(prefs, dict) else {}
+    if not isinstance(blocked, dict):
+        return set()
+    return {
+        str(entry.get("scheme_id") or entry.get("source_id") or "").strip()
+        for entry in blocked.values()
+        if isinstance(entry, dict)
+        and _random_paint_preference_entry_matches(entry, kind, directory, "online")
+        and str(entry.get("scheme_id") or entry.get("source_id") or "").strip()
+    }
+
+def random_paint_favorite_source_ids(kind: str, directory: str = "", preferences: dict[str, object] | None = None) -> set[str]:
+    prefs = preferences if isinstance(preferences, dict) else load_random_paint_preferences()
+    favorites = prefs.get("favorites") if isinstance(prefs, dict) else {}
+    if not isinstance(favorites, dict):
+        return set()
+    return {
+        str(entry.get("source_id") or "").strip()
+        for entry in favorites.values()
+        if isinstance(entry, dict)
+        and _random_paint_preference_entry_matches(entry, kind, directory, "local")
+        and str(entry.get("source_id") or "").strip()
+    }
+
+def random_paint_favorite_online_entry(kind: str, directory: str = "", preferences: dict[str, object] | None = None) -> dict[str, object] | None:
+    prefs = preferences if isinstance(preferences, dict) else load_random_paint_preferences()
+    favorites = prefs.get("favorites") if isinstance(prefs, dict) else {}
+    if not isinstance(favorites, dict):
+        return None
+    candidates = [
+        _normalize_random_paint_preference_entry(entry)
+        for entry in favorites.values()
+        if isinstance(entry, dict) and _random_paint_preference_entry_matches(entry, kind, directory, "online")
+    ]
+    candidates = [entry for entry in candidates if entry is not None]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda entry: (float(entry.get("last_used_at") or 0.0), float(entry.get("created_at") or 0.0)), reverse=True)
+    return candidates[0]
+
+def _random_preference_entry_from_driver_current_entry(entry: dict[str, object] | None, status_code: str = "") -> dict[str, object] | None:
+    if not isinstance(entry, dict):
+        return None
+    kind = _random_paint_preference_kind(str(entry.get("kind") or ""))
+    if not kind:
+        return None
+    directory = str(entry.get("directory") or "")
+    source = str(entry.get("source") or "").strip()
+    scheme_id = str(entry.get("scheme_id") or "").strip()
+    status = str(status_code or "").strip().lower()
+    if source in {"random_pool", "local_random_pool"} or status in {"fallback_local", "fallback"}:
+        if not scheme_id.startswith(("pool:", "ai_livery:", "pool_accessory:", "ai_livery_accessory:")):
+            return None
+        return _random_preference_entry_for_source(
+            kind=kind,
+            directory=directory,
+            source_type="local",
+            source_id=scheme_id,
+            scheme_id="",
+            title=entry.get("title") or "",
+            source_link="",
+            source="random_pool",
+        )
+    if source in {"showroom", "showroom_direct", "fallback_online", "online"} or status == "fallback_online":
+        if not scheme_id or scheme_id.startswith("current-"):
+            return None
+        return _random_preference_entry_for_source(
+            kind=kind,
+            directory=directory,
+            source_type="online",
+            source_id="",
+            scheme_id=scheme_id,
+            title=entry.get("title") or "",
+            source_link=entry.get("source_link") or "",
+            source="fallback_online",
+        )
+    return None
 
 def _normalize_driver_paint_override_entry(entry: dict[str, object]) -> dict[str, object] | None:
     if not isinstance(entry, dict):
@@ -4651,6 +5018,15 @@ def assign_driver_paint_override_from_showroom_public(
     label = user.display_name or (f"AI {user.user_id}" if user.is_ai else f"user {user.user_id}")
     forced_scheme_id = str(scheme_id or "").strip()
     forced_title = f"manual scheme {forced_scheme_id}" if forced_scheme_id else ""
+    exclude_scheme_ids: set[str] | None = None
+    if not forced_scheme_id and str(source_label or "").strip().lower() == "random":
+        random_preferences = load_random_paint_preferences()
+        exclude_scheme_ids = random_paint_blocked_scheme_ids("car", user.directory, random_preferences)
+        favorite_entry = random_paint_favorite_online_entry("car", user.directory, random_preferences)
+        favorite_scheme_id = str((favorite_entry or {}).get("scheme_id") or "").strip()
+        if favorite_scheme_id and favorite_scheme_id not in exclude_scheme_ids:
+            forced_scheme_id = favorite_scheme_id
+            forced_title = str((favorite_entry or {}).get("title") or f"favorite scheme {favorite_scheme_id}").strip()
     result = choose_showroom_paint_direct(
         directory=user.directory,
         mapping_path=mapping_path,
@@ -4658,6 +5034,7 @@ def assign_driver_paint_override_from_showroom_public(
         prefer_official=False,
         choice_mode="random",
         showroom_sources=showroom_sources,
+        exclude_scheme_ids=exclude_scheme_ids,
         forced_scheme_id=forced_scheme_id,
         forced_scheme_title=forced_title,
         log=logging.info,
@@ -4675,6 +5052,7 @@ def assign_driver_paint_override_from_showroom_public(
         retry_backoff_seconds=retry_backoff_seconds,
         source_label=str(source_label or "manual").strip() or "manual",
         preserve_on_cleanup=True,
+        log=logs.append,
         cancel_event=cancel_event,
     )
     chosen_scheme_id = str(result.chosen_scheme_id or forced_scheme_id or "").strip()
@@ -4780,10 +5158,16 @@ def _apply_local_tp_random_fallback_assets_for_user(
                 (PaintType.CAR_SPEC, entry.spec_file),
                 (PaintType.CAR_DECAL, entry.decal_file),
             ):
+                download_id = _download_id_with_tp_source(
+                    DownloadId(paint_type=paint_type, **base_kwargs),
+                    scheme_id=entry.source_id,
+                    title=f"{entry.source_kind} random source",
+                    source="random_pool",
+                )
                 copied = _copy_source_file_to_saved_targets(
                     source_path,
                     session.session_id,
-                    DownloadId(paint_type=paint_type, **base_kwargs),
+                    download_id,
                     paints_dir,
                 )
                 if copied:
@@ -4803,7 +5187,12 @@ def _apply_local_tp_random_fallback_assets_for_user(
         copied = _copy_source_file_to_saved_targets(
             helmet_source,
             session.session_id,
-            DownloadId(user_id=target_id, directory=user.directory, paint_type=PaintType.HELMET, is_team_paint=target_is_team, is_superspeedway_variant=False),
+            _download_id_with_tp_source(
+                DownloadId(user_id=target_id, directory=user.directory, paint_type=PaintType.HELMET, is_team_paint=target_is_team, is_superspeedway_variant=False),
+                scheme_id=helmet_source_id or "",
+                title="local random helmet source",
+                source="random_pool",
+            ),
             paints_dir,
         )
         if copied:
@@ -4826,7 +5215,12 @@ def _apply_local_tp_random_fallback_assets_for_user(
         copied = _copy_source_file_to_saved_targets(
             suit_source,
             session.session_id,
-            DownloadId(user_id=target_id, directory=user.directory, paint_type=PaintType.SUIT, is_team_paint=target_is_team, is_superspeedway_variant=False),
+            _download_id_with_tp_source(
+                DownloadId(user_id=target_id, directory=user.directory, paint_type=PaintType.SUIT, is_team_paint=target_is_team, is_superspeedway_variant=False),
+                scheme_id=suit_source_id or "",
+                title="local random suit source",
+                source="random_pool",
+            ),
             paints_dir,
         )
         if copied:
@@ -6184,6 +6578,96 @@ def choose_showroom_accessory_direct(
     )
 
 
+def _cleanup_partial_download_save_files(
+    downloaded_items: list[DownloadedFile],
+    items: list[DownloadFile],
+    paints_dir: Path,
+) -> None:
+    for downloaded in downloaded_items:
+        try:
+            downloaded.file_path.unlink(missing_ok=True)
+        except Exception:
+            logging.debug("Could not remove partial downloaded file %s", downloaded.file_path, exc_info=True)
+    for item in items:
+        try:
+            for destination in save_paths_for(item.download_id, paints_dir):
+                destination.with_name(destination.name + ".tmp").unlink(missing_ok=True)
+                if destination.exists():
+                    try:
+                        if int(destination.stat().st_size) <= 0:
+                            _hard_delete_file(destination, paints_root=paints_dir)
+                    except OSError:
+                        pass
+        except Exception:
+            logging.debug("Could not clean partial save target for %s", item.download_id, exc_info=True)
+
+
+def _download_and_save_with_auto_repair(
+    *,
+    session_id: SessionId,
+    temp_dir: Path,
+    paints_dir: Path,
+    items: list[DownloadFile],
+    retries: int,
+    retry_backoff_seconds: float,
+    cancel_event: threading.Event | None = None,
+    log: Callable[[str], None] | None = None,
+    label: str = "Trading Paints paint",
+    skip_car_extras_until_car: bool = False,
+) -> list[SavedFile]:
+    if not items:
+        return []
+    repair_attempts = 2
+    for repair_attempt in range(1, repair_attempts + 1):
+        if _cancel_requested(cancel_event):
+            return []
+        downloaded_items: list[DownloadedFile] = []
+        car_downloaded = False
+        for ordinal, item in enumerate(items, start=1):
+            if skip_car_extras_until_car and item.download_id.paint_type in {PaintType.CAR_SPEC, PaintType.CAR_DECAL} and not car_downloaded:
+                continue
+            downloaded = download_file(
+                session_id,
+                temp_dir,
+                item,
+                retries,
+                retry_backoff_seconds,
+                ordinal=ordinal,
+                total=len(items),
+                cancel_event=cancel_event,
+            )
+            if downloaded is not None:
+                downloaded_items.append(downloaded)
+                if item.download_id.paint_type is PaintType.CAR:
+                    car_downloaded = True
+        saved_items: list[SavedFile] = []
+        for downloaded in downloaded_items:
+            saved = move_or_extract(
+                downloaded,
+                paints_dir,
+                retries=retries,
+                retry_backoff_seconds=retry_backoff_seconds,
+                cancel_event=cancel_event,
+            )
+            if saved:
+                saved_items.extend(saved)
+        if saved_items:
+            return saved_items
+        _cleanup_partial_download_save_files(downloaded_items, items, paints_dir)
+        if repair_attempt < repair_attempts and not _cancel_requested(cancel_event):
+            message = (
+                f"Auto repair: {label} failed to download or save after the normal retry sequence; "
+                "cleaned partial files and will try the online fallback once more."
+            )
+            if log is not None:
+                try:
+                    log(message)
+                except Exception:
+                    logging.debug("Could not append auto repair log", exc_info=True)
+            logging.warning(message)
+    return []
+
+
 def _download_and_save_direct_showroom_car_result(
     *,
     session: Session,
@@ -6195,6 +6679,7 @@ def _download_and_save_direct_showroom_car_result(
     retry_backoff_seconds: float,
     source_label: str,
     preserve_on_cleanup: bool = False,
+    log: Callable[[str], None] | None = None,
     cancel_event: threading.Event | None = None,
 ) -> list[SavedFile]:
     retargeted_items = _tp_retarget_manifest_items_for_user(session, user, result.direct_items)
@@ -6209,36 +6694,18 @@ def _download_and_save_direct_showroom_car_result(
         retargeted_items = _preserve_download_items_on_cleanup(retargeted_items)
     if not retargeted_items:
         return []
-    downloaded_items: list[DownloadedFile] = []
-    car_downloaded = False
-    for ordinal, item in enumerate(retargeted_items, start=1):
-        if item.download_id.paint_type in {PaintType.CAR_SPEC, PaintType.CAR_DECAL} and not car_downloaded:
-            continue
-        downloaded = download_file(
-            session.session_id,
-            temp_dir,
-            item,
-            retries,
-            retry_backoff_seconds,
-            ordinal=ordinal,
-            total=len(retargeted_items),
-            cancel_event=cancel_event,
-        )
-        if downloaded is not None:
-            downloaded_items.append(downloaded)
-            if item.download_id.paint_type is PaintType.CAR:
-                car_downloaded = True
-    saved_items: list[SavedFile] = []
-    for downloaded in downloaded_items:
-        saved = move_or_extract(
-            downloaded,
-            paints_dir,
-            retries=retries,
-            retry_backoff_seconds=retry_backoff_seconds,
-            cancel_event=cancel_event,
-        )
-        if saved:
-            saved_items.extend(saved)
+    saved_items = _download_and_save_with_auto_repair(
+        session_id=session.session_id,
+        temp_dir=temp_dir,
+        paints_dir=paints_dir,
+        items=retargeted_items,
+        retries=retries,
+        retry_backoff_seconds=retry_backoff_seconds,
+        cancel_event=cancel_event,
+        log=log,
+        label=f"public showroom car scheme {result.chosen_scheme_id or '(unknown)'}",
+        skip_car_extras_until_car=True,
+    )
     if saved_items:
         saved_items = _ensure_superspeedway_companion_saved_files(saved_items, paints_dir)
     return saved_items
@@ -6256,6 +6723,7 @@ def _download_and_save_direct_showroom_accessory_result(
     retry_backoff_seconds: float,
     source_label: str,
     preserve_on_cleanup: bool = False,
+    log: Callable[[str], None] | None = None,
     cancel_event: threading.Event | None = None,
 ) -> list[SavedFile]:
     normalized_kind = str(accessory_kind or "").strip().lower()
@@ -6274,32 +6742,17 @@ def _download_and_save_direct_showroom_accessory_result(
         retargeted_items = _preserve_download_items_on_cleanup(retargeted_items)
     if not retargeted_items:
         return []
-    downloaded_items: list[DownloadedFile] = []
-    for ordinal, item in enumerate(retargeted_items, start=1):
-        downloaded = download_file(
-            session.session_id,
-            temp_dir,
-            item,
-            retries,
-            retry_backoff_seconds,
-            ordinal=ordinal,
-            total=len(retargeted_items),
-            cancel_event=cancel_event,
-        )
-        if downloaded is not None:
-            downloaded_items.append(downloaded)
-    saved_items: list[SavedFile] = []
-    for downloaded in downloaded_items:
-        saved = move_or_extract(
-            downloaded,
-            paints_dir,
-            retries=retries,
-            retry_backoff_seconds=retry_backoff_seconds,
-            cancel_event=cancel_event,
-        )
-        if saved:
-            saved_items.extend(saved)
-    return saved_items
+    return _download_and_save_with_auto_repair(
+        session_id=session.session_id,
+        temp_dir=temp_dir,
+        paints_dir=paints_dir,
+        items=retargeted_items,
+        retries=retries,
+        retry_backoff_seconds=retry_backoff_seconds,
+        cancel_event=cancel_event,
+        log=log,
+        label=f"public showroom {normalized_kind} scheme {result.chosen_scheme_id or '(unknown)'}",
+    )
 
 
 def _tp_showroom_input_link(value: object, scheme_id: str = "") -> str:
@@ -13004,6 +13457,7 @@ def apply_tp_showroom_fallbacks_public(
         if item.download_id.paint_type is PaintType.SUIT
     }
     recent_schemes_by_directory = load_tp_recent_schemes()
+    random_preferences = load_random_paint_preferences()
     recent_history_changed = False
     used_showroom_scheme_ids: set[str] = set()
     random_pool_dir = default_random_pool_dir()
@@ -13050,16 +13504,26 @@ def apply_tp_showroom_fallbacks_public(
             for item in recent_schemes_by_directory.get(recent_key, [])
             if str(item).strip()
         }
+        blocked_scheme_ids = random_paint_blocked_scheme_ids(normalized_kind, "", random_preferences)
+        favorite_entry = random_paint_favorite_online_entry(normalized_kind, "", random_preferences)
+        favorite_scheme_id = str((favorite_entry or {}).get("scheme_id") or "").strip()
+        favorite_title = str((favorite_entry or {}).get("title") or "").strip()
+        if favorite_scheme_id in blocked_scheme_ids:
+            favorite_scheme_id = ""
         for _attempt in range(1, 5):
             if _cancel_requested(cancel_event):
                 break
+            forced_scheme_id = favorite_scheme_id if _attempt == 1 else ""
+            attempt_excluded_scheme_ids = set(used_showroom_scheme_ids) | set(blocked_scheme_ids)
+            if forced_scheme_id:
+                attempt_excluded_scheme_ids.discard(forced_scheme_id)
             result = choose_showroom_accessory_direct(
                 accessory_kind=normalized_kind,
                 pages=TP_SHOWROOM_MAX_PAGES,
                 prefer_official=False,
                 choice_mode="random",
                 showroom_sources=[showroom_source],
-                exclude_scheme_ids=used_showroom_scheme_ids,
+                exclude_scheme_ids=attempt_excluded_scheme_ids,
                 exclude_recent_scheme_ids=recent_scheme_ids,
                 showroom_cars=list(accessory_cache.get("cars") or []),
                 showroom_sampled_pages=set(accessory_cache.get("sampled_pages") or set()),
@@ -13067,6 +13531,8 @@ def apply_tp_showroom_fallbacks_public(
                 detect_total_pages=detect_showroom_total_pages,
                 minimum_unused_choices=1,
                 allow_reuse_existing_scheme=False,
+                forced_scheme_id=forced_scheme_id,
+                forced_scheme_title=favorite_title,
                 log=logs.append,
                 cancel_event=cancel_event,
             )
@@ -13093,6 +13559,7 @@ def apply_tp_showroom_fallbacks_public(
                 retry_backoff_seconds=retry_backoff_seconds,
                 source_label="fallback_online",
                 preserve_on_cleanup=False,
+                log=logs.append,
                 cancel_event=cancel_event,
             )
             if not saved_items:
@@ -13180,9 +13647,19 @@ def apply_tp_showroom_fallbacks_public(
                     for item in recent_schemes_by_directory.get(directory_key, [])
                     if str(item).strip()
                 }
+                blocked_scheme_ids = random_paint_blocked_scheme_ids("car", user.directory, random_preferences)
+                favorite_entry = random_paint_favorite_online_entry("car", user.directory, random_preferences)
+                favorite_scheme_id = str((favorite_entry or {}).get("scheme_id") or "").strip()
+                favorite_title = str((favorite_entry or {}).get("title") or "").strip()
+                if favorite_scheme_id in blocked_scheme_ids:
+                    favorite_scheme_id = ""
                 for _attempt in range(1, 5):
                     if _cancel_requested(cancel_event):
                         break
+                    forced_scheme_id = favorite_scheme_id if _attempt == 1 else ""
+                    attempt_excluded_scheme_ids = set(used_showroom_scheme_ids) | set(blocked_scheme_ids)
+                    if forced_scheme_id:
+                        attempt_excluded_scheme_ids.discard(forced_scheme_id)
                     result = choose_showroom_paint_direct(
                         directory=user.directory,
                         mapping_path=mapping_path,
@@ -13190,7 +13667,7 @@ def apply_tp_showroom_fallbacks_public(
                         prefer_official=False,
                         choice_mode="random",
                         showroom_sources=[showroom_source],
-                        exclude_scheme_ids=used_showroom_scheme_ids,
+                        exclude_scheme_ids=attempt_excluded_scheme_ids,
                         exclude_recent_scheme_ids=recent_scheme_ids,
                         showroom_cars=list(showroom_cache.get("cars") or []),
                         showroom_sampled_pages=set(showroom_cache.get("sampled_pages") or set()),
@@ -13198,6 +13675,8 @@ def apply_tp_showroom_fallbacks_public(
                         detect_total_pages=detect_showroom_total_pages,
                         minimum_unused_choices=1,
                         allow_reuse_existing_scheme=False,
+                        forced_scheme_id=forced_scheme_id,
+                        forced_scheme_title=favorite_title,
                         log=logs.append,
                         cancel_event=cancel_event,
                     )
@@ -13223,6 +13702,7 @@ def apply_tp_showroom_fallbacks_public(
                         retry_backoff_seconds=retry_backoff_seconds,
                         source_label="fallback_online",
                         preserve_on_cleanup=False,
+                        log=logs.append,
                         cancel_event=cancel_event,
                     )
                     if not saved_items:
@@ -15968,6 +16448,7 @@ def move_or_extract(
                         shutil.copyfileobj(decompressor, out)
                 else:
                     shutil.copy2(src, temp_primary_dest)
+                remember_previous_paint_file(primary_dest, downloaded.session_id, downloaded.download_id)
                 os.replace(temp_primary_dest, primary_dest)
                 saved_paths = [primary_dest]
                 for extra_dest in dest_paths[1:]:
@@ -15975,6 +16456,7 @@ def move_or_extract(
                     temp_extra_dest = extra_dest.with_name(extra_dest.name + ".tmp")
                     temp_extra_dest.unlink(missing_ok=True)
                     shutil.copy2(primary_dest, temp_extra_dest)
+                    remember_previous_paint_file(extra_dest, downloaded.session_id, downloaded.download_id)
                     os.replace(temp_extra_dest, extra_dest)
                     saved_paths.append(extra_dest)
                 src.unlink(missing_ok=True)
@@ -16128,6 +16610,212 @@ def _download_id_from_dict(payload: dict[str, object]) -> DownloadId:
         tp_source_link=str(payload.get("tp_source_link") or ""),
         tp_source=str(payload.get("tp_source") or ""),
     )
+
+def _paint_history_target_key(download_id: DownloadId) -> str:
+    slot = _session_asset_slot_for_paint_type(download_id.paint_type) or str(download_id.paint_type.value)
+    target_kind = "team" if bool(download_id.is_team_paint) else "user"
+    target_id = max(0, int(download_id.user_id or 0))
+    directory = canonicalize_car_directory(download_id.directory).lower() if slot == "car" else "driver"
+    variant = "ss" if bool(download_id.is_superspeedway_variant) else "main"
+    numbered = "numbered" if bool(getattr(download_id, "is_numbered_car_spec", False)) else "plain"
+    return f"{target_kind}:{target_id}:{directory}:{slot}:{download_id.paint_type.value}:{variant}:{numbered}"
+
+def _paint_history_match_entry_for_user_kind(entry: dict[str, object], user: SessionUser, kind: str) -> bool:
+    if not isinstance(entry, dict):
+        return False
+    normalized_kind = _driver_paint_override_kind(kind)
+    if str(entry.get("asset_slot") or "") != normalized_kind:
+        return False
+    target_kind, target_id, target_directory = user.effective_target_key()
+    if str(entry.get("target_kind") or "") != str(target_kind):
+        return False
+    try:
+        if int(entry.get("target_id") or 0) != int(target_id):
+            return False
+    except Exception:
+        return False
+    if normalized_kind == "car":
+        return str(entry.get("directory") or "").lower() == str(target_directory or "").lower()
+    return True
+
+def _load_paint_history_index(path: Path | None = None) -> dict[str, object]:
+    resolved = Path(path) if path is not None else default_paint_history_index_path()
+    if not resolved.exists():
+        return {"version": 1, "entries": []}
+    try:
+        raw = json.loads(resolved.read_text(encoding="utf-8"))
+    except Exception:
+        return {"version": 1, "entries": []}
+    entries = raw.get("entries") if isinstance(raw, dict) else []
+    if not isinstance(entries, list):
+        entries = []
+    safe_entries = [entry for entry in entries if isinstance(entry, dict)]
+    return {"version": 1, "entries": safe_entries}
+
+def _save_paint_history_index(index: dict[str, object], path: Path | None = None) -> None:
+    resolved = Path(path) if path is not None else default_paint_history_index_path()
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    entries = index.get("entries") if isinstance(index, dict) else []
+    if not isinstance(entries, list):
+        entries = []
+    safe = {"version": 1, "entries": entries}
+    temp = resolved.with_name(resolved.name + ".tmp")
+    temp.write_text(json.dumps(safe, indent=2, sort_keys=True), encoding="utf-8")
+    os.replace(temp, resolved)
+
+def _prune_paint_history_entries(entries: list[dict[str, object]]) -> list[dict[str, object]]:
+    sorted_entries = sorted(
+        [entry for entry in entries if isinstance(entry, dict)],
+        key=lambda entry: float(entry.get("created_at") or 0.0),
+        reverse=True,
+    )
+    kept: list[dict[str, object]] = []
+    counts: Counter[str] = Counter()
+    pruned: list[dict[str, object]] = []
+    for entry in sorted_entries:
+        target_key = str(entry.get("target_key") or "")
+        if len(kept) >= PAINT_HISTORY_GLOBAL_LIMIT or counts[target_key] >= PAINT_HISTORY_LIMIT_PER_TARGET:
+            pruned.append(entry)
+            continue
+        kept.append(entry)
+        counts[target_key] += 1
+    for entry in pruned:
+        backup_path = Path(str(entry.get("backup_path") or ""))
+        try:
+            backup_path.unlink(missing_ok=True)
+        except Exception:
+            logging.debug("Could not prune paint history backup %s", backup_path, exc_info=True)
+    return kept
+
+def remember_previous_paint_file(destination: Path, session_id: SessionId, download_id: DownloadId) -> bool:
+    try:
+        destination = Path(destination)
+        if not destination.exists() or not destination.is_file():
+            return False
+        stat = destination.stat()
+        if int(stat.st_size) <= 0:
+            return False
+    except Exception:
+        return False
+    slot = _session_asset_slot_for_paint_type(download_id.paint_type) or str(download_id.paint_type.value)
+    target_kind = "team" if bool(download_id.is_team_paint) else "user"
+    target_id = max(0, int(download_id.user_id or 0))
+    directory = canonicalize_car_directory(download_id.directory).lower() if slot == "car" else "driver"
+    target_key = _paint_history_target_key(download_id)
+    created_at = time.time()
+    digest = hashlib.sha1(f"{target_key}|{destination}|{created_at}".encode("utf-8", errors="ignore")).hexdigest()[:12]
+    backup_dir = default_paint_history_dir() / "files" / target_key.replace(":", "_")
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    backup_path = backup_dir / f"{int(created_at * 1000)}_{digest}_{destination.name}"
+    try:
+        shutil.copy2(destination, backup_path)
+    except Exception as exc:
+        logging.debug("Could not snapshot previous paint %s: %s", destination, exc)
+        return False
+    entry = {
+        "version": 1,
+        "created_at": created_at,
+        "session_id": session_id.folder_name(),
+        "target_key": target_key,
+        "target_kind": target_kind,
+        "target_id": target_id,
+        "directory": directory,
+        "asset_slot": slot,
+        "file_path": str(destination),
+        "file_name": destination.name,
+        "backup_path": str(backup_path),
+        "download_id": _download_id_to_dict(download_id),
+        "previous_size": int(stat.st_size),
+        "previous_mtime": float(stat.st_mtime),
+    }
+    index = _load_paint_history_index()
+    entries = index.get("entries") if isinstance(index, dict) else []
+    if not isinstance(entries, list):
+        entries = []
+    entries.insert(0, entry)
+    index["entries"] = _prune_paint_history_entries(entries)
+    try:
+        _save_paint_history_index(index)
+    except Exception:
+        logging.debug("Could not save paint history index", exc_info=True)
+        return False
+    return True
+
+def paint_history_entries_for_user_kind(session: Session, user: SessionUser, kind: str) -> list[dict[str, object]]:
+    normalized_kind = _driver_paint_override_kind(kind)
+    if session is None or user is None or not normalized_kind:
+        return []
+    index = _load_paint_history_index()
+    entries = index.get("entries") if isinstance(index, dict) else []
+    if not isinstance(entries, list):
+        return []
+    matches = [
+        entry
+        for entry in entries
+        if isinstance(entry, dict)
+        and _paint_history_match_entry_for_user_kind(entry, user, normalized_kind)
+        and Path(str(entry.get("backup_path") or "")).exists()
+    ]
+    matches.sort(key=lambda entry: float(entry.get("created_at") or 0.0), reverse=True)
+    return matches
+
+def paint_history_has_previous(session: Session | None, user: SessionUser | None, kind: str) -> bool:
+    if session is None or user is None:
+        return False
+    return bool(paint_history_entries_for_user_kind(session, user, kind))
+
+def restore_previous_paint_for_user_kind(
+    *,
+    session: Session,
+    user: SessionUser,
+    kind: str,
+    paints_dir: Path,
+) -> tuple[list[SavedFile], list[str]]:
+    normalized_kind = _driver_paint_override_kind(kind)
+    logs: list[str] = []
+    if not normalized_kind:
+        return [], [f"Unsupported paint history kind: {kind}"]
+    entries = paint_history_entries_for_user_kind(session, user, normalized_kind)
+    if not entries:
+        return [], [f"No previous {normalized_kind} paint is available for {user.display_name or user.user_id}."]
+    latest_by_path: dict[str, dict[str, object]] = {}
+    for entry in entries:
+        file_key = os.path.normcase(os.path.abspath(str(entry.get("file_path") or "")))
+        if file_key and file_key not in latest_by_path:
+            latest_by_path[file_key] = entry
+    restored: list[SavedFile] = []
+    for entry in latest_by_path.values():
+        backup_path = Path(str(entry.get("backup_path") or ""))
+        if not backup_path.exists():
+            continue
+        try:
+            download_id = _download_id_from_dict(entry.get("download_id") if isinstance(entry.get("download_id"), dict) else {})
+        except Exception:
+            continue
+        download_id = replace(
+            download_id,
+            preserve_on_cleanup=False,
+            tp_source=str(getattr(download_id, "tp_source", "") or "paint_history"),
+        )
+        destination = Path(str(entry.get("file_path") or "")) if entry.get("file_path") else save_path_for(download_id, paints_dir)
+        try:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            remember_previous_paint_file(destination, session.session_id, download_id)
+            temp_destination = destination.with_name(destination.name + ".tmp")
+            temp_destination.unlink(missing_ok=True)
+            shutil.copy2(backup_path, temp_destination)
+            os.replace(temp_destination, destination)
+            restored.append(SavedFile(session_id=session.session_id, download_id=download_id, file_path=destination))
+        except Exception as exc:
+            logs.append(f"Could not restore previous {normalized_kind} paint file {destination.name}: {exc}")
+            logging.debug("Paint history restore failed for %s", destination, exc_info=True)
+    if restored:
+        logs.append(
+            f"Restored previous {normalized_kind} paint for {user.display_name or user.user_id}: {len(restored)} file(s)."
+        )
+    elif not logs:
+        logs.append(f"No previous {normalized_kind} paint file could be restored for {user.display_name or user.user_id}.")
+    return restored, logs
 
 def _replay_pack_index_path(replay_packs_dir: Path) -> Path:
     return replay_packs_dir / REPLAY_PACK_INDEX_FILENAME
@@ -20099,17 +20787,20 @@ class DownloaderUI:
         for column_index, (kind, label) in enumerate((("car", "Car"), ("helmet", "Helmet"), ("suit", "Suit"))):
             block = ttk.Frame(action_rows)
             block.grid(row=0, column=column_index, sticky="w", padx=(0 if column_index == 0 else 12, 0))
-            ttk.Label(block, text=label, font=("Segoe UI", 9, "bold")).pack(side="left")
+            ttk.Label(block, text=label, font=("Segoe UI", 9, "bold")).grid(row=0, column=0, columnspan=3, sticky="w")
             actions = (
-                ("open", "Open TP", lambda k=kind: self.open_selected_driver_tp_paint(k)),
-                ("assign", "Assign link...", lambda k=kind: self.assign_selected_driver_paint_from_link(k)),
-                ("current", "Assign current", lambda k=kind: self.assign_current_driver_paint(k)),
-                ("random", "Random", lambda k=kind: self.assign_random_driver_paint(k)),
-                ("forget", "Forget", lambda k=kind: self.forget_selected_driver_paint(k)),
+                ("open", "Open TP", 1, 0, lambda k=kind: self.open_selected_driver_tp_paint(k)),
+                ("assign", "Assign link...", 1, 1, lambda k=kind: self.assign_selected_driver_paint_from_link(k)),
+                ("current", "Assign current", 1, 2, lambda k=kind: self.assign_current_driver_paint(k)),
+                ("random", "Random", 2, 0, lambda k=kind: self.assign_random_driver_paint(k)),
+                ("favorite", "Favorite", 2, 1, lambda k=kind: self.favorite_selected_random_paint(k)),
+                ("block", "Block", 2, 2, lambda k=kind: self.block_selected_random_paint(k)),
+                ("restore", "Restore previous", 3, 0, lambda k=kind: self.restore_previous_driver_paint(k)),
+                ("forget", "Forget", 3, 1, lambda k=kind: self.forget_selected_driver_paint(k)),
             )
-            for action_key, button_text, command in actions:
+            for action_key, button_text, row_index, button_column, command in actions:
                 button = ttk.Button(block, text=button_text, command=command)
-                button.pack(side="left", padx=(6, 0))
+                button.grid(row=row_index, column=button_column, sticky="ew", padx=(0 if button_column == 0 else 6, 0), pady=(4, 0))
                 self.session_driver_action_buttons.append(button)
                 self.session_driver_action_buttons_by_kind[(kind, action_key)] = button
 
@@ -21120,11 +21811,17 @@ class DownloaderUI:
             can_open = bool(_driver_paint_entry_url(entry or current_entry, user))
             can_assign_current = current_entry is not None
             can_forget = has_override or row_status_code in {"fallback", "fallback_local", "fallback_online"}
+            random_source_entry = _random_preference_entry_from_driver_current_entry(current_entry, row_status_code)
+            can_mark_random = random_source_entry is not None
+            can_restore_previous = paint_history_has_previous(snapshot.current_session, user, kind)
             for action_key, action_enabled in (
                 ("assign", True),
                 ("current", can_assign_current),
                 ("random", True),
                 ("open", can_open),
+                ("favorite", can_mark_random),
+                ("block", can_mark_random),
+                ("restore", can_restore_previous),
                 ("forget", can_forget),
             ):
                 button = getattr(self, "session_driver_action_buttons_by_kind", {}).get((kind, action_key))
@@ -21274,6 +21971,108 @@ class DownloaderUI:
             self._append_log(f"Cannot randomize unsupported paint kind: {kind}")
             return
         self._start_driver_override_assignment(normalized_kind, scheme_id="", source_link="", source_label="random")
+    def _selected_random_paint_preference_entry(self, kind: str) -> tuple[SessionDriverSnapshot, dict[str, object]] | None:
+        selected = self._require_selected_session_driver()
+        if selected is None:
+            return None
+        snapshot, row, user = selected
+        normalized_kind = _driver_paint_override_kind(kind)
+        if not normalized_kind or snapshot.current_session is None:
+            self._append_log(f"Cannot inspect unsupported paint kind: {kind}")
+            return None
+        row_status_code = str(getattr(row, f"{normalized_kind}_status_code", "") or "")
+        current_entry = _driver_current_paint_entry_from_saved(
+            session=snapshot.current_session,
+            saved_items=list(snapshot.last_saved),
+            user=user,
+            kind=normalized_kind,
+            allow_profile_link=row_status_code in {"downloaded", "team_paint", "driver_paint", "replay", "fallback_online"},
+        )
+        preference_entry = _random_preference_entry_from_driver_current_entry(current_entry, row_status_code)
+        if preference_entry is None:
+            self._append_log(f"{row.display_name}'s current {normalized_kind} paint is not a random fallback source that can be favorited or blocked.")
+            self._update_session_action_state()
+            return None
+        return row, preference_entry
+    def favorite_selected_random_paint(self, kind: str) -> None:
+        selected = self._selected_random_paint_preference_entry(kind)
+        if selected is None:
+            return
+        row, preference_entry = selected
+        if remember_random_paint_favorite(preference_entry):
+            title = str(preference_entry.get("title") or preference_entry.get("scheme_id") or preference_entry.get("source_id") or "paint").strip()
+            self._append_log(f"Marked {row.display_name}'s current {kind} random paint as favorite: {title}.")
+            self.status_var.set("Random favorite saved")
+        else:
+            self._append_log(f"Could not favorite {row.display_name}'s current {kind} random paint.")
+        self._update_session_action_state()
+    def block_selected_random_paint(self, kind: str) -> None:
+        selected = self._selected_random_paint_preference_entry(kind)
+        if selected is None:
+            return
+        row, preference_entry = selected
+        if block_random_paint_source(preference_entry):
+            title = str(preference_entry.get("title") or preference_entry.get("scheme_id") or preference_entry.get("source_id") or "paint").strip()
+            self._append_log(f"Blocked {row.display_name}'s current {kind} random paint from future random choices: {title}.")
+            self.status_var.set("Random paint blocked")
+        else:
+            self._append_log(f"Could not block {row.display_name}'s current {kind} random paint.")
+        self._update_session_action_state()
+    def restore_previous_driver_paint(self, kind: str) -> None:
+        selected = self._require_selected_session_driver()
+        if selected is None:
+            return
+        snapshot, row, user = selected
+        normalized_kind = _driver_paint_override_kind(kind)
+        if not normalized_kind or snapshot.current_session is None:
+            self._append_log(f"Cannot restore unsupported paint kind: {kind}")
+            return
+        session = snapshot.current_session
+        paints_dir = default_paints_dir(self.config)
+        self._append_log(f"Restoring previous {normalized_kind} paint for {row.display_name}.")
+        self.status_var.set(f"Restoring previous {normalized_kind}...")
+
+        def _worker() -> None:
+            saved_items: list[SavedFile] = []
+            logs: list[str] = []
+            registered = False
+            try:
+                saved_items, logs = restore_previous_paint_for_user_kind(
+                    session=session,
+                    user=user,
+                    kind=normalized_kind,
+                    paints_dir=paints_dir,
+                )
+                if saved_items:
+                    registered = self.service.register_manual_saved_paints(
+                        session,
+                        saved_items,
+                        "downloaded",
+                        queue_reapply=False,
+                    )
+                    if registered:
+                        self.service.request_global_texture_reload()
+            except Exception as exc:
+                logging.debug("Paint history restore worker failed", exc_info=True)
+                logs.append(f"Could not restore previous {normalized_kind} paint for {row.display_name}: {exc}")
+
+            def _finish() -> None:
+                for line in logs:
+                    self._append_log(line)
+                if saved_items and registered:
+                    self.status_var.set(f"Previous {normalized_kind} restored")
+                    self._last_session_snapshot_signature = None
+                    self._refresh_session_tree()
+                elif saved_items:
+                    self._append_log(f"Previous {normalized_kind} paint was restored on disk, but the active session changed before the table could be updated.")
+                    self.status_var.set("Watching")
+                else:
+                    self.status_var.set("Watching")
+                self._update_session_action_state()
+
+            self.root.after(0, _finish)
+
+        threading.Thread(target=_worker, name="NishizumiPaintHistoryRestore", daemon=True).start()
     def assign_current_driver_paint(self, kind: str) -> None:
         selected = self._require_selected_session_driver()
         if selected is None:
