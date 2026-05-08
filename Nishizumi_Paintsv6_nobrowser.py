@@ -16872,10 +16872,16 @@ def restore_previous_paint_for_user_kind(
             download_id = _download_id_from_dict(entry.get("download_id") if isinstance(entry.get("download_id"), dict) else {})
         except Exception:
             continue
+        source = str(getattr(download_id, "tp_source", "") or "").strip()
+        if source.lower() in {"driver_override", "manual", "random"}:
+            source = "paint_history"
         download_id = replace(
             download_id,
             preserve_on_cleanup=False,
-            tp_source=str(getattr(download_id, "tp_source", "") or "paint_history"),
+            tp_scheme_id="",
+            tp_title="",
+            tp_source_link="",
+            tp_source=source or "paint_history",
         )
         destination = Path(str(entry.get("file_path") or "")) if entry.get("file_path") else save_path_for(download_id, paints_dir)
         try:
@@ -22418,6 +22424,7 @@ class DownloaderUI:
 
         def _worker() -> None:
             results: list[tuple[tuple[object, int, str, str], SessionDriverSnapshot, list[SavedFile], bool, list[str]]] = []
+            reload_items: list[SavedFile] = []
             for row, user, action_key in jobs:
                 saved_items: list[SavedFile] = []
                 logs: list[str] = []
@@ -22462,11 +22469,13 @@ class DownloaderUI:
                             queue_reapply=False,
                         )
                         if registered:
-                            self.service.request_global_texture_reload()
+                            reload_items.extend(saved_items)
                 except Exception as exc:
                     logging.debug("Paint history restore worker failed", exc_info=True)
                     logs.append(f"Could not restore previous {normalized_kind} paint for {row.display_name}: {exc}")
                 results.append((action_key, row, saved_items, registered, logs))
+            if reload_items:
+                self._trigger_incremental_texture_reload_for_saved_items(session, reload_items)
 
             def _finish() -> None:
                 saved_any = False
@@ -22493,6 +22502,18 @@ class DownloaderUI:
             self.root.after(0, _finish)
 
         threading.Thread(target=_worker, name="NishizumiPaintHistoryRestore", daemon=True).start()
+    def _trigger_incremental_texture_reload_for_saved_items(self, session: Session, saved_items: list[SavedFile]) -> bool:
+        if not saved_items:
+            return False
+        reader = None
+        try:
+            reader = create_sdk_reader()
+            return bool(reader is not None and _try_incremental_texture_reload(reader, session, saved_items))
+        except Exception:
+            logging.debug("Incremental texture reload for restored paint failed", exc_info=True)
+            return False
+        finally:
+            close_sdk_reader(reader)
     def assign_current_driver_paint(self, kind: str) -> None:
         selected = self._require_selected_session_drivers()
         if selected is None:
@@ -22712,7 +22733,7 @@ class DownloaderUI:
                         queue_reapply=False,
                     )
                     if registered:
-                        self.service.request_global_texture_reload()
+                        self._trigger_incremental_texture_reload_for_saved_items(session, saved_items)
                 else:
                     history_items, history_logs = restore_previous_paint_for_user_kind(
                         session=session,
@@ -22731,7 +22752,7 @@ class DownloaderUI:
                             queue_reapply=False,
                         )
                         if registered:
-                            self.service.request_global_texture_reload()
+                            self._trigger_incremental_texture_reload_for_saved_items(session, saved_items)
             except Exception as exc:
                 logging.debug("Original paint restore after Forget failed", exc_info=True)
                 logs.append(f"Could not restore original {kind} paint for {row.display_name}: {exc}")
