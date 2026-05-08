@@ -48,6 +48,7 @@ Examples of other runtime files include:
 
 - `%APPDATA%\NishizumiPaints\.nishizumi_tp_recent_schemes.json`
 - `%APPDATA%\NishizumiPaints\.nishizumi_driver_paint_overrides.json`
+- `%APPDATA%\NishizumiPaints\.nishizumi_random_paint_preferences.json`
 - `%APPDATA%\NishizumiPaints\.nishizumi_tp_login_status.json`
 
 These are state files, not repository assets.
@@ -60,6 +61,7 @@ Local fallback content uses different folders:
 - `%APPDATA%\Nishizumi-Paints\CollectionPool`
 - `%APPDATA%\Nishizumi-Paints\AiLiveries`
 - `%APPDATA%\Nishizumi-Paints\DriverOverrides`
+- `%APPDATA%\Nishizumi-Paints\PaintHistory`
 
 Notice that some runtime folders use `Nishizumi-Paints` while the settings path uses `NishizumiPaints`. That is part of the current historical path layout preserved by the app.
 

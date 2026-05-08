@@ -9,6 +9,8 @@ The app can store:
 - settings
 - recent-scheme state
 - driver override memory
+- random fallback favorites and blocklist entries
+- paint-history snapshots used by Restore previous
 - showroom mapping overrides
 - RandomPool content
 - collection-pool content
@@ -52,7 +54,9 @@ It intentionally ignores:
 
 The main online fallback path uses public showroom direct downloads. That reduces the need to package or ship browser automation just to make public fallback work.
 
-The 6.2.0 manual team downloader also stays browserless. It sends the entered Team ID, resolved car directory, optional requesting/driver member IDs, and car number to Trading Paints manifest endpoints. It does not store Trading Paints passwords, cookies, or tokens.
+The 7.0 manual team downloader also stays browserless. It sends the entered Team ID, resolved car directory, optional requesting/driver member IDs, and car number to Trading Paints manifest endpoints. It does not store Trading Paints passwords, cookies, or tokens.
+
+Session table camera switching uses the local iRacing SDK connection. It does not send camera-control data to Trading Paints or GitHub.
 
 ## Responsible debugging
 

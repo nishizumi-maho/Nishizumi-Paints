@@ -26,6 +26,8 @@ Nishizumi Paints should not require users to commit, share, or publish:
 - iRacing document contents
 - local paint folders
 - local RandomPool or collection-pool caches
+- local paint-history snapshots
+- random fallback favorites or blocklist files
 - `.playwright-cli/` captures or other local browser/debug exports
 - `FILES TO SEND/` or other staging/export folders prepared for manual sharing
 - installer-built `dist/` or `build/` output
@@ -37,4 +39,4 @@ Nishizumi Paints should not require users to commit, share, or publish:
 
 The repository intentionally excludes generated builds, installer output, local browser bundles, cache folders, scratch directories, staging/export folders, and local downloaded paint pools.
 
-The no-browser public-showroom path in the current release does not require shipping an embedded browser, but local runtime data can still contain account-linked or machine-specific information and should not be committed.
+The no-browser public-showroom path in the current release does not require shipping an embedded browser, Trading Paints cookies, or Trading Paints tokens. Local runtime data can still contain account-linked or machine-specific information and should not be committed.

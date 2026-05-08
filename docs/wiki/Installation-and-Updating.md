@@ -38,6 +38,17 @@ Typical flow:
 
 User configuration, cached pools, mapping overrides, and other runtime data stay in the Roaming AppData config area, not in the install folder.
 
+## Updating from 6.5 to 7.0
+
+Version 7.0 is the consolidated public release after 6.5. Existing settings are reused. New or missing settings default to safer behavior:
+
+- random paints are not applied to the local user unless enabled
+- random paints in Team events remain disabled unless enabled
+- Team current-driver fallback options are enabled by item type
+- Team driver personal paint preloading is enabled
+
+After updating, review the Random tab and General tab if you want more aggressive fallback behavior.
+
 ## Source run
 
 ```powershell

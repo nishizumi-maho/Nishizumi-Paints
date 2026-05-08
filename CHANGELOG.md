@@ -2,20 +2,30 @@
 
 All notable user-facing changes to Nishizumi Paints are documented here.
 
-## [6.5.2] - 2026-04-29
+## [7.0.0] - 2026-05-08
 
 ### Stable Release
 
-- Changed the default for **Do not apply random paints to myself** to checked for new or missing config values.
-- Confirmed **Do not apply random paints in team events** remains checked by default.
+This release consolidates the 6.5-to-7.0 work into one public release.
 
-## [6.5.1] - 2026-04-29
-
-### Experimental
-
-- Removed the old local AI roster prefill workflow that could still run at startup or after AI roster sync.
-- Fixed the warning `Local AI roster prefill failed: name 'LocalAIRosterPrefillResult' is not defined`.
-- Kept current AI random fallback and local AI roster live-update behavior intact; only the stale prefill path was removed.
+- Added Team-session personal paint fallback: when a team car, suit, or helmet is missing, Nishizumi Paints can use the current in-car driver's matching personal item before random fallback.
+- Added per-item Team fallback controls for car, suit, and helmet, plus preloading of Team drivers' personal paints so driver swaps can reuse cached files faster.
+- Added confirmed Team driver-swap handling with post-swap refresh retries, stale-file cleanup, and clearer Team Event logs.
+- Added richer Session diagnostics: compact non-Team layout, Team-only current-driver/swap/refresh columns, and per-item tooltips explaining Team paint, driver paint, random fallback, or iRacing default.
+- Added Session actions for random fallback management: Favorite, Block, Restore previous, Forget, Open TP, and Force refresh current car/team.
+- Added paint-history snapshots before overwrites and Restore previous for car, helmet, and suit.
+- Added random-paint favorites and blocklist support for public showroom and Local RandomPool sources.
+- Added auto repair for failed direct Trading Paints downloads: retry, partial-file cleanup, and one final online fallback pass before local fallback.
+- Added multi-select in the Session driver table so compatible fixed-paint actions can be applied to all selected drivers.
+- Added double-click camera switching from the Session table through the iRacing SDK camera broadcast.
+- Tightened the Random tab layout by removing extra explanatory text under Step 2 and Step 3 and moving the showroom and local pool controls higher.
+- Changed new or missing configs to protect the local user by default: random paints are not applied to the local user, and random paints in Team events remain disabled unless enabled.
+- Removed the stale local AI roster prefill startup path while keeping AI random fallback and local AI roster live-update behavior.
+- Fixed Restore previous after random fixed overrides so override memory is cleared, restored history paints return to normal Session status, and only affected cars receive texture reloads.
+- Fixed Team driver-personal restores so they register as `driver_paint`, not `override`.
+- Fixed Forget so Team targets without a real Team Trading Paints asset can restore the prior driver-personal paint from history.
+- Fixed repeated Team-driver preload retries for unavailable personal assets with a short per-session cooldown.
+- Prevented duplicate manual random and restore jobs from launching for the same selected driver item.
 
 ## [6.5] - 2026-04-29
 

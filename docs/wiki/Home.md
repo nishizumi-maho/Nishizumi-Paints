@@ -4,6 +4,8 @@ This folder is the versioned source of the Nishizumi Paints manual. It is writte
 
 Nishizumi Paints is a Windows desktop companion for iRacing. It watches live sessions, downloads normal Trading Paints liveries, fills gaps with configurable random fallback sources, manages AI rosters, and keeps the whole workflow usable for both casual and advanced users.
 
+Version 7.0 consolidates the work since 6.5 into one public release: Team-session driver personal fallback, smarter Team driver-swap handling, Session table multi-select actions, double-click camera switching, random favorites/blocklist, paint-history restore, and a cleaner Random tab layout.
+
 ## What the app does
 
 - monitors the iRacing SDK and reacts to session changes
@@ -11,6 +13,9 @@ Nishizumi Paints is a Windows desktop companion for iRacing. It watches live ses
 - applies public-showroom fallback for cars, helmets, and suits when they do not
 - keeps a local RandomPool for reusable fallback assets
 - supports per-driver overrides and quick randomization from the Session tab
+- supports multi-select Session actions for compatible driver operations
+- can switch the in-game camera to a driver by double-clicking the Session row
+- remembers random fallback favorites, blocked sources, and previous paint snapshots
 - syncs AI rosters and AI livery assets
 - runs in Easy mode, Advanced mode, tray/background mode, and headless mode
 
@@ -27,7 +32,8 @@ Nishizumi Paints is a Windows desktop companion for iRacing. It watches live ses
 9. [Showroom Mapping and Collections](Showroom-Mapping-and-Collections)
 10. [AI Tab](AI-Tab)
 11. [Background and Headless Modes](Background-and-Headless-Modes)
-12. [Troubleshooting](Troubleshooting)
+12. [Release 7.0](Release-7.0)
+13. [Troubleshooting](Troubleshooting)
 
 ## Core concepts
 
@@ -50,6 +56,14 @@ The app can also cache paints from Trading Paints collections. This is useful fo
 ### Per-driver memory
 
 The Session tab can remember fixed overrides for a driver. It can also forget them. Forgetting now restores a driver back to the real Trading Paints paint if the driver had one and only clears fallback memory when the driver did not.
+
+### Paint history and restore
+
+Before overwriting a car, helmet, or suit, the app stores a local history snapshot. `Restore previous` copies that snapshot back, clears fixed-override metadata, updates the Session table source state, and reloads only affected cars.
+
+### Team driver fallback
+
+In Team sessions, the app tries the Team paint first. If the Team item is missing, it can use the current driver's personal car, helmet, or suit before random fallback. Driver swaps are confirmed before repainting, and the app retries briefly afterward to catch late iRacing or Trading Paints updates.
 
 ## User-interface modes
 

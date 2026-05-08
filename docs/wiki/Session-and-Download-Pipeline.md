@@ -33,6 +33,12 @@ For each session user, the app attempts to resolve normal Trading Paints assets 
 
 This stage decides which normal TP files already exist for the session before fallback even starts.
 
+For Team sessions, team assets are preferred per item. If the team has no car, helmet, or suit for the active car, the matching General-tab option can retarget the current in-car driver's personal asset for that same item to the team file path.
+
+The app also starts an experimental preload pass for Team sessions. It caches personal car, suit, and helmet files for team drivers exposed by the iRacing session data, then reuses that cache before making a fresh fallback download.
+
+The session fingerprint includes the active driver's iRacing ID. In Team sessions, a driver swap in the same team car is first treated as a candidate, then confirmed on a follow-up read before the app clears and reapplies that team's files. Confirmed swaps also schedule short refresh retries at 5, 12, and 20 seconds so late Trading Paints or iRacing updates can still be picked up. When that happens, the log records the old and new driver and the Session tab updates the last-swap column.
+
 ## 4. Download stage
 
 Resolved download items are queued and fetched using the configured worker mode.
@@ -76,6 +82,11 @@ As saves and fallback actions happen, the app updates:
 
 - row asset state
 - overall row status
+- per-item source, such as Team paint, Driver paint, Random, or iRacing default
+- current driver
+- last detected team driver swap
+- last refresh time
+- per-item hover reasons explaining the chosen source
 - Trading Paints source metadata
 - monitor counters and summaries
 
@@ -89,6 +100,7 @@ At session end, the app can:
 - optionally recycle live-session paints into the RandomPool
 - preserve the local user’s livery when configured
 - clear session-only state so the next session starts cleanly
+- remove old Team-driver preload cache files
 
 ## 10. Why the pipeline matters
 
