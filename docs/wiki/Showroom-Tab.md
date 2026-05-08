@@ -40,7 +40,7 @@ The collection importer is meant for:
 
 Use the **Teams** tab when you know a Trading Paints Team ID and the target car.
 
-In 6.3.2 and newer, the Teams form only asks for the required Team ID and car value. Optional manifest context is handled internally.
+The Teams form only asks for the required Team ID and car value. Optional manifest context is handled internally.
 
 Accepted car values:
 
@@ -75,7 +75,7 @@ The no-browser release is centered on public showroom access:
 - no Trading Paints login is required for the main public path
 - public non-numbered, non-PRO assets are the intended direct-download target
 
-In 6.3.2, the manual team downloader follows the same no-browser posture. It uses Trading Paints manifest endpoints and does not require local Trading Paints cookies or a stored login.
+The manual team downloader follows the same no-browser posture. It uses Trading Paints manifest endpoints and does not require local Trading Paints cookies or a stored login.
 
 ## Relationship to RandomPool and collection pool
 

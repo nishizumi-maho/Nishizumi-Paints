@@ -52,6 +52,8 @@ The team-driver options are enabled by default. In Team sessions, the app tries 
 
 The preload option is also enabled by default. When a Team session is detected, the app caches personal paints for team drivers exposed by the iRacing session data. That cache can be applied immediately if one of those drivers later becomes the active driver in the team car.
 
+In 7.0, Team driver swaps are treated conservatively: the app confirms a detected active-driver change before clearing and reapplying files, then schedules short follow-up refreshes so late iRacing or Trading Paints data can still be applied.
+
 ## Download worker mode
 
 This section controls the main manifest, download, and save worker counts for the session pipeline.

@@ -77,6 +77,7 @@ Before publishing a release:
 1. verify the script compiles
 2. verify the onedir build works
 3. verify the installer build works
-4. keep root-level repository noise low
-5. avoid shipping local caches, tokens, browser profiles, Playwright captures, staging folders, or downloaded paint folders
-6. upload only the freshly generated installer from the cleaned `installer/output/` folder
+4. run a tracked-file secret and privacy scan
+5. keep root-level repository noise low
+6. avoid shipping local caches, tokens, browser profiles, Playwright captures, staging folders, or downloaded paint folders
+7. upload only the freshly generated installer from the cleaned `installer/output/` folder

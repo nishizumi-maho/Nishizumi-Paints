@@ -1,16 +1,14 @@
 # Nishizumi Paints
-<img width="524" height="524" alt="image" src="https://github.com/user-attachments/assets/b3a5d4a8-3808-4696-8503-26c416f86f33" />
 
+<img width="524" height="524" alt="Nishizumi Paints icon" src="https://github.com/user-attachments/assets/b3a5d4a8-3808-4696-8503-26c416f86f33" />
 
-Nishizumi Paints is a Windows desktop companion for iRacing that downloads Trading Paints liveries, applies them automatically, and fills missing car, helmet, and suit assets with configurable random fallback sources.
+Nishizumi Paints is a Windows desktop companion for iRacing. It watches live sessions, downloads Trading Paints liveries, fills missing car, helmet, and suit assets from online or local fallback sources, and gives you manual control over individual drivers from the Session table.
 
 [Download the latest release](https://github.com/nishizumi-maho/Nishizumi-Paints/releases/latest)
 ;
-[Read the full manual](./docs/wiki/Home.md)
+[Read the manual](./docs/wiki/Home.md)
 ;
 [View the changelog](./CHANGELOG.md)
-;
-[Read the unofficial Trading Paints API notes](./trading_paints_unofficial_api_sdk.md)
 ;
 [Security policy](./SECURITY.md)
 
@@ -20,74 +18,69 @@ Nishizumi Paints is a Windows desktop companion for iRacing that downloads Tradi
 - iRacing
 - Internet access for Trading Paints and public showroom downloads
 
-## Install
+## Install or update
 
-1. Download the latest setup executable from the [Releases](https://github.com/nishizumi-maho/Nishizumi-Paints/releases/latest) page.
-2. Run the downloaded `NishizumiPaints-Setup-*.exe`.
-3. Keep the startup and background options enabled if you want the app to keep monitoring from the tray.
+1. Download the latest `NishizumiPaints-Setup-*.exe` from [Releases](https://github.com/nishizumi-maho/Nishizumi-Paints/releases/latest).
+2. Run the installer.
+3. Keep startup/background options enabled if you want monitoring to continue from the tray.
 4. Finish the Quick Start wizard after first launch.
 
-## Update
+Upgrades use the same app ID and install path, so a newer installer can be run over an existing installation.
 
-1. Download the newest setup executable from the [Releases](https://github.com/nishizumi-maho/Nishizumi-Paints/releases/latest) page.
-2. Run it over the existing installation.
-3. The installer reuses the same app ID and install path, so upgrades are performed in place.
+## What's new in 7.0
 
-## First launch
+- Team sessions can fall back to the current driver's personal car, helmet, or suit when the Team paint is missing.
+- Team driver swaps are confirmed before the app clears and reapplies paints, with short follow-up refreshes for late updates.
+- The Session table now supports multi-select actions and double-click camera switching through the iRacing SDK.
+- Random fallback sources can be marked as favorites or blocked from the Session tab.
+- The app stores paint-history snapshots before overwrites and can restore the previous car, helmet, or suit.
+- Restore previous now clears override state and reloads only affected cars instead of forcing a global texture reload.
+- The Random tab is cleaner: Step 2 only chooses Local or Online, and Step 3 starts directly with showroom source and RandomPool controls.
+- New or missing configs keep the local user protected by default.
 
-The Quick Start wizard covers:
+## Session table quick guide
 
-- Easy mode or Advanced mode
-- iRacing Documents folder detection
-- safe fallback defaults
-- AI member ID setup
-- startup and background behavior
+- Select one driver to manage that driver's car, helmet, or suit.
+- Use `Ctrl+click` to toggle multiple drivers, or `Shift+click` to select a range.
+- Compatible Session actions apply to every selected driver that can use that action.
+- Double-click a driver row to switch the in-game iRacing camera to that driver's car.
+- Use `Random` to fetch a new random fallback result for the selected item.
+- Use `Favorite` or `Block` when the selected item came from a random fallback source.
+- Use `Restore previous` to put back the last saved local paint-history snapshot.
+- Use `Forget` to clear fixed override memory and return to the real Trading Paints or restored history source when available.
 
-## Using the 6.5 Showroom tools
+## Random fallback quick guide
+
+1. In **Random Step 1**, choose which targets can receive fallback paints: cars, helmets, suits, real drivers, and AI.
+2. In **Random Step 2**, choose the preferred source: `Online` for public showroom downloads or `Local` for the RandomPool.
+3. In **Random Step 3**, choose public showroom sources and manage the Local RandomPool.
+
+The Local RandomPool can be filled from manual Showroom imports, collections, or optional recycling of downloaded session car paints.
+
+## Team session quick guide
+
+The recommended 7.0 Team fallback order is:
+
+1. Team paint for the item.
+2. Current driver's personal paint for the same item, if the matching General-tab fallback option is enabled.
+3. Random fallback, if the target is eligible.
+4. iRacing default.
+
+The Team driver-personal fallback options are split by car, suit, and helmet. Preloading is enabled by default so driver swaps can apply cached personal paints faster.
+
+## Showroom tools
 
 Open **Showroom** when you want to pre-fill paints manually instead of waiting for a live session fallback.
 
-### Choose Showroom sources
+- **Car** downloads random public non-PRO paints for one mapped iRacing car.
+- **Member ID** downloads a known member's car, helmet, and suit paints.
+- **Teams** downloads known Team paints.
+- **Showroom links** accepts one or more Trading Paints paint links.
+- **Collection** imports usable public non-PRO paints from a Trading Paints collection.
 
-In **Advanced mode**, enable the public Showroom sources the app may use:
+## Privacy notes
 
-- **Trending**
-- **Newest**
-- **Most favorited**
-- **Most raced (ever)**
-
-If more than one source is enabled, Nishizumi Paints randomly chooses one enabled source each time it fetches a public random paint. New or missing configs default to all four sources enabled.
-
-### Download random paints for one car
-
-1. Open **Showroom**.
-2. Use the **Car** tab.
-3. Click the **Car** field and choose a car from the dropdown, or type part of the car name to filter suggestions.
-4. Choose how many paints to download and the max page scan limit.
-5. Click **Download to RandomPool**, or choose a custom folder first and click **Download to custom folder**.
-
-### Download a member's paints
-
-Use **Showroom > Member ID** when you know a Trading Paints/iRacing member ID.
-
-- To download one car: enter the Member ID, choose the car, then click **Download car to iRacing paints** or **Download car to custom folder**.
-- To download everything found for that member: enter only the Member ID, then use the **Download everything** box and click **Download ALL member paints...**. The app saves all returned cars, helmets, and suits into an organized member folder.
-
-### Download a team's paints
-
-Use **Showroom > Teams** when you know a Trading Paints team ID.
-
-- To download one car: enter the Team ID, choose the car, then click **Download to iRacing paints** or **Download to custom folder**.
-- To download everything found for that team: enter only the Team ID, then use the **Download everything** box and click **Download ALL team paints...**. The app scans mapped Trading Paints cars and saves found car, helmet, and suit assets into an organized team folder.
-
-### Other Showroom tabs
-
-- **Showroom links**: paste one or more Trading Paints paint links, one per line.
-- **Collection**: paste a Trading Paints collection URL or ID to download usable public non-PRO paints from that collection.
-
-### Local RandomPool recycle option
-
-The **Recycle downloaded TP car paints into the local random pool** checkbox is off by default. Leave it off if you only want live downloads to be used for the current workflow. Turn it on if you want downloaded Trading Paints car paints to be archived into the local RandomPool for future fallback reuse.
+The normal 7.0 online fallback path is browserless and does not require a Trading Paints login, password, cookie, token, or browser profile. Runtime data such as settings, paint history, RandomPool files, collection caches, and local iRacing paint folders should stay local and should not be committed.
 
 ## Run from source
 
@@ -97,21 +90,14 @@ python .\Nishizumi_Paintsv6_nobrowser.py
 
 ## Build from source
 
-Build the application directory:
-
 ```powershell
 .\scripts\build_nobrowser_dir.bat
-```
-
-Build the installer after the app build:
-
-```powershell
 .\scripts\build_installer.bat
 ```
 
 ## Documentation
 
-The full manual is versioned in [`docs/wiki`](./docs/wiki/Home.md). It covers installation, every tab, runtime behavior, online fallback, RandomPool, collections, AI flows, tray/headless operation, troubleshooting, and the source-code layout.
+The full manual is versioned in [`docs/wiki`](./docs/wiki/Home.md). It covers installation, every tab, runtime behavior, online fallback, RandomPool, collections, AI flows, tray/headless operation, troubleshooting, privacy, and the source-code layout.
 
 ## Support
 

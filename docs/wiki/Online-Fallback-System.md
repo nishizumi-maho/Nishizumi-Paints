@@ -103,6 +103,23 @@ The app tries to avoid reusing the same public scheme repeatedly by tracking:
 
 The goal is to reduce visible repetition within the same session and across consecutive random requests.
 
+## Favorites and blocked sources
+
+From the Session tab, a random fallback source can be marked as a favorite or blocked.
+
+- favorites are preferred when the same item type is randomized again
+- blocked sources are skipped by both public showroom fallback and Local RandomPool fallback
+- car preferences are scoped to the car directory
+- helmet and suit preferences are scoped by item type
+
+These preferences are local runtime data and are not required for normal installation.
+
+## Paint history and repair
+
+Before a manual random or fixed override replaces a paint file, the app stores a local history snapshot. `Restore previous` copies that snapshot back and reloads only affected cars.
+
+If a direct Trading Paints download fails, the app retries normally, cleans partial files when needed, and can attempt one final online fallback pass before using the local pool.
+
 ## Unavailable public assets
 
 The app treats `401`, `403`, and `404` as unavailable public assets and logs that explicitly. That is why a showroom page can look valid while an actual direct asset URL is still skipped.
