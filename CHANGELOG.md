@@ -6,6 +6,8 @@ All notable user-facing changes to Nishizumi Paints are documented here.
 
 ### Experimental
 
+- Added multi-select support to the Session driver table so fixed-paint actions can be applied to all compatible selected drivers.
+- Added double-click camera switching in the Session driver table through the iRacing SDK camera broadcast.
 - Fixed **Restore previous** after a random fixed override: the app now clears the saved override and active preserve state before restoring the previous driver/session paint.
 - Restored Team driver-personal paints now return the Session row to `driver_paint` instead of staying marked as `override`.
 - Fixed repeated Team-driver preload retries for unavailable personal assets by adding a short per-session cooldown for failed user/slot attempts, including manifest failures and incomplete car-slot saves.

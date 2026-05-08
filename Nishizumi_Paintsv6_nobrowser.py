@@ -18639,6 +18639,58 @@ def trigger_texture_reload(reader: IracingSdkReader, car_idx: int | None = None)
         return False
     logging.info("Triggered iRacing texture reload via SDK")
     return True
+def _read_sdk_int_var(sdk: object, key: str, default: int) -> int:
+    try:
+        value = sdk[key]
+    except Exception:
+        return int(default)
+    if value is None:
+        return int(default)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return int(default)
+def switch_camera_to_car_number(reader: IracingSdkReader, car_number: str, driver_label: str = "") -> bool:
+    car_number_text = str(car_number or "").strip()
+    if not car_number_text:
+        logging.warning("Could not switch camera because the selected driver has no car number")
+        return False
+    sdk = reader.sdk
+    try:
+        if not sdk.is_initialized:
+            if not sdk.startup():
+                logging.warning("Could not initialize SDK to switch the camera")
+                return False
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("SDK startup() failed before camera switch: %s", exc)
+        return False
+    if not sdk.is_connected:
+        logging.debug("SDK not connected; cannot switch camera right now")
+        return False
+    try:
+        sdk.freeze_var_buffer_latest()
+    except Exception as exc:  # noqa: BLE001
+        logging.debug("freeze_var_buffer_latest() failed before camera switch: %s", exc)
+    switch_num = getattr(sdk, "cam_switch_num", None)
+    if not callable(switch_num):
+        logging.warning("This irsdk package does not expose cam_switch_num(); cannot switch camera")
+        return False
+    group = max(1, _read_sdk_int_var(sdk, "CamGroupNumber", 1))
+    camera = max(0, _read_sdk_int_var(sdk, "CamCameraNumber", 0))
+    try:
+        result = switch_num(car_number_text, group, camera)
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("Failed to switch iRacing camera to car #%s: %s", car_number_text, exc)
+        return False
+    if result is False:
+        logging.warning("iRacing rejected camera switch to car #%s", car_number_text)
+        return False
+    label = str(driver_label or "").strip()
+    if label:
+        logging.info("Switched iRacing camera to %s, car #%s", label, car_number_text)
+    else:
+        logging.info("Switched iRacing camera to car #%s", car_number_text)
+    return True
 def maybe_trigger_pending_texture_reload(
     reader: IracingSdkReader,
     pending_reload: PendingTextureReload | None,
@@ -20576,6 +20628,7 @@ class DownloaderUI:
         self._last_runtime_snapshot_version = -1
         self._cached_runtime_snapshot: RuntimeSnapshot | None = None
         self._selected_session_row_iid: str | None = None
+        self._selected_session_row_iids: tuple[str, ...] = ()
         self._session_tree_tooltip_window = None
         self._session_tree_tooltip_key: tuple[str, str] | None = None
         self._session_sort_column: str = "ir"
@@ -20856,7 +20909,7 @@ class DownloaderUI:
         driver_list_frame.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
         driver_list_frame.columnconfigure(0, weight=1)
         driver_list_frame.rowconfigure(0, weight=1)
-        self.session_tree = ttk.Treeview(driver_list_frame, columns=("car", "suit", "helmet", "id", "num", "ir", "lic", "sr", "name", "swap", "refresh"), show="headings", height=18)
+        self.session_tree = ttk.Treeview(driver_list_frame, columns=("car", "suit", "helmet", "id", "num", "ir", "lic", "sr", "name", "swap", "refresh"), show="headings", height=18, selectmode="extended")
         self.session_tree.heading("car", text="Car", command=lambda: self.on_session_heading_clicked("car"))
         self.session_tree.heading("suit", text="Suit", command=lambda: self.on_session_heading_clicked("suit"))
         self.session_tree.heading("helmet", text="Helmet", command=lambda: self.on_session_heading_clicked("helmet"))
@@ -20882,6 +20935,7 @@ class DownloaderUI:
         session_tree_scroll = ttk.Scrollbar(driver_list_frame, orient="vertical", command=self.session_tree.yview)
         self.session_tree.configure(yscrollcommand=session_tree_scroll.set)
         self.session_tree.bind("<<TreeviewSelect>>", self.on_session_driver_selected)
+        self.session_tree.bind("<Double-1>", self.on_session_driver_double_clicked)
         self.session_tree.bind("<Motion>", self.on_session_tree_motion)
         self.session_tree.bind("<Leave>", self.on_session_tree_leave)
         self.session_tree.grid(row=0, column=0, sticky="nsew")
@@ -20903,7 +20957,7 @@ class DownloaderUI:
         }.items():
             self.session_tree.tag_configure(tag_name, foreground=color)
 
-        driver_actions = ttk.LabelFrame(session_tab, text="Selected driver fixed paints", padding=8)
+        driver_actions = ttk.LabelFrame(session_tab, text="Driver fixed paints", padding=8)
         driver_actions.grid(row=2, column=0, sticky="ew", pady=(10, 0))
         driver_actions.columnconfigure(0, weight=1)
         ttk.Label(driver_actions, textvariable=self.session_driver_action_summary_var, foreground="#555555").grid(row=0, column=0, sticky="w")
@@ -21806,6 +21860,61 @@ class DownloaderUI:
     def on_session_tree_leave(self, _event=None) -> None:
         self._destroy_session_tree_tooltip()
 
+    def on_session_driver_double_clicked(self, event) -> None:
+        iid = self.session_tree.identify_row(event.y)
+        if not iid:
+            return
+        self.root.after(0, lambda selected_iid=iid: self._switch_camera_to_session_row_iid(selected_iid))
+
+    def _switch_camera_to_session_row_iid(self, iid: str) -> None:
+        row = self._session_row_lookup.get(iid)
+        if row is None:
+            self._append_log("Could not switch camera: the selected Session row is no longer available.")
+            return
+        snapshot = self.service.get_runtime_snapshot()
+        if snapshot.current_session is None:
+            self._append_log("Could not switch camera: no active iRacing session is detected.")
+            return
+        user = self._session_user_for_row(snapshot.current_session, row)
+        if user is None:
+            self._append_log(f"Could not switch camera: {row.display_name} is no longer in the active session.")
+            return
+        car_number = str(row.number or user.number or "").strip()
+        if not car_number:
+            self._append_log(f"Could not switch camera to {row.display_name}: no car number is available.")
+            return
+        driver_label = str(row.current_driver_text or self._format_session_driver_name(row) or row.display_name or user.user_id).strip()
+        self.status_var.set("Switching camera...")
+
+        def _worker() -> None:
+            ok = False
+            error_text = ""
+            reader = None
+            try:
+                reader = create_sdk_reader()
+                if reader is None:
+                    error_text = "the iRacing SDK could not be opened"
+                else:
+                    ok = switch_camera_to_car_number(reader, car_number, driver_label)
+            except Exception as exc:  # noqa: BLE001
+                logging.debug("Camera switch worker failed", exc_info=True)
+                error_text = str(exc)
+            finally:
+                close_sdk_reader(reader)
+
+            def _finish() -> None:
+                if ok:
+                    self._append_log(f"Switched iRacing camera to {driver_label} (car #{car_number}).")
+                    self.status_var.set("Camera switched")
+                else:
+                    detail = f": {error_text}" if error_text else ""
+                    self._append_log(f"Could not switch iRacing camera to {driver_label} (car #{car_number}){detail}.")
+                    self.status_var.set("Watching")
+
+            self.root.after(0, _finish)
+
+        threading.Thread(target=_worker, name="NishizumiCameraSwitch", daemon=True).start()
+
     def _session_snapshot_signature(self, snapshot: RuntimeSnapshot) -> tuple:
         session_label = snapshot.current_session.session_id.folder_name() if snapshot.current_session is not None else ""
         rows_sig = tuple(
@@ -21893,9 +22002,37 @@ class DownloaderUI:
     def _format_irating_text(self, value: int | None) -> str:
         return "-" if value is None or value <= 0 else f"{int(value):,}"
     def _current_session_row(self) -> SessionDriverSnapshot | None:
-        if not self._selected_session_row_iid:
-            return None
-        return self._session_row_lookup.get(self._selected_session_row_iid)
+        if self._selected_session_row_iid:
+            row = self._session_row_lookup.get(self._selected_session_row_iid)
+            if row is not None:
+                return row
+        for iid in getattr(self, "_selected_session_row_iids", ()):
+            row = self._session_row_lookup.get(iid)
+            if row is not None:
+                return row
+        return None
+    def _selected_session_rows(self) -> list[SessionDriverSnapshot]:
+        selected_iids = tuple(getattr(self, "_selected_session_row_iids", ()) or ())
+        if not selected_iids and self._selected_session_row_iid:
+            selected_iids = (self._selected_session_row_iid,)
+        if not selected_iids:
+            return []
+        selected_set = set(selected_iids)
+        rows: list[SessionDriverSnapshot] = []
+        seen: set[str] = set()
+        try:
+            ordered_iids = tuple(self.session_tree.get_children())
+        except Exception:
+            ordered_iids = tuple(self._session_row_lookup.keys())
+        for iid in ordered_iids:
+            if iid in selected_set and iid not in seen and iid in self._session_row_lookup:
+                rows.append(self._session_row_lookup[iid])
+                seen.add(iid)
+        for iid in selected_iids:
+            if iid not in seen and iid in self._session_row_lookup:
+                rows.append(self._session_row_lookup[iid])
+                seen.add(iid)
+        return rows
     def _session_user_for_row(self, session: Session | None, row: SessionDriverSnapshot | None) -> SessionUser | None:
         if session is None or row is None:
             return None
@@ -21911,6 +22048,21 @@ class DownloaderUI:
         row = self._current_session_row()
         user = self._session_user_for_row(snapshot.current_session, row)
         return snapshot, row, user
+    def _selected_session_contexts(self, snapshot: RuntimeSnapshot | None = None) -> tuple[RuntimeSnapshot, list[tuple[SessionDriverSnapshot, SessionUser]]]:
+        if snapshot is None:
+            snapshot = self.service.get_runtime_snapshot()
+        contexts: list[tuple[SessionDriverSnapshot, SessionUser]] = []
+        for row in self._selected_session_rows():
+            user = self._session_user_for_row(snapshot.current_session, row)
+            if user is not None:
+                contexts.append((row, user))
+        return snapshot, contexts
+    def _require_selected_session_drivers(self) -> tuple[RuntimeSnapshot, list[tuple[SessionDriverSnapshot, SessionUser]]] | None:
+        snapshot, contexts = self._selected_session_contexts()
+        if snapshot.current_session is None or not contexts:
+            self._append_log("Select one or more drivers in the Session tab first.")
+            return None
+        return snapshot, contexts
     def _driver_action_key(self, session: Session, user: SessionUser, kind: str) -> tuple[object, int, str, str]:
         return (
             session_cancel_fingerprint(session),
@@ -21919,8 +22071,8 @@ class DownloaderUI:
             canonicalize_car_directory(user.directory).lower(),
         )
     def _update_session_action_state(self) -> None:
-        snapshot, row, user = self._selected_session_context()
-        enabled = bool(snapshot.current_session is not None and row is not None and user is not None)
+        snapshot, contexts = self._selected_session_contexts()
+        enabled = bool(snapshot.current_session is not None and contexts)
         for button in getattr(self, "session_driver_action_buttons", []):
             try:
                 button.state(["disabled"])
@@ -21929,37 +22081,77 @@ class DownloaderUI:
         if not enabled:
             self.session_driver_action_summary_var.set("Select a driver to manage fixed paints.")
             return
+        assert snapshot.current_session is not None
+        session = snapshot.current_session
         overrides = load_driver_paint_overrides()
-        status_bits: list[str] = []
-        for kind, label in (("car", "car"), ("helmet", "helmet"), ("suit", "suit")):
-            entry = _driver_paint_override_entry_for_user(overrides, user, kind)
-            has_override = entry is not None
+
+        def _current_entry(row: SessionDriverSnapshot, user: SessionUser, kind: str) -> dict[str, object] | None:
             row_status_code = str(getattr(row, f"{kind}_status_code", "") or "")
-            current_entry = _driver_current_paint_entry_from_saved(
-                session=snapshot.current_session,
+            return _driver_current_paint_entry_from_saved(
+                session=session,
                 saved_items=list(snapshot.last_saved),
                 user=user,
                 kind=kind,
                 allow_profile_link=row_status_code in {"downloaded", "team_paint", "driver_paint", "replay", "fallback_online"},
             )
-            can_open = bool(_driver_paint_entry_url(entry or current_entry, user))
-            can_assign_current = current_entry is not None
-            can_forget = has_override or row_status_code in {"fallback", "fallback_local", "fallback_online"}
-            random_source_entry = _random_preference_entry_from_driver_current_entry(current_entry, row_status_code)
-            can_mark_random = random_source_entry is not None
-            can_restore_previous = paint_history_has_previous(snapshot.current_session, user, kind)
-            in_override_assignment = self._driver_action_key(snapshot.current_session, user, kind) in getattr(self, "_driver_override_assignment_in_progress", set())
-            in_restore = self._driver_action_key(snapshot.current_session, user, kind) in getattr(self, "_driver_restore_in_progress", set())
-            action_busy = bool(in_override_assignment or in_restore)
+
+        def _can_assign_current(row: SessionDriverSnapshot, user: SessionUser, kind: str) -> bool:
+            entry = _current_entry(row, user, kind)
+            if entry is None:
+                return False
+            current_items = _session_saved_items_for_user_kind(
+                session,
+                list(snapshot.last_saved),
+                user,
+                kind,
+                require_existing=True,
+            )
+            return bool(current_items)
+
+        status_bits: list[str] = []
+        for kind, label in (("car", "car"), ("helmet", "helmet"), ("suit", "suit")):
+            entries = [
+                _driver_paint_override_entry_for_user(overrides, user, kind)
+                for _row, user in contexts
+            ]
+            current_entries = [
+                _current_entry(row, user, kind)
+                for row, user in contexts
+            ]
+            row_status_codes = [
+                str(getattr(row, f"{kind}_status_code", "") or "")
+                for row, _user in contexts
+            ]
+            action_keys = [
+                self._driver_action_key(session, user, kind)
+                for _row, user in contexts
+            ]
+            busy_keys = set(getattr(self, "_driver_override_assignment_in_progress", set())) | set(getattr(self, "_driver_restore_in_progress", set()))
+            available_indices = [index for index, action_key in enumerate(action_keys) if action_key not in busy_keys]
+            can_open = len(contexts) == 1 and bool(_driver_paint_entry_url(entries[0] or current_entries[0], contexts[0][1]))
+            can_assign_current = any(_can_assign_current(contexts[index][0], contexts[index][1], kind) for index in available_indices)
+            can_forget = any(
+                entries[index] is not None or row_status_codes[index] in {"fallback", "fallback_local", "fallback_online"}
+                for index in available_indices
+            )
+            can_mark_random = any(
+                _random_preference_entry_from_driver_current_entry(current_entries[index], row_status_codes[index]) is not None
+                for index, _context in enumerate(contexts)
+            )
+            can_restore_previous = any(
+                paint_history_has_previous(session, contexts[index][1], kind)
+                for index in available_indices
+            )
+            can_start_override = bool(available_indices)
             for action_key, action_enabled in (
-                ("assign", not action_busy),
-                ("current", can_assign_current and not action_busy),
-                ("random", not action_busy),
+                ("assign", can_start_override),
+                ("current", can_assign_current),
+                ("random", can_start_override),
                 ("open", can_open),
                 ("favorite", can_mark_random),
                 ("block", can_mark_random),
-                ("restore", can_restore_previous and not action_busy),
-                ("forget", can_forget and not action_busy),
+                ("restore", can_restore_previous),
+                ("forget", can_forget),
             ):
                 button = getattr(self, "session_driver_action_buttons_by_kind", {}).get((kind, action_key))
                 if button is not None:
@@ -21967,13 +22159,20 @@ class DownloaderUI:
                         button.state(["!disabled"] if action_enabled else ["disabled"])
                     except Exception:
                         pass
-            if entry is not None:
+            if len(contexts) == 1 and entries[0] is not None:
+                entry = entries[0]
                 scheme = str(entry.get("scheme_id") or "").strip()
                 status_bits.append(f"{label} fixed" + (f" #{scheme}" if scheme else ""))
-        fixed_text = "; ".join(status_bits) if status_bits else "no fixed paints"
-        self.session_driver_action_summary_var.set(
-            f"Selected: {row.display_name} | iRacing ID {row.iracing_id} | {row.directory} | {fixed_text}"
-        )
+        if len(contexts) == 1:
+            row, _user = contexts[0]
+            fixed_text = "; ".join(status_bits) if status_bits else "no fixed paints"
+            self.session_driver_action_summary_var.set(
+                f"Selected: {row.display_name} | iRacing ID {row.iracing_id} | {row.directory} | {fixed_text}"
+            )
+        else:
+            self.session_driver_action_summary_var.set(
+                f"{len(contexts)} drivers selected | actions apply to compatible selected rows."
+            )
     def _refresh_session_tree(self, snapshot: RuntimeSnapshot | None = None) -> None:
         if snapshot is None:
             snapshot = self.service.get_runtime_snapshot()
@@ -21986,6 +22185,7 @@ class DownloaderUI:
         rows = self._session_rows_sorted(list(snapshot.session_rows))
         self._session_row_lookup = {}
         selected = self._selected_session_row_iid
+        selected_iids = tuple(getattr(self, "_selected_session_row_iids", ()) or ())
         if snapshot.current_session is None or not rows:
             children = self.session_tree.get_children()
             if children:
@@ -21994,6 +22194,7 @@ class DownloaderUI:
             self.session_summary_var.set("No active iRacing session detected yet.")
             self.session_status_summary_var.set("Join a session and the driver list will appear here.")
             self._selected_session_row_iid = None
+            self._selected_session_row_iids = ()
             self._destroy_session_tree_tooltip()
             self._update_session_action_state()
             return
@@ -22028,17 +22229,25 @@ class DownloaderUI:
                     self.session_tree.item(iid, values=values, tags=tags)
                 self.session_tree.move(iid, "", index)
             self._session_tree_row_states[iid] = state
+        valid_selected_iids = tuple(iid for iid in selected_iids if iid in self._session_row_lookup)
         if selected not in self._session_row_lookup:
-            selected = next(iter(self._session_row_lookup.keys()), None)
+            selected = valid_selected_iids[0] if valid_selected_iids else next(iter(self._session_row_lookup.keys()), None)
+        if selected and selected not in valid_selected_iids:
+            valid_selected_iids = (selected,) + tuple(iid for iid in valid_selected_iids if iid != selected)
+        if not valid_selected_iids and selected:
+            valid_selected_iids = (selected,)
         self._selected_session_row_iid = selected
+        self._selected_session_row_iids = valid_selected_iids
         if selected:
-            self.session_tree.selection_set(selected)
+            self.session_tree.selection_set(valid_selected_iids)
             self.session_tree.focus(selected)
             self.session_tree.see(selected)
         self._update_session_action_state()
     def on_session_driver_selected(self, _event=None) -> None:
-        selection = self.session_tree.selection()
-        self._selected_session_row_iid = selection[0] if selection else None
+        selection = tuple(iid for iid in self.session_tree.selection() if iid in self._session_row_lookup)
+        focus_iid = self.session_tree.focus()
+        self._selected_session_row_iids = selection
+        self._selected_session_row_iid = focus_iid if focus_iid in selection else (selection[0] if selection else None)
         self._update_session_action_state()
     def _require_selected_session_driver(self) -> tuple[RuntimeSnapshot, SessionDriverSnapshot, SessionUser] | None:
         snapshot, row, user = self._selected_session_context()
@@ -22077,13 +22286,20 @@ class DownloaderUI:
         except Exception as exc:
             self._append_log(f"Could not open Trading Paints for {row.display_name}: {exc}")
     def assign_selected_driver_paint_from_link(self, kind: str) -> None:
-        selected = self._require_selected_session_driver()
+        selected = self._require_selected_session_drivers()
         if selected is None:
             return
-        _snapshot, row, _user = selected
+        _snapshot, contexts = selected
         normalized_kind = _driver_paint_override_kind(kind)
+        if not normalized_kind:
+            self._append_log(f"Cannot assign unsupported paint kind: {kind}")
+            return
+        if len(contexts) == 1:
+            target_text = f"{contexts[0][0].display_name}'s fixed {normalized_kind} paint"
+        else:
+            target_text = f"the fixed {normalized_kind} paint for {len(contexts)} selected drivers"
         prompt = (
-            f"Paste the Trading Paints showroom link for {row.display_name}'s fixed {normalized_kind} paint.\n\n"
+            f"Paste the Trading Paints showroom link for {target_text}.\n\n"
             "Example: https://www.tradingpaints.com/showroom/view/123456/Paint-Name"
         )
         try:
@@ -22108,136 +22324,167 @@ class DownloaderUI:
             self._append_log(f"Cannot randomize unsupported paint kind: {kind}")
             return
         self._start_driver_override_assignment(normalized_kind, scheme_id="", source_link="", source_label="random")
-    def _selected_random_paint_preference_entry(self, kind: str) -> tuple[SessionDriverSnapshot, dict[str, object]] | None:
-        selected = self._require_selected_session_driver()
+    def _selected_random_paint_preference_entries(self, kind: str) -> list[tuple[SessionDriverSnapshot, dict[str, object]]]:
+        selected = self._require_selected_session_drivers()
         if selected is None:
-            return None
-        snapshot, row, user = selected
+            return []
+        snapshot, contexts = selected
         normalized_kind = _driver_paint_override_kind(kind)
         if not normalized_kind or snapshot.current_session is None:
             self._append_log(f"Cannot inspect unsupported paint kind: {kind}")
-            return None
-        row_status_code = str(getattr(row, f"{normalized_kind}_status_code", "") or "")
-        current_entry = _driver_current_paint_entry_from_saved(
-            session=snapshot.current_session,
-            saved_items=list(snapshot.last_saved),
-            user=user,
-            kind=normalized_kind,
-            allow_profile_link=row_status_code in {"downloaded", "team_paint", "driver_paint", "replay", "fallback_online"},
-        )
-        preference_entry = _random_preference_entry_from_driver_current_entry(current_entry, row_status_code)
-        if preference_entry is None:
-            self._append_log(f"{row.display_name}'s current {normalized_kind} paint is not a random fallback source that can be favorited or blocked.")
+            return []
+        entries: list[tuple[SessionDriverSnapshot, dict[str, object]]] = []
+        for row, user in contexts:
+            row_status_code = str(getattr(row, f"{normalized_kind}_status_code", "") or "")
+            current_entry = _driver_current_paint_entry_from_saved(
+                session=snapshot.current_session,
+                saved_items=list(snapshot.last_saved),
+                user=user,
+                kind=normalized_kind,
+                allow_profile_link=row_status_code in {"downloaded", "team_paint", "driver_paint", "replay", "fallback_online"},
+            )
+            preference_entry = _random_preference_entry_from_driver_current_entry(current_entry, row_status_code)
+            if preference_entry is None:
+                self._append_log(f"{row.display_name}'s current {normalized_kind} paint is not a random fallback source that can be favorited or blocked.")
+                continue
+            entries.append((row, preference_entry))
+        if not entries:
             self._update_session_action_state()
-            return None
-        return row, preference_entry
+        return entries
+    def _selected_random_paint_preference_entry(self, kind: str) -> tuple[SessionDriverSnapshot, dict[str, object]] | None:
+        entries = self._selected_random_paint_preference_entries(kind)
+        return entries[0] if entries else None
     def favorite_selected_random_paint(self, kind: str) -> None:
-        selected = self._selected_random_paint_preference_entry(kind)
-        if selected is None:
+        selected = self._selected_random_paint_preference_entries(kind)
+        if not selected:
             return
-        row, preference_entry = selected
-        if remember_random_paint_favorite(preference_entry):
-            title = str(preference_entry.get("title") or preference_entry.get("scheme_id") or preference_entry.get("source_id") or "paint").strip()
-            self._append_log(f"Marked {row.display_name}'s current {kind} random paint as favorite: {title}.")
+        saved_count = 0
+        for row, preference_entry in selected:
+            if remember_random_paint_favorite(preference_entry):
+                saved_count += 1
+                title = str(preference_entry.get("title") or preference_entry.get("scheme_id") or preference_entry.get("source_id") or "paint").strip()
+                self._append_log(f"Marked {row.display_name}'s current {kind} random paint as favorite: {title}.")
+            else:
+                self._append_log(f"Could not favorite {row.display_name}'s current {kind} random paint.")
+        if saved_count:
             self.status_var.set("Random favorite saved")
-        else:
-            self._append_log(f"Could not favorite {row.display_name}'s current {kind} random paint.")
         self._update_session_action_state()
     def block_selected_random_paint(self, kind: str) -> None:
-        selected = self._selected_random_paint_preference_entry(kind)
-        if selected is None:
+        selected = self._selected_random_paint_preference_entries(kind)
+        if not selected:
             return
-        row, preference_entry = selected
-        if block_random_paint_source(preference_entry):
-            title = str(preference_entry.get("title") or preference_entry.get("scheme_id") or preference_entry.get("source_id") or "paint").strip()
-            self._append_log(f"Blocked {row.display_name}'s current {kind} random paint from future random choices: {title}.")
+        blocked_count = 0
+        for row, preference_entry in selected:
+            if block_random_paint_source(preference_entry):
+                blocked_count += 1
+                title = str(preference_entry.get("title") or preference_entry.get("scheme_id") or preference_entry.get("source_id") or "paint").strip()
+                self._append_log(f"Blocked {row.display_name}'s current {kind} random paint from future random choices: {title}.")
+            else:
+                self._append_log(f"Could not block {row.display_name}'s current {kind} random paint.")
+        if blocked_count:
             self.status_var.set("Random paint blocked")
-        else:
-            self._append_log(f"Could not block {row.display_name}'s current {kind} random paint.")
         self._update_session_action_state()
     def restore_previous_driver_paint(self, kind: str) -> None:
-        selected = self._require_selected_session_driver()
+        selected = self._require_selected_session_drivers()
         if selected is None:
             return
-        snapshot, row, user = selected
+        snapshot, contexts = selected
         normalized_kind = _driver_paint_override_kind(kind)
         if not normalized_kind or snapshot.current_session is None:
             self._append_log(f"Cannot restore unsupported paint kind: {kind}")
             return
         session = snapshot.current_session
-        if not paint_history_has_previous(session, user, normalized_kind):
-            self._append_log(f"No previous {normalized_kind} paint is available for {row.display_name}.")
+        jobs: list[tuple[SessionDriverSnapshot, SessionUser, tuple[object, int, str, str]]] = []
+        for row, user in contexts:
+            if not paint_history_has_previous(session, user, normalized_kind):
+                self._append_log(f"No previous {normalized_kind} paint is available for {row.display_name}.")
+                continue
+            action_key = self._driver_action_key(session, user, normalized_kind)
+            if action_key in self._driver_restore_in_progress:
+                self._append_log(f"Restore previous {normalized_kind} for {row.display_name} is already running.")
+                continue
+            self._driver_restore_in_progress.add(action_key)
+            jobs.append((row, user, action_key))
+        if not jobs:
             self._update_session_action_state()
             return
-        action_key = self._driver_action_key(session, user, normalized_kind)
-        if action_key in self._driver_restore_in_progress:
-            self._append_log(f"Restore previous {normalized_kind} for {row.display_name} is already running.")
-            return
-        self._driver_restore_in_progress.add(action_key)
         self._update_session_action_state()
         paints_dir = default_paints_dir(self.config)
-        self._append_log(f"Restoring previous {normalized_kind} paint for {row.display_name}.")
+        if len(jobs) == 1:
+            self._append_log(f"Restoring previous {normalized_kind} paint for {jobs[0][0].display_name}.")
+        else:
+            self._append_log(f"Restoring previous {normalized_kind} paint for {len(jobs)} selected drivers.")
         self.status_var.set(f"Restoring previous {normalized_kind}...")
 
         def _worker() -> None:
-            saved_items: list[SavedFile] = []
-            logs: list[str] = []
-            registered = False
-            try:
-                removed_override, removed_files, freed_bytes = forget_driver_paint_override(
-                    user.user_id,
-                    normalized_kind,
-                    user.directory,
-                    remove_cache=True,
-                )
-                unpreserved = self.service.drop_manual_saved_paint_preserve(
-                    session,
-                    user.user_id,
-                    normalized_kind,
-                    user.directory,
-                )
-                if removed_override:
-                    logs.append(
-                        f"Cleared fixed {normalized_kind} override for {row.display_name} before restoring the previous driver/session paint."
+            results: list[tuple[tuple[object, int, str, str], SessionDriverSnapshot, list[SavedFile], bool, list[str]]] = []
+            for row, user, action_key in jobs:
+                saved_items: list[SavedFile] = []
+                logs: list[str] = []
+                registered = False
+                try:
+                    removed_override, removed_files, freed_bytes = forget_driver_paint_override(
+                        user.user_id,
+                        normalized_kind,
+                        user.directory,
+                        remove_cache=True,
                     )
-                    if removed_files:
-                        logs.append(
-                            f"Removed {removed_files} cached override file(s), freeing {freed_bytes / float(1024 ** 3):.2f} GB."
-                        )
-                elif unpreserved:
-                    logs.append(f"Cleared active fixed {normalized_kind} override state for {row.display_name}.")
-                restored_items, restore_logs = restore_previous_paint_for_user_kind(
-                    session=session,
-                    user=user,
-                    kind=normalized_kind,
-                    paints_dir=paints_dir,
-                )
-                saved_items = restored_items
-                logs.extend(restore_logs)
-                if saved_items:
-                    status_code = restored_paint_status_code_for_saved_items(session, user, normalized_kind, saved_items)
-                    registered = self.service.register_manual_saved_paints(
+                    unpreserved = self.service.drop_manual_saved_paint_preserve(
                         session,
-                        saved_items,
-                        status_code,
-                        queue_reapply=False,
+                        user.user_id,
+                        normalized_kind,
+                        user.directory,
                     )
-                    if registered:
-                        self.service.request_global_texture_reload()
-            except Exception as exc:
-                logging.debug("Paint history restore worker failed", exc_info=True)
-                logs.append(f"Could not restore previous {normalized_kind} paint for {row.display_name}: {exc}")
+                    if removed_override:
+                        logs.append(
+                            f"Cleared fixed {normalized_kind} override for {row.display_name} before restoring the previous driver/session paint."
+                        )
+                        if removed_files:
+                            logs.append(
+                                f"Removed {removed_files} cached override file(s), freeing {freed_bytes / float(1024 ** 3):.2f} GB."
+                            )
+                    elif unpreserved:
+                        logs.append(f"Cleared active fixed {normalized_kind} override state for {row.display_name}.")
+                    restored_items, restore_logs = restore_previous_paint_for_user_kind(
+                        session=session,
+                        user=user,
+                        kind=normalized_kind,
+                        paints_dir=paints_dir,
+                    )
+                    saved_items = restored_items
+                    logs.extend(restore_logs)
+                    if saved_items:
+                        status_code = restored_paint_status_code_for_saved_items(session, user, normalized_kind, saved_items)
+                        registered = self.service.register_manual_saved_paints(
+                            session,
+                            saved_items,
+                            status_code,
+                            queue_reapply=False,
+                        )
+                        if registered:
+                            self.service.request_global_texture_reload()
+                except Exception as exc:
+                    logging.debug("Paint history restore worker failed", exc_info=True)
+                    logs.append(f"Could not restore previous {normalized_kind} paint for {row.display_name}: {exc}")
+                results.append((action_key, row, saved_items, registered, logs))
 
             def _finish() -> None:
-                self._driver_restore_in_progress.discard(action_key)
-                for line in logs:
-                    self._append_log(line)
-                if saved_items and registered:
+                saved_any = False
+                registered_any = False
+                for action_key, row, saved_items, registered, logs in results:
+                    self._driver_restore_in_progress.discard(action_key)
+                    for line in logs:
+                        self._append_log(line)
+                    if saved_items and registered:
+                        registered_any = True
+                    elif saved_items:
+                        saved_any = True
+                        self._append_log(f"Previous {normalized_kind} paint for {row.display_name} was restored on disk, but the active session changed before the table could be updated.")
+                if registered_any:
                     self.status_var.set(f"Previous {normalized_kind} restored")
                     self._last_session_snapshot_signature = None
                     self._refresh_session_tree()
-                elif saved_items:
-                    self._append_log(f"Previous {normalized_kind} paint was restored on disk, but the active session changed before the table could be updated.")
+                elif saved_any:
                     self.status_var.set("Watching")
                 else:
                     self.status_var.set("Watching")
@@ -22247,83 +22494,97 @@ class DownloaderUI:
 
         threading.Thread(target=_worker, name="NishizumiPaintHistoryRestore", daemon=True).start()
     def assign_current_driver_paint(self, kind: str) -> None:
-        selected = self._require_selected_session_driver()
+        selected = self._require_selected_session_drivers()
         if selected is None:
             return
-        snapshot, row, user = selected
+        snapshot, contexts = selected
         normalized_kind = _driver_paint_override_kind(kind)
         if not normalized_kind:
             self._append_log(f"Cannot assign unsupported paint kind: {kind}")
             return
         assert snapshot.current_session is not None
-        current_items = _session_saved_items_for_user_kind(
-            snapshot.current_session,
-            list(snapshot.last_saved),
-            user,
-            normalized_kind,
-            require_existing=True,
-        )
-        entry = _driver_current_paint_entry_from_saved(
-            session=snapshot.current_session,
-            saved_items=list(snapshot.last_saved),
-            user=user,
-            kind=normalized_kind,
-            allow_profile_link=str(getattr(row, f"{normalized_kind}_status_code", "") or "") in {"downloaded", "replay", "fallback_online"},
-        )
-        if entry is None or not current_items:
-            self._append_log(f"No current {normalized_kind} paint file is available yet for {row.display_name}.")
-            self._update_session_action_state()
-            return
-        try:
-            cache_saved_driver_paint_override(current_items, entry)
-            entry = remember_driver_paint_override(entry)
-            preserved_items = [
-                replace(
-                    item,
-                    download_id=_download_id_with_tp_source(
-                        replace(item.download_id, preserve_on_cleanup=True),
-                        scheme_id=str(entry.get("scheme_id") or "").strip(),
-                        title=str(entry.get("title") or "").strip(),
-                        source_link=str(entry.get("source_link") or "").strip(),
-                        source=str(entry.get("source") or "current_session").strip() or "current_session",
-                    ),
-                )
-                for item in current_items
-            ]
-            registered = self.service.register_manual_saved_paints(
+        saved_count = 0
+        registered_count = 0
+        for row, user in contexts:
+            current_items = _session_saved_items_for_user_kind(
                 snapshot.current_session,
-                preserved_items,
-                "override",
-                override_entry=entry,
+                list(snapshot.last_saved),
+                user,
+                normalized_kind,
+                require_existing=True,
             )
-        except Exception as exc:
-            logging.debug("Current driver paint assignment failed", exc_info=True)
-            self._append_log(f"Could not assign current {normalized_kind} paint for {row.display_name}: {exc}")
+            entry = _driver_current_paint_entry_from_saved(
+                session=snapshot.current_session,
+                saved_items=list(snapshot.last_saved),
+                user=user,
+                kind=normalized_kind,
+                allow_profile_link=str(getattr(row, f"{normalized_kind}_status_code", "") or "") in {"downloaded", "replay", "fallback_online"},
+            )
+            if entry is None or not current_items:
+                self._append_log(f"No current {normalized_kind} paint file is available yet for {row.display_name}.")
+                continue
+            try:
+                cache_saved_driver_paint_override(current_items, entry)
+                entry = remember_driver_paint_override(entry)
+                preserved_items = [
+                    replace(
+                        item,
+                        download_id=_download_id_with_tp_source(
+                            replace(item.download_id, preserve_on_cleanup=True),
+                            scheme_id=str(entry.get("scheme_id") or "").strip(),
+                            title=str(entry.get("title") or "").strip(),
+                            source_link=str(entry.get("source_link") or "").strip(),
+                            source=str(entry.get("source") or "current_session").strip() or "current_session",
+                        ),
+                    )
+                    for item in current_items
+                ]
+                registered = self.service.register_manual_saved_paints(
+                    snapshot.current_session,
+                    preserved_items,
+                    "override",
+                    override_entry=entry,
+                )
+            except Exception as exc:
+                logging.debug("Current driver paint assignment failed", exc_info=True)
+                self._append_log(f"Could not assign current {normalized_kind} paint for {row.display_name}: {exc}")
+                continue
+            saved_count += 1
+            if registered:
+                registered_count += 1
+            scheme_id = str(entry.get("scheme_id") or "").strip()
+            source_link = _driver_paint_entry_url(entry, user)
+            link_text = f" ({source_link})" if source_link else ""
+            if registered:
+                self._append_log(f"Current {normalized_kind} paint for {row.display_name} is now fixed as scheme {scheme_id}.{link_text}")
+            else:
+                self._append_log(f"Current {normalized_kind} paint for {row.display_name} was saved as a fixed override, but the active session table could not be updated.")
+        if not saved_count:
             self._update_session_action_state()
             return
-        scheme_id = str(entry.get("scheme_id") or "").strip()
-        source_link = _driver_paint_entry_url(entry, user)
-        link_text = f" ({source_link})" if source_link else ""
-        if registered:
-            self._append_log(f"Current {normalized_kind} paint for {row.display_name} is now fixed as scheme {scheme_id}.{link_text}")
-        else:
-            self._append_log(f"Current {normalized_kind} paint for {row.display_name} was saved as a fixed override, but the active session table could not be updated.")
         self.status_var.set(f"Fixed {normalized_kind} override saved")
-        self._last_session_snapshot_signature = None
-        self._refresh_session_tree()
+        if registered_count:
+            self._last_session_snapshot_signature = None
+            self._refresh_session_tree()
         self._update_session_action_state()
     def _start_driver_override_assignment(self, kind: str, *, scheme_id: str, source_link: str, source_label: str) -> None:
-        selected = self._require_selected_session_driver()
+        selected = self._require_selected_session_drivers()
         if selected is None:
             return
-        snapshot, row, user = selected
+        snapshot, contexts = selected
         assert snapshot.current_session is not None
         session = snapshot.current_session
-        action_key_for_assignment = self._driver_action_key(session, user, kind)
-        if action_key_for_assignment in self._driver_override_assignment_in_progress:
-            self._append_log(f"Fixed {kind} assignment for {row.display_name} is already running.")
+        jobs: list[tuple[SessionDriverSnapshot, SessionUser, tuple[object, int, str, str]]] = []
+        for row, user in contexts:
+            action_key_for_assignment = self._driver_action_key(session, user, kind)
+            if action_key_for_assignment in self._driver_override_assignment_in_progress:
+                self._append_log(f"Fixed {kind} assignment for {row.display_name} is already running.")
+                continue
+            self._driver_override_assignment_in_progress.add(action_key_for_assignment)
+            jobs.append((row, user, action_key_for_assignment))
+        if not jobs:
+            self._update_session_action_state()
             return
-        self._driver_override_assignment_in_progress.add(action_key_for_assignment)
         self._update_session_action_state()
         config = self.config
         paints_dir = default_paints_dir(config)
@@ -22333,65 +22594,79 @@ class DownloaderUI:
             session.local_user_id if session.local_user_id is not None else snapshot.last_known_member_id,
         )
         action_label = "random" if not scheme_id else f"scheme {scheme_id}"
-        self._append_log(f"Assigning fixed {kind} override for {row.display_name} ({row.iracing_id}) using {action_label}.")
+        if len(jobs) == 1:
+            row = jobs[0][0]
+            self._append_log(f"Assigning fixed {kind} override for {row.display_name} ({row.iracing_id}) using {action_label}.")
+        else:
+            self._append_log(f"Assigning fixed {kind} override for {len(jobs)} selected drivers using {action_label}.")
         self.status_var.set(f"Assigning {kind} override...")
 
         def _worker() -> None:
-            saved_items: list[SavedFile] = []
-            logs: list[str] = []
-            registered = False
-            entry: dict[str, object] | None = None
-            try:
-                saved_items, logs, entry = assign_driver_paint_override_from_showroom(
-                    session=session,
-                    user=user,
-                    kind=kind,
-                    paints_dir=paints_dir,
-                    temp_dir=temp_dir,
-                    mapping_path=default_tp_showroom_mapping_path(),
-                    profile_dir=default_tp_showroom_profile_dir(),
-                    manifest_member_id=manifest_member_id,
-                    scheme_id=scheme_id,
-                    source_link=source_link,
-                    source_label=source_label,
-                    showroom_sources=getattr(config, "tp_showroom_sources", TP_SHOWROOM_DEFAULT_SOURCES),
-                    retries=positive_int(config.retries, 3),
-                    retry_backoff_seconds=max(config.retry_backoff_seconds, 0.1),
-                )
-                if saved_items:
-                    if entry is None:
-                        entry = _driver_current_paint_entry_from_saved(
-                            session=session,
-                            saved_items=saved_items,
-                            user=user,
-                            kind=kind,
-                            allow_profile_link=False,
-                        )
-                        if entry is not None:
-                            cache_saved_driver_paint_override(saved_items, entry)
-                            entry = remember_driver_paint_override(entry)
-                    registered = self.service.register_manual_saved_paints(
-                        session,
-                        saved_items,
-                        "override",
-                        override_entry=entry,
+            results: list[tuple[tuple[object, int, str, str], SessionDriverSnapshot, list[SavedFile], bool, list[str]]] = []
+            for row, user, action_key_for_assignment in jobs:
+                saved_items: list[SavedFile] = []
+                logs: list[str] = []
+                registered = False
+                entry: dict[str, object] | None = None
+                try:
+                    saved_items, logs, entry = assign_driver_paint_override_from_showroom(
+                        session=session,
+                        user=user,
+                        kind=kind,
+                        paints_dir=paints_dir,
+                        temp_dir=temp_dir,
+                        mapping_path=default_tp_showroom_mapping_path(),
+                        profile_dir=default_tp_showroom_profile_dir(),
+                        manifest_member_id=manifest_member_id,
+                        scheme_id=scheme_id,
+                        source_link=source_link,
+                        source_label=source_label,
+                        showroom_sources=getattr(config, "tp_showroom_sources", TP_SHOWROOM_DEFAULT_SOURCES),
+                        retries=positive_int(config.retries, 3),
+                        retry_backoff_seconds=max(config.retry_backoff_seconds, 0.1),
                     )
-            except Exception as exc:
-                logging.debug("Driver override worker failed", exc_info=True)
-                logs.append(f"Driver override assignment failed for {row.display_name} {kind}: {exc}")
+                    if saved_items:
+                        if entry is None:
+                            entry = _driver_current_paint_entry_from_saved(
+                                session=session,
+                                saved_items=saved_items,
+                                user=user,
+                                kind=kind,
+                                allow_profile_link=False,
+                            )
+                            if entry is not None:
+                                cache_saved_driver_paint_override(saved_items, entry)
+                                entry = remember_driver_paint_override(entry)
+                        registered = self.service.register_manual_saved_paints(
+                            session,
+                            saved_items,
+                            "override",
+                            override_entry=entry,
+                        )
+                except Exception as exc:
+                    logging.debug("Driver override worker failed", exc_info=True)
+                    logs.append(f"Driver override assignment failed for {row.display_name} {kind}: {exc}")
+                results.append((action_key_for_assignment, row, saved_items, registered, logs))
 
             def _finish() -> None:
-                self._driver_override_assignment_in_progress.discard(action_key_for_assignment)
-                for line in logs:
-                    self._append_log(line)
-                if saved_items:
-                    if registered:
-                        self._append_log(f"Fixed {kind} override applied to {row.display_name} and registered in the active session.")
-                    else:
-                        self._append_log(f"Fixed {kind} override saved for {row.display_name}; the active session changed before the Session table could be updated.")
+                saved_any = False
+                registered_any = False
+                for action_key_for_assignment, row, saved_items, registered, logs in results:
+                    self._driver_override_assignment_in_progress.discard(action_key_for_assignment)
+                    for line in logs:
+                        self._append_log(line)
+                    if saved_items:
+                        saved_any = True
+                        if registered:
+                            registered_any = True
+                            self._append_log(f"Fixed {kind} override applied to {row.display_name} and registered in the active session.")
+                        else:
+                            self._append_log(f"Fixed {kind} override saved for {row.display_name}; the active session changed before the Session table could be updated.")
+                if saved_any:
                     self.status_var.set(f"Fixed {kind} override saved")
-                    self._last_session_snapshot_signature = None
-                    self._refresh_session_tree()
+                    if registered_any:
+                        self._last_session_snapshot_signature = None
+                        self._refresh_session_tree()
                 else:
                     self.status_var.set("Watching")
                 self._update_session_action_state()
@@ -22480,54 +22755,57 @@ class DownloaderUI:
 
         threading.Thread(target=_worker, name="NishizumiDriverForgetRestore", daemon=True).start()
     def forget_selected_driver_paint(self, kind: str) -> None:
-        selected = self._require_selected_session_driver()
+        selected = self._require_selected_session_drivers()
         if selected is None:
             return
-        snapshot, row, user = selected
+        snapshot, contexts = selected
         normalized_kind = _driver_paint_override_kind(kind)
         if not normalized_kind:
             self._append_log(f"Cannot forget unsupported paint kind: {kind}")
             return
         overrides = load_driver_paint_overrides()
-        entry = _driver_paint_override_entry_for_user(overrides, user, normalized_kind)
-        row_status_code = str(getattr(row, f"{normalized_kind}_status_code", "") or "")
-        is_unmemorized_fallback = row_status_code in {"fallback", "fallback_local", "fallback_online"}
-        if entry is None and is_unmemorized_fallback:
-            self._append_log(
-                f"{row.display_name}'s current {normalized_kind} fallback is not saved as a fixed override; nothing will be reused next session."
-            )
-            self._update_session_action_state()
-            return
-        removed, removed_files, freed_bytes = forget_driver_paint_override(
-            user.user_id,
-            normalized_kind,
-            user.directory,
-            remove_cache=True,
-        )
-        unpreserved = False
-        if snapshot.current_session is not None:
-            unpreserved = self.service.drop_manual_saved_paint_preserve(
-                snapshot.current_session,
+        any_unpreserved = False
+        for row, user in contexts:
+            entry = _driver_paint_override_entry_for_user(overrides, user, normalized_kind)
+            row_status_code = str(getattr(row, f"{normalized_kind}_status_code", "") or "")
+            is_unmemorized_fallback = row_status_code in {"fallback", "fallback_local", "fallback_online"}
+            if entry is None and is_unmemorized_fallback:
+                self._append_log(
+                    f"{row.display_name}'s current {normalized_kind} fallback is not saved as a fixed override; nothing will be reused next session."
+                )
+                continue
+            removed, removed_files, freed_bytes = forget_driver_paint_override(
                 user.user_id,
                 normalized_kind,
                 user.directory,
+                remove_cache=True,
             )
-        if removed:
-            self._append_log(
-                f"Forgot fixed {normalized_kind} override for {row.display_name} ({row.iracing_id}); removed {removed_files} cached file(s), freed {freed_bytes / float(1024 ** 3):.2f} GB."
-            )
-            if unpreserved:
-                self._append_log("Current session file is no longer protected from the normal cleanup rules.")
+            unpreserved = False
             if snapshot.current_session is not None:
-                self._restore_original_driver_paint_after_forget(
+                unpreserved = self.service.drop_manual_saved_paint_preserve(
                     snapshot.current_session,
-                    user,
-                    row,
+                    user.user_id,
                     normalized_kind,
+                    user.directory,
                 )
-        else:
-            self._append_log(f"No fixed {normalized_kind} override was saved for {row.display_name} ({row.iracing_id}).")
-        if unpreserved:
+            if unpreserved:
+                any_unpreserved = True
+            if removed:
+                self._append_log(
+                    f"Forgot fixed {normalized_kind} override for {row.display_name} ({row.iracing_id}); removed {removed_files} cached file(s), freed {freed_bytes / float(1024 ** 3):.2f} GB."
+                )
+                if unpreserved:
+                    self._append_log("Current session file is no longer protected from the normal cleanup rules.")
+                if snapshot.current_session is not None:
+                    self._restore_original_driver_paint_after_forget(
+                        snapshot.current_session,
+                        user,
+                        row,
+                        normalized_kind,
+                    )
+            else:
+                self._append_log(f"No fixed {normalized_kind} override was saved for {row.display_name} ({row.iracing_id}).")
+        if any_unpreserved:
             self._last_session_snapshot_signature = None
             self._refresh_session_tree()
         self._update_session_action_state()
