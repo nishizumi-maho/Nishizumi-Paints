@@ -20710,7 +20710,6 @@ class DownloaderUI:
         }
         self.tp_showroom_source_summary_var = tk.StringVar(value=f"Selected: {tp_showroom_sources_label(showroom_sources)}")
         self.random_pool_summary_var = tk.StringVar(value="Random pool: waiting")
-        self.public_showroom_summary_var = tk.StringVar(value=f"Source: {tp_showroom_sources_label(showroom_sources)}. Skips numbered and PRO paints. Uses the local pool if needed.")
         self.tp_auth_profile_summary_var = tk.StringVar(value="No-browser copy: no Trading Paints login or embedded browser is used.")
         current_member_id = normalize_tp_member_id(getattr(self.config, "tp_manifest_member_id_override", 0))
         self.tp_manifest_member_id_var = tk.StringVar(value=str(current_member_id) if current_member_id > 0 else "")
@@ -20735,10 +20734,7 @@ class DownloaderUI:
         self.quick_start_tp_confirm_button = None
         self.quick_start_tp_disconnect_button = None
         self.quick_start_tp_status_label = None
-        self.tp_mode_summary_var = tk.StringVar(value="Choose how missing paints should be filled.")
         self.online_section_state_var = tk.StringVar(value="OFF")
-        self.online_section_hint_var = tk.StringVar(value="Saved here for later use.")
-        self.local_backup_hint_var = tk.StringVar(value="Local backup pool settings live in Random Step 3.")
         self.showroom_download_car_var = tk.StringVar(value="")
         self.showroom_collection_sources_var = tk.StringVar(value="")
         self.showroom_download_count_var = tk.IntVar(value=5)
@@ -21248,8 +21244,6 @@ class DownloaderUI:
         source_row.pack(anchor="w")
         ttk.Radiobutton(source_row, text="Local", value="Local", variable=self.tp_fallback_mode_var, command=self.on_tp_fallback_mode_changed).pack(side="left")
         ttk.Radiobutton(source_row, text="Online", value="Online", variable=self.tp_fallback_mode_var, command=self.on_tp_fallback_mode_changed).pack(side="left", padx=(12, 0))
-        self.tp_mode_summary_label = ttk.Label(self.source_pref_frame, textvariable=self.tp_mode_summary_var, justify="left", wraplength=920, foreground="#555555")
-        self.tp_mode_summary_label.pack(anchor="w", pady=(8, 0))
 
         self.online_mode_frame = ttk.LabelFrame(random_tab, text="Step 3 • Public showroom", padding=10)
         self.online_mode_frame.grid(row=2, column=0, sticky="ew", pady=(10, 0))
@@ -21258,11 +21252,8 @@ class DownloaderUI:
         online_left = ttk.Frame(self.online_mode_frame)
         online_left.grid(row=0, column=0, sticky="nw", padx=(0, 10))
         online_left.columnconfigure(0, weight=1)
-        ttk.Label(online_left, text="Public showroom", font=("Segoe UI", 10, "bold")).grid(row=0, column=0, sticky="w")
-        self.online_state_hint_label = ttk.Label(online_left, textvariable=self.online_section_hint_var, foreground="#555555", justify="left", wraplength=620)
-        self.online_state_hint_label.grid(row=1, column=0, sticky="w", pady=(4, 0))
         self.tp_showroom_sources_frame = ttk.LabelFrame(online_left, text="Showroom source", padding=8)
-        self.tp_showroom_sources_frame.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        self.tp_showroom_sources_frame.grid(row=0, column=0, sticky="ew")
         source_options_row = ttk.Frame(self.tp_showroom_sources_frame)
         source_options_row.grid(row=0, column=0, sticky="w")
         self.tp_showroom_source_checkbuttons = {}
@@ -21276,13 +21267,12 @@ class DownloaderUI:
             check.pack(side="left", padx=(0, 14))
             self.tp_showroom_source_checkbuttons[source] = check
         ttk.Label(self.tp_showroom_sources_frame, textvariable=self.tp_showroom_source_summary_var, justify="left", foreground="#555555", wraplength=620).grid(row=1, column=0, sticky="w", pady=(4, 0))
-        ttk.Label(online_left, textvariable=self.public_showroom_summary_var, justify="left", foreground="#176d2b", wraplength=620).grid(row=3, column=0, sticky="w", pady=(6, 0))
         online_left_actions = ttk.Frame(online_left)
-        online_left_actions.grid(row=4, column=0, sticky="w", pady=(6, 0))
+        online_left_actions.grid(row=1, column=0, sticky="w", pady=(6, 0))
         ttk.Button(online_left_actions, text="Showroom", command=self.open_tp_showroom).pack(side="left")
         ttk.Button(online_left_actions, text="RandomPool", command=self.open_random_pool_folder).pack(side="left", padx=(8, 0))
         self.local_pool_frame = ttk.LabelFrame(online_left, text="Local random paints pool", padding=10)
-        self.local_pool_frame.grid(row=5, column=0, sticky="ew", pady=(8, 0))
+        self.local_pool_frame.grid(row=2, column=0, sticky="ew", pady=(8, 0))
         self.local_pool_frame.columnconfigure(0, weight=1)
         self.local_pool_frame.columnconfigure(3, weight=1)
         ttk.Label(self.local_pool_frame, text="Keeps extra local paints the app can reuse later when a driver or AI has no TP paint. This still matters even if you prefer Online.", foreground="#176d2b", justify="left", wraplength=620).grid(row=0, column=0, columnspan=4, sticky="w")
@@ -23224,7 +23214,6 @@ class DownloaderUI:
         label = tp_showroom_sources_label(sources)
         try:
             self.tp_showroom_source_summary_var.set(f"Selected: {label}")
-            self.public_showroom_summary_var.set(f"Source: {label}. Skips numbered and PRO paints. Uses the local pool if needed.")
         except Exception:
             pass
 
@@ -23254,38 +23243,20 @@ class DownloaderUI:
             pass
         if has_any_targets and mode == "online":
             self.online_section_state_var.set("ON")
-            if parse_tp_collection_ids_from_text(self.tp_collection_pool_sources_var.get()):
-                self.online_section_hint_var.set("Online is active. Collections run first.")
-            else:
-                self.online_section_hint_var.set("Online is active.")
-            self.local_backup_hint_var.set("Local backup still stays available. Pool settings live in Random Step 3.")
-            self.tp_mode_summary_var.set("Online first. Public showroom downloads are enabled.")
             try:
                 self.online_state_label.configure(foreground="#176d2b")
-                self.online_state_hint_label.configure(foreground="#555555")
-                self.tp_mode_summary_label.configure(foreground="#176d2b")
             except Exception:
                 pass
         elif has_any_targets:
             self.online_section_state_var.set("OFF")
-            self.online_section_hint_var.set("Used only when Online is selected.")
-            self.local_backup_hint_var.set("Local mode is active. The app will use the local random paints pool from Random Step 3.")
-            self.tp_mode_summary_var.set("Local is active. The online tools below are not in use right now.")
             try:
                 self.online_state_label.configure(foreground="#b00020")
-                self.online_state_hint_label.configure(foreground="#555555")
-                self.tp_mode_summary_label.configure(foreground="#0b63b6")
             except Exception:
                 pass
         else:
             self.online_section_state_var.set("OFF")
-            self.online_section_hint_var.set("Turn on at least one fallback target above to use random fallback paints.")
-            self.local_backup_hint_var.set("Fallback is currently disabled for both real drivers and AI.")
-            self.tp_mode_summary_var.set("Enable a fallback checkbox above to choose Local or Online.")
             try:
                 self.online_state_label.configure(foreground="#b00020")
-                self.online_state_hint_label.configure(foreground="#b00020")
-                self.tp_mode_summary_label.configure(foreground="#555555")
             except Exception:
                 pass
         self._refresh_tp_auth_profile_summary(force=force)

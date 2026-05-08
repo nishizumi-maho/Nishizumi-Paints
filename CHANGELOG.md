@@ -8,6 +8,7 @@ All notable user-facing changes to Nishizumi Paints are documented here.
 
 - Added multi-select support to the Session driver table so fixed-paint actions can be applied to all compatible selected drivers.
 - Added double-click camera switching in the Session driver table through the iRacing SDK camera broadcast.
+- Tightened the Random tab layout by removing extra explanatory text under Step 2 and Step 3, moving the showroom and local pool controls higher.
 - Fixed **Restore previous** after a random fixed override: the app now clears the saved override and active preserve state before restoring the previous driver/session paint.
 - Fixed restored history paints retaining fixed-override metadata in the Session table and changed restore reloads to target only affected cars instead of triggering a global texture reload.
 - Restored Team driver-personal paints now return the Session row to `driver_paint` instead of staying marked as `override`.
