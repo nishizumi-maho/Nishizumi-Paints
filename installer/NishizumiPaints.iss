@@ -38,7 +38,7 @@ VersionInfoVersion={#AppVersionInfo}
 VersionInfoCompany={#AppPublisher}
 VersionInfoDescription={#AppName} installer
 VersionInfoProductName={#AppName}
-VersionInfoProductVersion={#AppVersion}
+VersionInfoProductVersion={#AppVersionInfo}
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
