@@ -9,7 +9,7 @@
 - [Online Fallback System](Online-Fallback-System)
 - [Local RandomPool](Local-RandomPool)
 - [Showroom Mapping and Collections](Showroom-Mapping-and-Collections)
-- [Release 7.1 Experimental](Release-7.1-Experimental)
+- [Release 7.1](Release-7.1)
 - [Release 7.0](Release-7.0)
 - [Background and Headless Modes](Background-and-Headless-Modes)
 - [Logs and Monitoring](Logs-and-Monitoring)

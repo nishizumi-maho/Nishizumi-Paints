@@ -2,9 +2,9 @@
 
 All notable user-facing changes to Nishizumi Paints are documented here.
 
-## [7.1.0-experimental] - 2026-05-13
+## [7.1.0] - 2026-05-13
 
-### Experimental Release
+### Stable Release
 
 - Fixed manual Showroom collection downloads to import every downloadable public collection paint into the Local RandomPool instead of discarding public Pro-owned or stamped-number paints with the online-fallback eligibility filter.
 - Fixed the Session table `Random` action so Local mode uses the Local RandomPool when Online fallback is disabled.
