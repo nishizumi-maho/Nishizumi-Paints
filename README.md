@@ -27,7 +27,7 @@ Nishizumi Paints is a Windows desktop companion for iRacing. It watches live ses
 
 Upgrades use the same app ID and install path, so a newer installer can be run over an existing installation.
 
-## What's new in 7.1 experimental
+## What's new in 7.1
 
 - Manual Showroom collection imports now keep all downloadable public collection paints, including public paints owned by Pro users or paints with stamped numbers, instead of using the stricter online-fallback filter.
 - The Session table `Random` action now honors Local mode and pulls from the Local RandomPool when Online fallback is disabled.
@@ -56,7 +56,7 @@ The Local RandomPool can be filled from manual Showroom imports, collections, or
 
 ## Team session quick guide
 
-The recommended 7.1 experimental Team fallback order is:
+The recommended 7.1 Team fallback order is:
 
 1. Team paint for the item.
 2. Current driver's personal paint for the same item, if the matching General-tab fallback option is enabled.
@@ -77,7 +77,7 @@ Open **Showroom** when you want to pre-fill paints manually instead of waiting f
 
 ## Privacy notes
 
-The normal 7.1 experimental online fallback path is browserless and does not require a Trading Paints login, password, cookie, token, or browser profile. Runtime data such as settings, paint history, RandomPool files, collection caches, and local iRacing paint folders should stay local and should not be committed.
+The normal 7.1 online fallback path is browserless and does not require a Trading Paints login, password, cookie, token, or browser profile. Runtime data such as settings, paint history, RandomPool files, collection caches, and local iRacing paint folders should stay local and should not be committed.
 
 ## Run from source
 
