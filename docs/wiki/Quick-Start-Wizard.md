@@ -51,6 +51,8 @@ If the folder is wrong, the app can still run, but the saved paints will go to t
 
 The app uses an iRacing member ID to discover AI-related collection content and to keep the AI tab ready immediately after setup. The wizard asks for that value up front so the user does not need to dig for it later.
 
+In the normal flow this is the final wizard page, so the action button changes to `Finish` here.
+
 ## Safe defaults applied by the wizard
 
 The current flow defaults to:

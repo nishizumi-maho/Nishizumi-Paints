@@ -20805,7 +20805,7 @@ class DownloaderUI:
         self.sync_ai_rosters_var = tk.BooleanVar(value=getattr(self.config, "sync_ai_rosters_from_server", True))
         current_ai_member_id = normalize_tp_member_id(getattr(self.config, "ai_roster_member_id_override", 0))
         self.ai_roster_member_id_var = tk.StringVar(value=str(current_ai_member_id) if current_ai_member_id > 0 else "")
-        self.ai_roster_member_id_summary_var = tk.StringVar(value="No AI roster member ID configured. The app will auto-fill this from the first active iRacing session when available.")
+        self.ai_roster_member_id_summary_var = tk.StringVar(value="Current iRacing ID: none selected.")
         self.ai_collection_skip_random_cars_var = tk.BooleanVar(value=bool(getattr(self.config, "ai_collection_skip_random_cars", True)))
         self.ai_collection_skip_random_helmets_var = tk.BooleanVar(value=bool(getattr(self.config, "ai_collection_skip_random_helmets", True)))
         self.ai_collection_skip_random_suits_var = tk.BooleanVar(value=bool(getattr(self.config, "ai_collection_skip_random_suits", True)))
@@ -23269,13 +23269,9 @@ class DownloaderUI:
     def _refresh_ai_roster_member_id_summary(self) -> None:
         member_id = self._parse_ai_roster_member_id_ui()
         if member_id > 0:
-            self.ai_roster_member_id_summary_var.set(
-                f"AI roster sync will use iRacing member ID {member_id}, even when no iRacing session is active."
-            )
+            self.ai_roster_member_id_summary_var.set(f"Current iRacing ID: {member_id}.")
         else:
-            self.ai_roster_member_id_summary_var.set(
-                "No AI roster member ID configured. The app will auto-fill this from the first active iRacing session when available."
-            )
+            self.ai_roster_member_id_summary_var.set("Current iRacing ID: none selected.")
 
     def save_ai_roster_member_id(self) -> None:
         member_id = self._parse_ai_roster_member_id_ui()
@@ -25492,38 +25488,6 @@ class DownloaderUI:
         ).pack(anchor="w", pady=(10, 0))
         pages.append(p_ai)
 
-        p4 = _page_container()
-        self.ttk.Label(p4, text="Public showroom downloads", font=("Segoe UI", 10, "bold"), foreground="#0b63b6").pack(anchor="w")
-        explain = (
-            "Online fallback now downloads public showroom paint assets directly. "
-            "Nishizumi Paints samples random showroom pages for the active car, skips numbered and PRO-owner paints, then saves the selected public asset for the driver. "
-            "No Trading Paints login, browser profile, separate account, or manifest member ID is required."
-        )
-        self.ttk.Label(p4, text=explain, wraplength=520, justify="left", foreground="#444444").pack(anchor="w", pady=(8, 0))
-        self.quick_start_tp_status_label = self.ttk.Label(p4, textvariable=self.tp_auth_profile_summary_var, wraplength=520, justify="left", foreground="#176d2b")
-        self.quick_start_tp_status_label.pack(anchor="w", pady=(10, 0))
-        self.ttk.Label(p4, text="The Random tab controls automatic session fallback. The Showroom tab lets you manually pre-fill the standard RandomPool for any Trading Paints car you choose.", wraplength=520, justify="left", foreground="#176d2b").pack(anchor="w", pady=(12, 0))
-        pages.append(p4)
-
-        p5 = _page_container()
-        self.ttk.Label(p5, text="Ready", font=("Segoe UI", 10, "bold"), foreground="#0b63b6").pack(anchor="w")
-        self.ttk.Label(
-            p5,
-            text=(
-                "You can still change everything later. Easy mode keeps the app simple. Advanced mode brings back all tabs whenever you want more control."
-            ),
-            wraplength=520,
-            justify="left",
-            foreground="#444444",
-        ).pack(anchor="w", pady=(8, 0))
-        self.ttk.Label(
-            p5,
-            text="Recommended final setup: Online fallback with public showroom downloads and your iRacing ID saved for AI collections.",
-            wraplength=520,
-            justify="left",
-            foreground="#176d2b",
-        ).pack(anchor="w", pady=(8, 0))
-        pages.append(p5)
 
         footer = self.ttk.Frame(wizard, padding=(14, 0, 14, 14))
         footer.grid(row=2, column=0, sticky="ew")
@@ -25533,11 +25497,6 @@ class DownloaderUI:
         nav.grid(row=0, column=1, sticky="e")
         page_index = {"value": 0}
 
-        def _online_setup_required() -> bool:
-            return False
-
-        def _tp_login_ready() -> bool:
-            return True
 
         def _finish() -> None:
             if not bool(quick_start_docs_state.get("confirmed")):
@@ -25567,13 +25526,12 @@ class DownloaderUI:
         def _refresh_nav_state() -> None:
             index = page_index["value"]
             needs_docs_confirmation = not bool(quick_start_docs_state.get("confirmed"))
-            needs_login = False
             back_btn.state(["disabled"] if index == 0 else ["!disabled"])
             if index == len(pages) - 1:
                 next_btn.configure(text="Finish")
             else:
                 next_btn.configure(text="Next →")
-            if (needs_docs_confirmation and index >= 2) or (needs_login and index >= 6):
+            if needs_docs_confirmation and index >= 2:
                 next_btn.state(["disabled"])
                 skip_btn.state(["disabled"])
             else:
