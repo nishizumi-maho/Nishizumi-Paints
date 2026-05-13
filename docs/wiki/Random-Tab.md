@@ -83,4 +83,4 @@ That means:
 
 ## Easy mode explanation
 
-In Easy mode, the text around the random fallback controls is intentionally simpler. The intent is to tell the user, clearly, that the app can assign a random online paint to a driver who does not have a usable Trading Paints paint.
+In Easy mode, the text around the random fallback controls is intentionally simpler. The intent is to tell the user, clearly, that the app can assign a random paint to a driver who does not have a usable Trading Paints paint, using Online or Local mode according to the selected source.

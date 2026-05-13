@@ -43,7 +43,7 @@ from requests.adapters import HTTPAdapter
 # Browserless copy: Trading Paints browser automation is intentionally disabled.
 sync_playwright = None
 APP_NAME = "Nishizumi Paints"
-APP_VERSION = "7.0.0"
+APP_VERSION = "7.1.0-experimental"
 APP_REGISTRY_NAME = "NishizumiPaints"
 APP_CONFIG_DIRNAME = "NishizumiPaints"
 APP_TOOLTIP = f"{APP_NAME} {APP_VERSION}"
@@ -5245,6 +5245,57 @@ def _apply_local_tp_random_fallback_assets_for_user(
             )
     return saved_items, logs, reused_existing_source
 
+def assign_driver_paint_override_from_local_random_pool(
+    *,
+    session: Session,
+    user: SessionUser,
+    kind: str,
+    paints_dir: Path,
+    random_pool_dir: Path,
+    ai_livery_root: Path,
+    used_source_ids: set[str],
+    cancel_event: threading.Event | None = None,
+) -> tuple[list[SavedFile], list[str], dict[str, object] | None]:
+    normalized_kind = _driver_paint_override_kind(kind)
+    if not normalized_kind:
+        return [], [f"Unsupported driver override kind: {kind}"], None
+    if _cancel_requested(cancel_event):
+        return [], ["Local RandomPool driver override assignment was cancelled before it started."], None
+
+    saved_items, logs, _reused_existing_source = _apply_local_tp_random_fallback_assets_for_user(
+        session=session,
+        user=user,
+        paints_dir=paints_dir,
+        random_pool_dir=random_pool_dir,
+        ai_livery_root=ai_livery_root,
+        used_source_ids=used_source_ids,
+        need_car=normalized_kind == "car",
+        need_helmet=normalized_kind == "helmet",
+        need_suit=normalized_kind == "suit",
+    )
+    label = user.display_name or (f"AI {user.user_id}" if user.is_ai else f"user {user.user_id}")
+    if not _saved_items_have_required_driver_override_asset(normalized_kind, saved_items):
+        logs.append(f"Local RandomPool driver override could not find a usable {normalized_kind} source for {label}.")
+        return [], logs, None
+    saved_items = [
+        replace(item, download_id=replace(item.download_id, preserve_on_cleanup=True))
+        for item in saved_items
+    ]
+
+    entry = _driver_current_paint_entry_from_saved(
+        session=session,
+        saved_items=saved_items,
+        user=user,
+        kind=normalized_kind,
+        allow_profile_link=False,
+    )
+    if entry is not None:
+        entry["source"] = "random_pool"
+        cache_saved_driver_paint_override(saved_items, entry)
+        entry = remember_driver_paint_override(entry)
+    logs.append(f"Local RandomPool driver override saved for {label} ({user.user_id}) {normalized_kind}.")
+    return saved_items, logs, entry
+
 def apply_local_tp_random_fallbacks(
     session: Session,
     saved: list[SavedFile],
@@ -5916,6 +5967,16 @@ def _tp_showroom_scheme_usable_for_online_fallback(car: dict) -> bool:
     if paint_kind and paint_kind != "paint":
         return False
     if not str(car.get("id") or "").strip():
+        return False
+    return True
+
+def _tp_collection_item_downloadable_to_random_pool(item: dict) -> bool:
+    if not isinstance(item, dict):
+        return False
+    if not _tp_collection_scheme_id(item):
+        return False
+    paint_kind = str(item.get("type") or "").strip().lower()
+    if paint_kind and paint_kind != "paint":
         return False
     return True
 
@@ -6894,7 +6955,7 @@ def _tp_random_pool_candidate_from_collection_item(
     mapping_path: Path | None,
     log: Callable[[str], None] | None = None,
 ) -> dict[str, object] | None:
-    if not isinstance(item, dict) or not _tp_showroom_scheme_usable_for_online_fallback(item):
+    if not _tp_collection_item_downloadable_to_random_pool(item):
         return None
     scheme_id = _tp_collection_scheme_id(item)
     if not scheme_id:
@@ -7189,7 +7250,7 @@ def download_tp_collection_to_random_pool(
                 continue
             candidate["source"] = "manual_collection_pool"
             candidates.append(candidate)
-    write(f"Prepared {len(candidates)} public non-PRO collection paint(s) from {total_items} total item(s); skipped {skipped_metadata} item(s) before download.")
+    write(f"Prepared {len(candidates)} downloadable public collection paint(s) from {total_items} total item(s); skipped {skipped_metadata} item(s) before download.")
     result = _download_public_scheme_candidates_to_random_pool(
         candidates=candidates,
         random_pool_dir=random_pool_dir or default_random_pool_dir(),
@@ -18656,11 +18717,65 @@ def _read_sdk_int_var(sdk: object, key: str, default: int) -> int:
         return int(value)
     except (TypeError, ValueError):
         return int(default)
-def switch_camera_to_car_number(reader: IracingSdkReader, car_number: str, driver_label: str = "") -> bool:
-    car_number_text = str(car_number or "").strip()
-    if not car_number_text:
-        logging.warning("Could not switch camera because the selected driver has no car number")
-        return False
+
+def _sdk_camera_group_number_by_name(sdk: object, wanted_name: str) -> int | None:
+    wanted = str(wanted_name or "").strip().lower()
+    if not wanted:
+        return None
+    try:
+        camera_info = sdk["CameraInfo"]
+    except Exception:
+        return None
+    groups = camera_info.get("Groups") if isinstance(camera_info, dict) else None
+    if not isinstance(groups, list):
+        return None
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        group_name = str(group.get("GroupName") or "").strip().lower()
+        if group_name != wanted:
+            continue
+        try:
+            group_number = int(group.get("GroupNum"))
+        except Exception:
+            return None
+        return group_number if group_number > 0 else None
+    return None
+
+def _sdk_car_number_for_car_idx(sdk: object, car_idx: int | None) -> str:
+    if car_idx is None:
+        return ""
+    try:
+        wanted_car_idx = int(car_idx)
+    except Exception:
+        return ""
+    if wanted_car_idx < 0:
+        return ""
+    try:
+        driver_info = sdk["DriverInfo"]
+    except Exception:
+        return ""
+    drivers = driver_info.get("Drivers") if isinstance(driver_info, dict) else None
+    if not isinstance(drivers, list):
+        return ""
+    for driver in drivers:
+        if not isinstance(driver, dict):
+            continue
+        try:
+            if int(driver.get("CarIdx")) != wanted_car_idx:
+                continue
+        except Exception:
+            continue
+        for key in ("CarNumber", "CarNumberDesignStr", "CarNumberRaw"):
+            value = driver.get(key)
+            if value in (None, ""):
+                continue
+            text = str(value).strip()
+            if text and text != "-1":
+                return text
+    return ""
+
+def switch_camera_to_car_number(reader: IracingSdkReader, car_number: str, driver_label: str = "", car_idx: int | None = None) -> bool:
     sdk = reader.sdk
     try:
         if not sdk.is_initialized:
@@ -18681,8 +18796,19 @@ def switch_camera_to_car_number(reader: IracingSdkReader, car_number: str, drive
     if not callable(switch_num):
         logging.warning("This irsdk package does not expose cam_switch_num(); cannot switch camera")
         return False
-    group = max(1, _read_sdk_int_var(sdk, "CamGroupNumber", 1))
-    camera = max(0, _read_sdk_int_var(sdk, "CamCameraNumber", 0))
+    car_number_text = _sdk_car_number_for_car_idx(sdk, car_idx) or str(car_number or "").strip()
+    if not car_number_text:
+        logging.warning("Could not switch camera because the selected driver has no usable car number")
+        return False
+    group = _sdk_camera_group_number_by_name(sdk, "Chase") or 20
+    camera = 1
+    logging.info(
+        "Camera switch using Chase camera group %s camera %s for target carIdx=%s car #%s",
+        group,
+        camera,
+        car_idx if car_idx is not None else "unknown",
+        car_number_text,
+    )
     try:
         result = switch_num(car_number_text, group, camera)
     except Exception as exc:  # noqa: BLE001
@@ -18693,9 +18819,9 @@ def switch_camera_to_car_number(reader: IracingSdkReader, car_number: str, drive
         return False
     label = str(driver_label or "").strip()
     if label:
-        logging.info("Switched iRacing camera to %s, car #%s", label, car_number_text)
+        logging.info("Switched iRacing Chase camera to %s, car #%s", label, car_number_text)
     else:
-        logging.info("Switched iRacing camera to car #%s", car_number_text)
+        logging.info("Switched iRacing Chase camera to car #%s", car_number_text)
     return True
 def maybe_trigger_pending_texture_reload(
     reader: IracingSdkReader,
@@ -20702,7 +20828,10 @@ class DownloaderUI:
         self.random_pool_car_size_gb_var = tk.DoubleVar(value=clamp_random_pool_category_gb(getattr(self.config, "max_random_pool_car_gb", 3.0), 3.0))
         self.random_pool_helmet_size_gb_var = tk.DoubleVar(value=clamp_random_pool_category_gb(getattr(self.config, "max_random_pool_helmet_gb", 1.0), 1.0))
         self.random_pool_suit_size_gb_var = tk.DoubleVar(value=clamp_random_pool_category_gb(getattr(self.config, "max_random_pool_suit_gb", 1.0), 1.0))
-        self.iracing_documents_dir_var = tk.StringVar(value=normalize_optional_path(getattr(self.config, "iracing_documents_dir", "")) or str(default_iracing_documents_dir()))
+        custom_iracing_documents_dir = normalize_optional_path(getattr(self.config, "iracing_documents_dir", ""))
+        self.custom_iracing_documents_dir_var = tk.BooleanVar(value=bool(custom_iracing_documents_dir))
+        self.iracing_documents_dir_var = tk.StringVar(value=custom_iracing_documents_dir or str(default_iracing_documents_dir()))
+        self.iracing_documents_dir_summary_var = tk.StringVar(value="")
         showroom_sources = tp_showroom_sources_list(getattr(self.config, "tp_showroom_sources", TP_SHOWROOM_DEFAULT_SOURCES))
         self.tp_showroom_source_vars = {
             source: tk.BooleanVar(value=source in showroom_sources)
@@ -21065,18 +21194,30 @@ class DownloaderUI:
             variable=self.preload_team_driver_personal_paints_var,
             command=self.on_setting_changed,
         ).grid(row=16, column=0, columnspan=2, sticky="w", pady=(2, 0))
-        iracing_docs_box = ttk.LabelFrame(prefs, text="iRacing Documents folder", padding=8)
+        iracing_docs_box = ttk.LabelFrame(prefs, text="Advanced folder settings", padding=8)
         iracing_docs_box.grid(row=17, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         iracing_docs_box.columnconfigure(0, weight=1)
-        iracing_docs_row = ttk.Frame(iracing_docs_box)
-        iracing_docs_row.grid(row=0, column=0, sticky="ew")
-        iracing_docs_row.columnconfigure(0, weight=1)
-        self.iracing_documents_dir_entry = ttk.Entry(iracing_docs_row, textvariable=self.iracing_documents_dir_var, state="readonly")
+        ttk.Checkbutton(
+            iracing_docs_box,
+            text="Customize iRacing Documents folder",
+            variable=self.custom_iracing_documents_dir_var,
+            command=self.on_custom_iracing_documents_dir_changed,
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            iracing_docs_box,
+            textvariable=self.iracing_documents_dir_summary_var,
+            foreground="#666666",
+            wraplength=500,
+            justify="left",
+        ).grid(row=1, column=0, sticky="w", pady=(4, 0))
+        self.iracing_documents_custom_frame = ttk.Frame(iracing_docs_box)
+        self.iracing_documents_custom_frame.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        self.iracing_documents_custom_frame.columnconfigure(0, weight=1)
+        self.iracing_documents_dir_entry = ttk.Entry(self.iracing_documents_custom_frame, textvariable=self.iracing_documents_dir_var, state="readonly")
         self.iracing_documents_dir_entry.grid(row=0, column=0, sticky="ew")
-        ttk.Button(iracing_docs_row, text="Change...", command=self.browse_iracing_documents_dir).grid(row=0, column=1, padx=(8, 0))
-        ttk.Button(iracing_docs_row, text="Default", command=self.reset_iracing_documents_dir).grid(row=0, column=2, padx=(8, 0))
-        ttk.Label(iracing_docs_box, text="Folder that contains paint, replay, and airosters. Use the button to change it. When you confirm a new location, the app restarts to apply the change.", foreground="#666666", wraplength=500, justify="left").grid(row=1, column=0, sticky="w", pady=(6, 0))
-
+        ttk.Button(self.iracing_documents_custom_frame, text="Change...", command=self.browse_iracing_documents_dir).grid(row=0, column=1, padx=(8, 0))
+        ttk.Button(self.iracing_documents_custom_frame, text="Use automatic", command=self.reset_iracing_documents_dir).grid(row=0, column=2, padx=(8, 0))
+        self._refresh_iracing_documents_dir_controls()
         perf.columnconfigure(1, weight=1)
         ttk.Label(perf, text="Worker mode").grid(row=0, column=0, sticky="w")
         mode_combo = ttk.Combobox(perf, state="readonly", values=["Safe", "Manual", "Session Total"], width=14, textvariable=self.download_workers_mode_var)
@@ -21414,7 +21555,7 @@ class DownloaderUI:
         ttk.Button(links_actions, text="Download links to RandomPool", command=self.download_showroom_links_now).pack(side="left")
         ttk.Button(links_actions, text="Download links to custom folder", command=lambda: self.download_showroom_links_now(custom_folder=True)).pack(side="left", padx=(8, 0))
 
-        ttk.Label(collection_tab, text="Paste a Trading Paints collection URL or ID. The app downloads all usable public non-PRO paints in that collection and separates cars, helmets, and suits locally.").grid(row=0, column=0, columnspan=4, sticky="w")
+        ttk.Label(collection_tab, text="Paste a Trading Paints collection URL or ID. The app downloads usable public paints in that collection and separates cars, helmets, and suits locally.").grid(row=0, column=0, columnspan=4, sticky="w")
         ttk.Label(collection_tab, text="Collection URL or ID").grid(row=1, column=0, sticky="w", pady=(10, 0))
         ttk.Entry(collection_tab, textvariable=self.showroom_collection_sources_var, width=52).grid(row=1, column=1, columnspan=2, sticky="ew", pady=(10, 0))
         ttk.Button(collection_tab, text="Collections", command=self.open_tp_collections_page).grid(row=1, column=3, sticky="w", padx=(8, 0), pady=(10, 0))
@@ -21891,7 +22032,7 @@ class DownloaderUI:
                 if reader is None:
                     error_text = "the iRacing SDK could not be opened"
                 else:
-                    ok = switch_camera_to_car_number(reader, car_number, driver_label)
+                    ok = switch_camera_to_car_number(reader, car_number, driver_label, car_idx=user.car_idx)
             except Exception as exc:  # noqa: BLE001
                 logging.debug("Camera switch worker failed", exc_info=True)
                 error_text = str(exc)
@@ -22600,11 +22741,14 @@ class DownloaderUI:
         config = self.config
         paints_dir = default_paints_dir(config)
         temp_dir = default_temp_dir()
+        source_is_random = str(source_label or "").strip().lower() == "random" and not str(scheme_id or "").strip()
+        fallback_mode = str(getattr(config, "tp_fallback_mode", "local") or "local").strip().lower()
+        use_local_random_pool = source_is_random and (fallback_mode == "local" or kind in {"helmet", "suit"})
         manifest_member_id = resolve_tp_manifest_member_id(
             getattr(config, "tp_manifest_member_id_override", 0),
             session.local_user_id if session.local_user_id is not None else snapshot.last_known_member_id,
         )
-        action_label = "random" if not scheme_id else f"scheme {scheme_id}"
+        action_label = "random local" if use_local_random_pool else ("random online" if source_is_random else f"scheme {scheme_id}")
         if len(jobs) == 1:
             row = jobs[0][0]
             self._append_log(f"Assigning fixed {kind} override for {row.display_name} ({row.iracing_id}) using {action_label}.")
@@ -22614,28 +22758,40 @@ class DownloaderUI:
 
         def _worker() -> None:
             results: list[tuple[tuple[object, int, str, str], SessionDriverSnapshot, list[SavedFile], bool, list[str]]] = []
+            used_local_random_source_ids: set[str] = set()
             for row, user, action_key_for_assignment in jobs:
                 saved_items: list[SavedFile] = []
                 logs: list[str] = []
                 registered = False
                 entry: dict[str, object] | None = None
                 try:
-                    saved_items, logs, entry = assign_driver_paint_override_from_showroom(
-                        session=session,
-                        user=user,
-                        kind=kind,
-                        paints_dir=paints_dir,
-                        temp_dir=temp_dir,
-                        mapping_path=default_tp_showroom_mapping_path(),
-                        profile_dir=default_tp_showroom_profile_dir(),
-                        manifest_member_id=manifest_member_id,
-                        scheme_id=scheme_id,
-                        source_link=source_link,
-                        source_label=source_label,
-                        showroom_sources=getattr(config, "tp_showroom_sources", TP_SHOWROOM_DEFAULT_SOURCES),
-                        retries=positive_int(config.retries, 3),
-                        retry_backoff_seconds=max(config.retry_backoff_seconds, 0.1),
-                    )
+                    if use_local_random_pool:
+                        saved_items, logs, entry = assign_driver_paint_override_from_local_random_pool(
+                            session=session,
+                            user=user,
+                            kind=kind,
+                            paints_dir=paints_dir,
+                            random_pool_dir=default_random_pool_dir(),
+                            ai_livery_root=default_ai_livery_dir(),
+                            used_source_ids=used_local_random_source_ids,
+                        )
+                    else:
+                        saved_items, logs, entry = assign_driver_paint_override_from_showroom(
+                            session=session,
+                            user=user,
+                            kind=kind,
+                            paints_dir=paints_dir,
+                            temp_dir=temp_dir,
+                            mapping_path=default_tp_showroom_mapping_path(),
+                            profile_dir=default_tp_showroom_profile_dir(),
+                            manifest_member_id=manifest_member_id,
+                            scheme_id=scheme_id,
+                            source_link=source_link,
+                            source_label=source_label,
+                            showroom_sources=getattr(config, "tp_showroom_sources", TP_SHOWROOM_DEFAULT_SOURCES),
+                            retries=positive_int(config.retries, 3),
+                            retry_backoff_seconds=max(config.retry_backoff_seconds, 0.1),
+                        )
                     if saved_items:
                         if entry is None:
                             entry = _driver_current_paint_entry_from_saved(
@@ -23747,13 +23903,42 @@ class DownloaderUI:
             iracing_documents_dir=self._read_iracing_documents_dir_setting(),
             launch_mode_preference=normalize_launch_mode_preference(getattr(self.config, "launch_mode_preference", "ask")),
         )
+    def _refresh_iracing_documents_dir_controls(self) -> None:
+        custom_enabled = bool(getattr(self, "custom_iracing_documents_dir_var", None) and self.custom_iracing_documents_dir_var.get())
+        automatic_path = str(default_iracing_documents_dir())
+        if not custom_enabled:
+            self.iracing_documents_dir_var.set(automatic_path)
+        frame = getattr(self, "iracing_documents_custom_frame", None)
+        if frame is not None:
+            try:
+                if custom_enabled:
+                    frame.grid()
+                else:
+                    frame.grid_remove()
+            except Exception:
+                pass
+        summary = getattr(self, "iracing_documents_dir_summary_var", None)
+        if summary is not None:
+            if custom_enabled:
+                summary.set("Advanced: using a custom iRacing Documents folder. Only change this if automatic detection is wrong.")
+            else:
+                summary.set(f"Automatic detection is active: {automatic_path}")
+    def on_custom_iracing_documents_dir_changed(self) -> None:
+        if self.custom_iracing_documents_dir_var.get():
+            current = normalize_optional_path(self.iracing_documents_dir_var.get()) or str(default_iracing_documents_dir())
+            self.iracing_documents_dir_var.set(current)
+        else:
+            self.iracing_documents_dir_var.set(str(default_iracing_documents_dir()))
+        self._refresh_iracing_documents_dir_controls()
+        self.on_setting_changed()
     def _read_iracing_documents_dir_setting(self) -> str:
+        if not bool(getattr(self, "custom_iracing_documents_dir_var", None) and self.custom_iracing_documents_dir_var.get()):
+            return ""
         normalized = normalize_optional_path(resolve_iracing_documents_dir(self.iracing_documents_dir_var.get()))
         default_path = str(default_iracing_documents_dir())
         if normalized == default_path:
             return ""
         return normalized
-
     def _prompt_restart_for_iracing_documents_dir(self, selected: str) -> None:
         normalized_selected = normalize_optional_path(resolve_iracing_documents_dir(selected))
         current_path = normalize_optional_path(resolve_iracing_documents_dir(self.iracing_documents_dir_var.get()))
@@ -23768,7 +23953,9 @@ class DownloaderUI:
         )
         if not confirmed:
             return
+        self.custom_iracing_documents_dir_var.set(True)
         self.iracing_documents_dir_var.set(normalized_selected)
+        self._refresh_iracing_documents_dir_controls()
         self.restart_app(
             f"iRacing Documents folder changed to: {normalized_selected}. Restarting now to apply the new location cleanly."
         )
@@ -23794,7 +23981,9 @@ class DownloaderUI:
         normalized_selected = normalize_optional_path(resolve_iracing_documents_dir(selected))
         if not normalized_selected:
             return False
+        self.custom_iracing_documents_dir_var.set(True)
         self.iracing_documents_dir_var.set(normalized_selected)
+        self._refresh_iracing_documents_dir_controls()
         self.on_setting_changed()
         return True
 
@@ -23805,8 +23994,22 @@ class DownloaderUI:
         self._prompt_restart_for_iracing_documents_dir(selected)
 
     def reset_iracing_documents_dir(self) -> None:
-        self._prompt_restart_for_iracing_documents_dir(str(default_iracing_documents_dir()))
-
+        automatic_path = str(default_iracing_documents_dir())
+        if not self.custom_iracing_documents_dir_var.get():
+            self.iracing_documents_dir_var.set(automatic_path)
+            self._refresh_iracing_documents_dir_controls()
+            return
+        confirmed = self.messagebox.askyesno(
+            APP_NAME,
+            f"Return to automatic iRacing Documents folder detection?\n\nDetected folder:\n{automatic_path}\n\nThe app will restart to apply the automatic location.",
+            parent=self.root,
+        )
+        if not confirmed:
+            return
+        self.custom_iracing_documents_dir_var.set(False)
+        self.iracing_documents_dir_var.set(automatic_path)
+        self._refresh_iracing_documents_dir_controls()
+        self.restart_app("iRacing Documents folder returned to automatic detection. Restarting now to apply the location cleanly.")
     def _current_ui_mode(self) -> str:
         mode = normalize_ui_mode_preference(self.ui_mode_var.get())
         if self.ui_mode_var.get() != mode:
@@ -25047,7 +25250,7 @@ class DownloaderUI:
 
         quick_start_docs_candidate = normalize_optional_path(auto_detect_iracing_documents_dir())
         quick_start_docs_state = {
-            "confirmed": False,
+            "confirmed": bool(quick_start_docs_candidate),
             "path": quick_start_docs_candidate,
             "auto_found": bool(quick_start_docs_candidate),
         }
@@ -25055,13 +25258,13 @@ class DownloaderUI:
         quick_start_docs_status_var = self.tk.StringVar(value="")
 
         p2 = _page_container()
-        self.ttk.Label(p2, text="3 • Check the iRacing Documents folder", font=("Segoe UI", 10, "bold"), foreground="#0b63b6").pack(anchor="w")
+        self.ttk.Label(p2, text="Choose the iRacing Documents folder", font=("Segoe UI", 10, "bold"), foreground="#0b63b6").pack(anchor="w")
         self.ttk.Label(
             p2,
             text=(
-                "Nishizumi Paints needs the folder that contains paint, replay, and airosters. "
-                "The app searches your Windows Documents location automatically, even if Documents was moved somewhere else. "
-                "Check the path below and confirm it before continuing."
+                "Automatic search did not find your iRacing folder. "
+                "Choose the folder that contains paint, replay, and airosters. "
+                "Most users will not see this step because the app can normally detect the folder by itself."
             ),
             wraplength=520,
             justify="left",
@@ -25147,10 +25350,11 @@ class DownloaderUI:
         quick_start_docs_confirm_button.configure(command=lambda: _confirm_quick_start_docs_path(quick_start_docs_state.get("path") or quick_start_docs_var.get(), auto_found=bool(quick_start_docs_state.get("auto_found"))))
         quick_start_docs_choose_button.configure(command=_choose_quick_start_docs_manually)
         _refresh_quick_start_docs_status()
-        pages.append(p2)
+        if not quick_start_docs_candidate:
+            pages.append(p2)
 
         p3 = _page_container()
-        self.ttk.Label(p3, text="4 • Download worker mode", font=("Segoe UI", 10, "bold"), foreground="#0b63b6").pack(anchor="w")
+        self.ttk.Label(p3, text="Download worker mode", font=("Segoe UI", 10, "bold"), foreground="#0b63b6").pack(anchor="w")
         self.ttk.Label(
             p3,
             text=(
@@ -25194,7 +25398,7 @@ class DownloaderUI:
         pages.append(p3)
 
         p3 = _page_container()
-        self.ttk.Label(p3, text="5 • Missing paint fallback", font=("Segoe UI", 10, "bold"), foreground="#0b63b6").pack(anchor="w")
+        self.ttk.Label(p3, text="Missing paint fallback", font=("Segoe UI", 10, "bold"), foreground="#0b63b6").pack(anchor="w")
         self.ttk.Label(
             p3,
             text="Choose what Nishizumi Paints should randomize when Trading Paints does not provide a usable paint. These options mirror the Random tab and start enabled by default.",
@@ -25260,7 +25464,7 @@ class DownloaderUI:
         pages.append(p3)
 
         p_ai = _page_container()
-        self.ttk.Label(p_ai, text="6 • iRacing ID for AI collections", font=("Segoe UI", 10, "bold"), foreground="#0b63b6").pack(anchor="w")
+        self.ttk.Label(p_ai, text="iRacing ID for AI collections", font=("Segoe UI", 10, "bold"), foreground="#0b63b6").pack(anchor="w")
         self.ttk.Label(
             p_ai,
             text=(
@@ -25289,7 +25493,7 @@ class DownloaderUI:
         pages.append(p_ai)
 
         p4 = _page_container()
-        self.ttk.Label(p4, text="7 • Public showroom downloads", font=("Segoe UI", 10, "bold"), foreground="#0b63b6").pack(anchor="w")
+        self.ttk.Label(p4, text="Public showroom downloads", font=("Segoe UI", 10, "bold"), foreground="#0b63b6").pack(anchor="w")
         explain = (
             "Online fallback now downloads public showroom paint assets directly. "
             "Nishizumi Paints samples random showroom pages for the active car, skips numbered and PRO-owner paints, then saves the selected public asset for the driver. "
@@ -25302,7 +25506,7 @@ class DownloaderUI:
         pages.append(p4)
 
         p5 = _page_container()
-        self.ttk.Label(p5, text="8 • Ready", font=("Segoe UI", 10, "bold"), foreground="#0b63b6").pack(anchor="w")
+        self.ttk.Label(p5, text="Ready", font=("Segoe UI", 10, "bold"), foreground="#0b63b6").pack(anchor="w")
         self.ttk.Label(
             p5,
             text=(
@@ -25898,7 +26102,7 @@ class DownloaderUI:
                 if downloaded > 0:
                     self.showroom_download_status_var.set(f"Done: downloaded {downloaded} collection paint(s), skipped {skipped}, added {added_sets} set(s), added {added_files} file(s) to {destination_label}.")
                 else:
-                    self.showroom_download_status_var.set("No usable public non-PRO paint assets were downloaded from that collection.")
+                    self.showroom_download_status_var.set("No usable public paint assets were downloaded from that collection.")
                 if not custom_folder:
                     self._refresh_random_pool_summary(force=True)
 

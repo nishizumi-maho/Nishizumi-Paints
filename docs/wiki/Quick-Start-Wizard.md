@@ -5,7 +5,7 @@ The Quick Start wizard is the intended first-run path for the app. It is designe
 ## What it configures
 
 - Easy mode or Advanced mode
-- iRacing Documents folder
+- iRacing Documents folder only when automatic detection fails
 - AI member ID
 - random fallback scope for cars, helmets, and suits
 - startup and background behavior
@@ -38,14 +38,14 @@ You can switch between the two modes later from inside the app, so the wizard ch
 
 ## iRacing Documents detection
 
-The wizard attempts to auto-detect the iRacing Documents folder. This matters because the app uses that location for:
+The wizard attempts to auto-detect the iRacing Documents folder. When detection succeeds, the wizard does not show a folder-selection page. It asks the user to choose manually only when the folder cannot be detected.
 
 - live-session paint output
 - AI rosters
 - replay-pack features
 - session cleanup
 
-If the folder is wrong, the app can still run, but the saved paints will go to the wrong place.
+If the folder is wrong, the app can still run, but the saved paints will go to the wrong place. After setup, Advanced mode exposes `Customize iRacing Documents folder` in General for users who need a manual override.
 
 ## AI member ID
 

@@ -2,6 +2,15 @@
 
 All notable user-facing changes to Nishizumi Paints are documented here.
 
+## [7.1.0-experimental] - 2026-05-13
+
+### Experimental Release
+
+- Fixed manual Showroom collection downloads to import every downloadable public collection paint into the Local RandomPool instead of discarding public Pro-owned or stamped-number paints with the online-fallback eligibility filter.
+- Fixed the Session table `Random` action so Local mode uses the Local RandomPool when Online fallback is disabled.
+- Simplified first-run iRacing Documents handling: Quick Start asks for a folder only when automatic detection fails, and General hides manual path controls behind `Customize iRacing Documents folder`.
+- Fixed Session row camera switching so selecting a driver from the Session table always switches iRacing to the Chase camera for that car.
+
 ## [7.0.0] - 2026-05-08
 
 ### Stable Release
