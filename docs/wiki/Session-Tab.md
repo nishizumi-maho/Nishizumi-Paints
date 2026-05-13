@@ -37,7 +37,7 @@ When multiple drivers are selected, compatible actions apply to every selected r
 
 ### Camera switch
 
-Double-click a Session row to ask iRacing to switch the in-game camera to that driver's car. The app uses the iRacing SDK camera broadcast and keeps the current camera group/camera when possible.
+Double-click a Session row to ask iRacing to switch the in-game camera to that driver's car. The app uses the iRacing SDK camera broadcast and selects the Chase camera for the target car.
 
 ### Fixed override
 
@@ -47,6 +47,7 @@ You can force a specific paint, helmet, or suit for a single driver. That overri
 
 You can ask the app to fetch a new random result for one driver. The current build is expected to:
 
+- honor the Random tab source mode, using the Local RandomPool when Local mode is selected
 - download the new result
 - save it into the correct iRacing target path
 - trigger texture reload for that car

@@ -1,5 +1,9 @@
 #ifndef AppVersion
-#define AppVersion "7.0.0"
+#define AppVersion "7.1.0-experimental"
+#endif
+
+#ifndef AppVersionInfo
+#define AppVersionInfo "7.1.0.0"
 #endif
 
 #define AppName "Nishizumi Paints"
@@ -30,7 +34,7 @@ CloseApplications=yes
 CloseApplicationsFilter={#AppExeName}
 RestartApplications=no
 SetupLogging=yes
-VersionInfoVersion={#AppVersion}
+VersionInfoVersion={#AppVersionInfo}
 VersionInfoCompany={#AppPublisher}
 VersionInfoDescription={#AppName} installer
 VersionInfoProductName={#AppName}

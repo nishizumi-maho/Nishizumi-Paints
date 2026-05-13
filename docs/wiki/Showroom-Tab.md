@@ -73,7 +73,8 @@ The no-browser release is centered on public showroom access:
 
 - no embedded browser is required for the normal showroom importer
 - no Trading Paints login is required for the main public path
-- public non-numbered, non-PRO assets are the intended direct-download target
+- normal online fallback still prefers public non-numbered, non-Pro assets
+- manual collection imports keep any downloadable public collection paint
 
 The manual team downloader follows the same no-browser posture. It uses Trading Paints manifest endpoints and does not require local Trading Paints cookies or a stored login.
 

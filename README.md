@@ -27,23 +27,20 @@ Nishizumi Paints is a Windows desktop companion for iRacing. It watches live ses
 
 Upgrades use the same app ID and install path, so a newer installer can be run over an existing installation.
 
-## What's new in 7.0
+## What's new in 7.1 experimental
 
-- Team sessions can fall back to the current driver's personal car, helmet, or suit when the Team paint is missing.
-- Team driver swaps are confirmed before the app clears and reapplies paints, with short follow-up refreshes for late updates.
-- The Session table now supports multi-select actions and double-click camera switching through the iRacing SDK.
-- Random fallback sources can be marked as favorites or blocked from the Session tab.
-- The app stores paint-history snapshots before overwrites and can restore the previous car, helmet, or suit.
-- Restore previous now clears override state and reloads only affected cars instead of forcing a global texture reload.
-- The Random tab is cleaner: Step 2 only chooses Local or Online, and Step 3 starts directly with showroom source and RandomPool controls.
-- New or missing configs keep the local user protected by default.
+- Manual Showroom collection imports now keep all downloadable public collection paints, including public paints owned by Pro users or paints with stamped numbers, instead of using the stricter online-fallback filter.
+- The Session table `Random` action now honors Local mode and pulls from the Local RandomPool when Online fallback is disabled.
+- First-run setup keeps the iRacing Documents folder automatic unless detection fails; Advanced mode exposes a `Customize iRacing Documents folder` checkbox for manual paths.
+- Double-click camera switching from the Session table now targets the selected driver with the Chase camera.
+- The 7.0 Team-session fallback, driver-swap, multi-select Session actions, favorites/blocklist, and paint-history restore work remain included.
 
 ## Session table quick guide
 
 - Select one driver to manage that driver's car, helmet, or suit.
 - Use `Ctrl+click` to toggle multiple drivers, or `Shift+click` to select a range.
 - Compatible Session actions apply to every selected driver that can use that action.
-- Double-click a driver row to switch the in-game iRacing camera to that driver's car.
+- Double-click a driver row to switch the in-game iRacing camera to that driver's car using Chase.
 - Use `Random` to fetch a new random fallback result for the selected item.
 - Use `Favorite` or `Block` when the selected item came from a random fallback source.
 - Use `Restore previous` to put back the last saved local paint-history snapshot.
@@ -59,7 +56,7 @@ The Local RandomPool can be filled from manual Showroom imports, collections, or
 
 ## Team session quick guide
 
-The recommended 7.0 Team fallback order is:
+The recommended 7.1 experimental Team fallback order is:
 
 1. Team paint for the item.
 2. Current driver's personal paint for the same item, if the matching General-tab fallback option is enabled.
@@ -76,11 +73,11 @@ Open **Showroom** when you want to pre-fill paints manually instead of waiting f
 - **Member ID** downloads a known member's car, helmet, and suit paints.
 - **Teams** downloads known Team paints.
 - **Showroom links** accepts one or more Trading Paints paint links.
-- **Collection** imports usable public non-PRO paints from a Trading Paints collection.
+- **Collection** imports usable public paints from a Trading Paints collection.
 
 ## Privacy notes
 
-The normal 7.0 online fallback path is browserless and does not require a Trading Paints login, password, cookie, token, or browser profile. Runtime data such as settings, paint history, RandomPool files, collection caches, and local iRacing paint folders should stay local and should not be committed.
+The normal 7.1 experimental online fallback path is browserless and does not require a Trading Paints login, password, cookie, token, or browser profile. Runtime data such as settings, paint history, RandomPool files, collection caches, and local iRacing paint folders should stay local and should not be committed.
 
 ## Run from source
 

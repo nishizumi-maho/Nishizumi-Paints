@@ -9,7 +9,7 @@ The General tab is the advanced-mode control panel for app-wide behavior. It doe
 - cleanup and self-protection options
 - general download worker mode
 - online fallback lane behavior
-- iRacing Documents folder management
+- automatic iRacing Documents detection with optional custom folder override
 
 ## Interface mode
 
@@ -97,9 +97,11 @@ The General tab also holds the advanced online-fallback toggles for:
 
 Those settings work together with the Random tab. The Random tab decides who is eligible for fallback; the General tab decides how aggressively the online engine runs.
 
-## iRacing Documents folder
+## Advanced folder settings
 
-The selected iRacing Documents folder is shown here and can be changed later. Changing it affects:
+The app detects the iRacing Documents folder automatically. Most users do not need to choose a path manually.
+
+Enable `Customize iRacing Documents folder` only when automatic detection points at the wrong folder or cannot find the folder. Manual selection affects:
 
 - live-session paint output
 - AI roster syncing

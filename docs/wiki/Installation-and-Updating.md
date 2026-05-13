@@ -6,7 +6,7 @@
 2. Run the installer.
 3. Leave the startup option enabled if you want the app to launch when you sign in.
 4. Leave the background option enabled inside the app if you want monitoring to continue when the main window is closed.
-5. Finish the Quick Start wizard after first launch.
+5. Finish the Quick Start wizard after first launch. It asks for the iRacing Documents folder only if automatic detection fails.
 
 ## What the installer does
 
