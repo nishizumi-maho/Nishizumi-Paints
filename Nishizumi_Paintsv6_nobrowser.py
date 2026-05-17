@@ -43,7 +43,7 @@ from requests.adapters import HTTPAdapter
 # Browserless copy: Trading Paints browser automation is intentionally disabled.
 sync_playwright = None
 APP_NAME = "Nishizumi Paints"
-APP_VERSION = "7.1.0"
+APP_VERSION = "7.1.1"
 APP_REGISTRY_NAME = "NishizumiPaints"
 APP_CONFIG_DIRNAME = "NishizumiPaints"
 APP_TOOLTIP = f"{APP_NAME} {APP_VERSION}"
@@ -15688,19 +15688,23 @@ def sanitize_paint_directory(value: str, *, fallback: str = "misc") -> str:
     if not text:
         text = str(fallback or '').strip()
     text = text.replace("/", "\\")
+    if text.startswith("\\"):
+        raise ValueError(f"Unsafe paint directory: {value!r}")
     parts = [part.strip() for part in text.split("\\") if part.strip()]
-    if len(parts) != 1:
+    if not parts:
         raise ValueError(f"Unsafe paint directory: {value!r}")
-    part = parts[0]
-    if part in {".", ".."}:
-        raise ValueError(f"Unsafe paint directory: {value!r}")
-    if ":" in part:
-        raise ValueError(f"Unsafe paint directory: {value!r}")
-    if part.endswith(".") or part.endswith(" "):
-        raise ValueError(f"Unsafe paint directory: {value!r}")
-    if not SAFE_PAINT_DIRECTORY_RE.fullmatch(part):
-        raise ValueError(f"Unsafe paint directory: {value!r}")
-    return part
+    safe_parts: list[str] = []
+    for part in parts:
+        if part in {".", ".."}:
+            raise ValueError(f"Unsafe paint directory: {value!r}")
+        if ":" in part:
+            raise ValueError(f"Unsafe paint directory: {value!r}")
+        if part.endswith(".") or part.endswith(" "):
+            raise ValueError(f"Unsafe paint directory: {value!r}")
+        if not SAFE_PAINT_DIRECTORY_RE.fullmatch(part):
+            raise ValueError(f"Unsafe paint directory: {value!r}")
+        safe_parts.append(part)
+    return os.path.join(*safe_parts)
 
 def safe_join_under(root: Path, *parts: str) -> Path:
     """Join paths while guaranteeing the final path stays under ``root``.

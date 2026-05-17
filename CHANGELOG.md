@@ -2,6 +2,12 @@
 
 All notable user-facing changes to Nishizumi Paints are documented here.
 
+## [7.1.1] - 2026-05-16
+
+### Fixed
+
+- Fixed Trading Paints downloads for cars whose iRacing paint directory is nested, such as `mx5\mx52016`, while preserving path traversal checks.
+
 ## [7.1.0] - 2026-05-13
 
 ### Stable Release
