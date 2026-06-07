@@ -2,6 +2,12 @@
 
 All notable user-facing changes to Nishizumi Paints are documented here.
 
+## [7.1.2] - 2026-06-07
+
+### Fixed
+
+- Fixed Team-session driver-swap refreshes so active-driver updates no longer cancel the whole paint pipeline, and confirmed swaps only reapply paints for changed Team targets instead of clearing and redownloading the whole session.
+
 ## [7.1.1] - 2026-05-16
 
 ### Fixed

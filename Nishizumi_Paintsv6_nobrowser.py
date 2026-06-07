@@ -43,7 +43,7 @@ from requests.adapters import HTTPAdapter
 # Browserless copy: Trading Paints browser automation is intentionally disabled.
 sync_playwright = None
 APP_NAME = "Nishizumi Paints"
-APP_VERSION = "7.1.1"
+APP_VERSION = "7.1.2"
 APP_REGISTRY_NAME = "NishizumiPaints"
 APP_CONFIG_DIRNAME = "NishizumiPaints"
 APP_TOOLTIP = f"{APP_NAME} {APP_VERSION}"
@@ -1628,6 +1628,14 @@ class Session:
 
 def session_cancel_fingerprint(session: Session) -> tuple[SessionId, tuple[tuple[str, int, str, int], ...], tuple[bool, str, int, int, bool, str, str, bool]]:
     return session.fingerprint()
+
+def session_pipeline_fingerprint(session: Session) -> tuple[SessionId, tuple[tuple[str, int, str, int], ...], tuple[bool, str, int, int, bool, str, str, bool]]:
+    session_id, users, context_bits = session.fingerprint()
+    stable_users = tuple(
+        (kind, target_id, directory, 0 if kind == "team" else source_user_id)
+        for kind, target_id, directory, source_user_id in users
+    )
+    return (session_id, stable_users, context_bits)
 @dataclass(frozen=True)
 class DownloadId:
     user_id: int
@@ -18585,9 +18593,9 @@ def start_session_cancel_monitor(
                     cancel_event.set()
                     logging.info("Cancelling active paint pipeline because the iRacing session ended or became invalid.")
                     break
-                if observed_session is not None and session_cancel_fingerprint(observed_session) != expected_fingerprint:
+                if observed_session is not None and session_pipeline_fingerprint(observed_session) != expected_fingerprint:
                     cancel_event.set()
-                    logging.info("Cancelling active paint pipeline because the iRacing session identity or context changed while processing.")
+                    logging.info("Cancelling active paint pipeline because the iRacing session identity, roster, or context changed while processing.")
                     break
                 stop_event.wait(max(0.25, float(poll_seconds)))
         finally:
@@ -20214,6 +20222,18 @@ class DownloaderService:
                             "Cleared %s stale team paint file(s) before applying the new team's active-driver paints.",
                             cleared_count,
                         )
+                    session_to_process = replace(
+                        session,
+                        users={current_user_map[key] for key in changed_team_driver_keys},
+                    )
+                    session_rows = merge_session_driver_rows(session, previous_rows, [])
+                    self._update_runtime_snapshot(
+                        current_session,
+                        last_saved,
+                        last_known_member_id,
+                        session_rows=session_rows,
+                        replay_mode_active=replay_mode_active,
+                    )
                 if partial_target_refresh_key is not None:
                     refresh_user = current_user_map[partial_target_refresh_key]
                     last_saved, cleared_count = clear_session_target_files(
@@ -20286,7 +20306,13 @@ class DownloaderService:
                         self._force_target_refresh_key = None
                     if partial_target_refresh_key is None:
                         logging.info("Manual re-download requested for session %s", session.session_id.folder_name())
-                if last_saved and config.cleanup_before_fetch and not roster_changed_same_session and partial_target_refresh_key is None:
+                if (
+                    last_saved
+                    and config.cleanup_before_fetch
+                    and not roster_changed_same_session
+                    and not changed_team_driver_keys
+                    and partial_target_refresh_key is None
+                ):
                     reason = (
                         f"Refreshing current session files before new fetch for {session.session_id.folder_name()}"
                         if current_fingerprint == last_session_fingerprint or same_session_identity
@@ -20348,7 +20374,7 @@ class DownloaderService:
                 else:
                     session_cancel_event = threading.Event()
                     session_cancel_monitor = start_session_cancel_monitor(
-                        expected_fingerprint=session_cancel_fingerprint(session),
+                        expected_fingerprint=session_pipeline_fingerprint(session),
                         cancel_event=session_cancel_event,
                         stop_event=self._stop_event,
                         reader=sdk_reader,
@@ -20455,7 +20481,7 @@ class DownloaderService:
                     refresh_time = time.time()
                     for row in processed_rows:
                         self._session_refresh_by_key[_session_row_key(row)] = refresh_time
-                    if roster_changed_same_session or partial_target_refresh_key is not None:
+                    if roster_changed_same_session or changed_team_driver_keys or partial_target_refresh_key is not None:
                         last_saved = merge_saved_files(last_saved, processed_saved)
                         session_rows = merge_session_driver_rows(session, previous_rows, processed_rows)
                     else:
