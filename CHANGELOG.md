@@ -2,6 +2,12 @@
 
 All notable user-facing changes to Nishizumi Paints are documented here.
 
+## [7.1.3] - 2026-06-07
+
+### Fixed
+
+- Added a visible update notice to the headless controller UI so newer releases are surfaced even when the app is running without the full live interface.
+
 ## [7.1.2] - 2026-06-07
 
 ### Fixed
