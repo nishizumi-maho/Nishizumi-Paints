@@ -43,7 +43,7 @@ from requests.adapters import HTTPAdapter
 # Browserless copy: Trading Paints browser automation is intentionally disabled.
 sync_playwright = None
 APP_NAME = "Nishizumi Paints"
-APP_VERSION = "7.1.2"
+APP_VERSION = "7.1.3"
 APP_REGISTRY_NAME = "NishizumiPaints"
 APP_CONFIG_DIRNAME = "NishizumiPaints"
 APP_TOOLTIP = f"{APP_NAME} {APP_VERSION}"
@@ -20938,6 +20938,7 @@ class DownloaderUI:
         self._auto_update_after_id = None
         self._random_pool_opt_in_notified = bool(getattr(self.config, "keep_tp_paints_in_random_pool", False))
         self._headless_controller_mode = False
+        self._last_headless_status_response: dict[str, object] | None = None
         self._last_monitor_snapshot_signature: tuple[object, ...] | None = None
         self._last_pool_stats_refresh_at = 0.0
         self._tp_mapping_scan_in_progress = False
@@ -21875,6 +21876,8 @@ class DownloaderUI:
         ttk.Label(easy_status, textvariable=self.session_summary_var, justify="left").grid(row=1, column=0, sticky="w", pady=(4, 0))
         ttk.Label(easy_status, textvariable=self.session_status_summary_var, justify="left", foreground="#555555", wraplength=860).grid(row=2, column=0, sticky="w", pady=(4, 0))
         ttk.Label(easy_status, textvariable=self.update_status_var, justify="left", foreground="#555555").grid(row=3, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(easy_status, textvariable=self.headless_status_var, justify="left", foreground="#555555", wraplength=860).grid(row=4, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(easy_status, textvariable=self.headless_hint_var, justify="left", foreground="#666666", wraplength=860).grid(row=5, column=0, sticky="w", pady=(4, 0))
 
         self.easy_log_frame = ttk.LabelFrame(easy_right, text="Activity", padding=8)
         self.easy_log_frame.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
@@ -23584,6 +23587,7 @@ class DownloaderUI:
         if self._headless_controller_mode:
             response = send_headless_control_command("status")
             if response and response.get('ok'):
+                self._last_headless_status_response = response
                 session_label = str(response.get('current_session') or '').strip()
                 status_label = str(response.get('service_status') or "Watching").strip() or "Watching"
                 self.status_var.set(f"Headless • {status_label}")
@@ -23618,6 +23622,7 @@ class DownloaderUI:
         if not response or not response.get('ok'):
             return False
         self._headless_controller_mode = True
+        self._last_headless_status_response = response
         self.status_var.set(f"Headless • {str(response.get('service_status') or 'Watching').strip() or 'Watching'}")
         self._update_headless_ui(response)
         return True
@@ -23636,15 +23641,23 @@ class DownloaderUI:
 
     def _update_headless_ui(self, status_response: dict[str, object] | None = None) -> None:
         if self._headless_controller_mode:
+            if status_response is None:
+                status_response = self._last_headless_status_response
+            update_notice = self._headless_update_notice_text()
             session_label = ""
             if status_response:
                 session_label = str(status_response.get('current_session') or '').strip()
             session_text = f" Current session: {session_label}." if session_label else ""
             self.headless_status_var.set(
-                "Headless mode is active. The downloader engine is running in the background without the live Tk interface, which keeps daily resource usage lower." + session_text
+                "Headless mode is active. The downloader engine is running in the background without the live Tk interface, which keeps daily resource usage lower."
+                + session_text
+                + update_notice
             )
+            hint_text = "This window is attached only as a settings controller. Any setting saved here is pushed to the running headless service immediately when possible."
+            if update_notice:
+                hint_text += update_notice
             self.headless_hint_var.set(
-                "This window is attached only as a settings controller. Any setting saved here is pushed to the running headless service immediately when possible."
+                hint_text
             )
             return
         self.headless_status_var.set(
@@ -23653,6 +23666,17 @@ class DownloaderUI:
         self.headless_hint_var.set(
             "The GUI and headless modes share the same saved settings file automatically."
         )
+
+    def _headless_update_notice_text(self) -> str:
+        release = self._latest_release_info
+        if release is None:
+            return ""
+        if compare_version_tags(release.tag_name, APP_VERSION) <= 0:
+            return ""
+        notice = f" Update available: {release.tag_name}."
+        if release.asset_name:
+            notice += f" Asset: {release.asset_name}."
+        return notice
 
     def _launch_headless_process(self) -> tuple[bool, str]:
         command = build_self_launch_command("--nogui", "--managed-headless")
@@ -23679,6 +23703,7 @@ class DownloaderUI:
             if self.service.is_running():
                 self.service.stop(join_timeout=2.0)
             self._headless_controller_mode = True
+            self._last_headless_status_response = response
             self._persist_launch_mode_preference("headless")
             self._update_headless_ui(response)
             self._append_log("Attached to the existing headless service.")
@@ -23806,6 +23831,8 @@ class DownloaderUI:
             self._append_log(f"Update check complete: local build {APP_VERSION} is newer than GitHub latest {release.tag_name}.")
             if manual:
                 self.messagebox.showinfo(APP_NAME, f"Your current build ({APP_VERSION}) is newer than the latest public GitHub release ({release.tag_name}).")
+        if self._headless_controller_mode:
+            self._update_headless_ui()
         if self.check_updates_var.get() and not self._exiting:
             self._schedule_update_check(initial=False)
     def open_latest_release(self) -> None:
