@@ -65,6 +65,6 @@ The current flow defaults to:
 - random suits enabled
 - safe worker mode available for general downloading
 
-## Mapping review timing
+## Automatic car identity
 
-The showroom mapping review prompt is intentionally delayed until after Quick Start completes. New users should not be interrupted by the mapping workflow before the base setup is finished.
+Quick Start does not ask the user to review or edit car mappings. The live Trading Paints car catalog is refreshed automatically after setup.

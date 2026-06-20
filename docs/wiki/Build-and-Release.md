@@ -14,8 +14,6 @@ Important top-level folders now include:
 
 - `assets/icons/`
   bundled icon files used by the app and installer
-- `data/`
-  bundled data files such as the showroom mapping seed
 - `scripts/`
   local build helpers
 - `installer/`
@@ -53,9 +51,8 @@ The current build packages:
 
 - `assets/icons/nishizumi_paints_icon.ico`
 - `assets/icons/nishizumi_paints_icon.png`
-- `data/tp_showroom_mapping.seed.json`
 
-Those resources are resolved at runtime through the script’s bundled-resource helpers so the same code works from source and from PyInstaller output.
+Car identity is not bundled. It is loaded automatically from the live Trading Paints template catalog.
 
 ## Ignored local output
 

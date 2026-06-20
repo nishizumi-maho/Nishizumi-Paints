@@ -67,7 +67,7 @@ if exist "installer\output" (
     rmdir /s /q "installer\output"
 )
 
-"%ISCC%" /DAppVersion=%APP_VERSION% "%ISS%"
+"%ISCC%" /DAppVersion=%APP_VERSION% /DAppVersionInfo=%APP_VERSION%.0 "%ISS%"
 if errorlevel 1 (
     echo.
     echo [ERROR] Installer build failed.

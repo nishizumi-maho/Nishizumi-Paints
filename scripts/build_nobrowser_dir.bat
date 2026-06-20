@@ -53,12 +53,6 @@ if exist "assets\\icons\\nishizumi_paints_icon.png" (
 if exist "assets\\icons\\nishizumi_paints_icon.ico" (
     set "CMD=!CMD! --add-data assets\\icons\\nishizumi_paints_icon.ico;assets/icons"
 )
-if exist "data\\tp_showroom_mapping.seed.json" (
-    set "CMD=!CMD! --add-data data\\tp_showroom_mapping.seed.json;data"
-) else (
-    echo [WARN] data\\tp_showroom_mapping.seed.json not found. Build will continue without it.
-)
-
 set "CMD=!CMD! --hidden-import irsdk --hidden-import bs4 %SCRIPT%"
 
 echo.

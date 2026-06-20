@@ -78,4 +78,4 @@ Installed builds are for normal users. Source builds are useful when:
 - preparing a new release
 - debugging runtime-path issues
 
-The release build ships the icon assets and bundled showroom mapping seed from the repository `assets/` and `data/` folders.
+The release build ships the icon assets from `assets/`. Car identity is loaded automatically from the live Trading Paints template catalog, so releases no longer bundle a showroom mapping seed.

@@ -11,7 +11,7 @@ At this point it can also:
 - update the tray state
 - check for updates
 - trigger AI roster sync
-- start showroom mapping review
+- refresh the live Trading Paints car identity catalog
 
 ## 2. Session detection
 
@@ -22,6 +22,7 @@ When the SDK exposes a usable session, the app builds an internal `Session` obje
 - users and AI entries
 - series and league context
 - car directories
+- car display names and iRacing car IDs
 - superspeedway state
 
 ## 3. Manifest stage
@@ -32,6 +33,8 @@ For each session user, the app attempts to resolve normal Trading Paints assets 
 2. single-user manifest fallback when needed
 
 This stage decides which normal TP files already exist for the session before fallback even starts.
+
+Manifest directories are recorded as runtime validation. Their `<carid>` fields are paint asset IDs and are not used as vehicle MIDs.
 
 For Team sessions, team assets are preferred per item. If the team has no car, helmet, or suit for the active car, the matching General-tab option can retarget the current in-car driver's personal asset for that same item to the team file path.
 

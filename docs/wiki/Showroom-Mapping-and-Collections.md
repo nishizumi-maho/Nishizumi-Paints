@@ -1,90 +1,33 @@
-# Showroom Mapping and Collections
+# Automatic Car Identification and Collections
 
-This page covers the parts of the app that connect iRacing car identifiers to Trading Paints showroom vehicles and the tools that use those mappings for manual or automated imports.
+This page covers how Nishizumi Paints connects iRacing car directories to Trading Paints vehicles without a bundled seed or user-edited mapping.
 
-## Why mapping exists
+## Automatic identity sources
 
-The public showroom JSON API is organized by Trading Paints vehicle pages. The live iRacing SDK and local paint folders are organized by iRacing car directories.
+The app combines:
 
-The app needs a bridge between those two worlds.
+- the iRacing SDK car name, car ID, and `CarPath`
+- car directories observed in Trading Paints manifests
+- the live Trading Paints template catalog at `https://www.tradingpaints.com/cartemplates`
 
-That bridge is the TP showroom mapping.
+The Trading Paints catalog publishes the vehicle MID, display name, and exact `Documents/iRacing/paint/...` directory in one record. This is the authoritative bridge used by public showroom downloads.
 
-## Bundled seed and user override
+## New cars
 
-The repository ships a bundled seed at:
+The catalog is loaded automatically, cached in memory for six hours, and refreshed immediately when an unknown car directory is requested. If iRacing exposes a different directory alias, the app can match it to the Trading Paints vehicle using the SDK car name.
 
-- `data/tp_showroom_mapping.seed.json`
+No Nishizumi Paints release, JSON edit, seed update, or review dialog is required.
 
-The app can also maintain a user override copy at:
+## Manifest handling
 
-- `%APPDATA%\NishizumiPaints\tp_showroom_mapping.seed.json`
-
-At runtime the app merges the bundled seed with the user override so local corrections can coexist with the shipped defaults.
-
-## Startup scan and review
-
-The app can scan:
-
-- the iRacing active-car source
-- the public Trading Paints showroom catalog
-
-It then scores likely matches and produces pending-review items for vehicles that are still unmapped.
-
-The review dialog lets the user:
-
-- accept a candidate
-- mark a car as not available in Trading Paints
-- skip a car
-- open the selected Trading Paints page
-- open the JSON file directly
-
-The review UI is intended to make the mapping decision easier, not to force the user to understand the raw JSON structure first.
+Manifest `<carid>` values identify paint assets, not Trading Paints vehicle MIDs. Nishizumi Paints therefore uses manifest directories as runtime validation and never treats a paint asset ID as a vehicle ID.
 
 ## Direct showroom links
 
-The Showroom tab can import:
-
-- full `showroom/view/...` links
-- raw scheme IDs
-
-The app then inspects the showroom view page to determine:
-
-- title
-- vehicle name
-- whether it is a car, helmet, or suit
-
-For cars, the mapping is used again to place the imported asset into the correct local bucket.
+The Showroom tab can import full `showroom/view/...` links or raw scheme IDs. For cars, the automatic identity catalog places the imported asset into the correct local bucket.
 
 ## Collection imports
 
-Collections now work without browser automation.
+Collections work without browser automation. The app loads collection JSON, separates cars from helmets and suits, resolves car MIDs through the live identity catalog, and saves results into the RandomPool or collection cache.
 
-The app can:
-
-- parse a collection URL or raw collection ID
-- request the collection JSON directly
-- separate car items from helmet and suit items
-- map cars back to iRacing directories when possible
-- save the results into the RandomPool or collection-specific cache
-
-When those collections are used as a live fallback source, disabling normal public showroom coverage now keeps the session inside that curated pool by repeating collection paints once the unused options are exhausted.
-
-## Mixed-vehicle collections
-
-Collections can contain:
-
-- multiple cars
-- helmets
-- suits
-
-The app separates those correctly and stores them under the appropriate local directories or buckets.
-
-## Practical workflow
-
-If a new car is missing from the mapping:
-
-1. let the startup scan or review dialog identify it
-2. accept the correct Trading Paints vehicle
-3. save the mapping
-4. use that car normally in public fallback, showroom imports, and collection imports
+Mixed-vehicle collections are supported.
