@@ -43,7 +43,7 @@ from requests.adapters import HTTPAdapter
 # Browserless copy: Trading Paints browser automation is intentionally disabled.
 sync_playwright = None
 APP_NAME = "Nishizumi Paints"
-APP_VERSION = "7.1.3"
+APP_VERSION = "7.2.0"
 APP_REGISTRY_NAME = "NishizumiPaints"
 APP_CONFIG_DIRNAME = "NishizumiPaints"
 APP_TOOLTIP = f"{APP_NAME} {APP_VERSION}"
@@ -93,18 +93,10 @@ PAINT_HISTORY_INDEX_FILENAME = "history.json"
 PAINT_HISTORY_LIMIT_PER_TARGET = 12
 PAINT_HISTORY_GLOBAL_LIMIT = 3000
 TP_RECENT_SCHEMES_HISTORY_LIMIT = 256
-TP_SHOWROOM_MAPPING_FILENAME = "tp_showroom_mapping.seed.json"
-TP_SHOWROOM_MAPPING_RESOURCE = "data/tp_showroom_mapping.seed.json"
-TP_SHOWROOM_REVIEW_DIRNAME = "tp_showroom_review"
-TP_SHOWROOM_SCAN_IRACING_SOURCE = "https://support.iracing.com/support/solutions/articles/31000172625-filepath-for-active-iracing-cars"
-TP_SHOWROOM_SCAN_ROOTS = (
-    "https://www.tradingpaints.com/showroom/Oval",
-    "https://www.tradingpaints.com/showroom/Road",
-)
-TP_SHOWROOM_SCAN_TIMEOUT_SECONDS = 25.0
-TP_SHOWROOM_SCAN_SLEEP_SECONDS = 0.15
-TP_SHOWROOM_SCAN_TOP_N = 5
-TP_SHOWROOM_SCAN_MIN_SCORE = 35.0
+TP_CAR_TEMPLATES_URL = "https://www.tradingpaints.com/cartemplates"
+TP_CAR_IDENTITY_CACHE_TTL_SECONDS = 6 * 60 * 60
+TP_CAR_IDENTITY_RETRY_SECONDS = 60.0
+TP_CAR_IDENTITY_MIN_EXPECTED_ENTRIES = 50
 TP_SHOWROOM_STARTUP_SCAN_DELAY_MS = 3500
 TP_LOGIN_STATUS_FILENAME = ".nishizumi_tp_login_status.json"
 TP_ORIGINAL_SCHEME_CACHE_FILENAME = ".nishizumi_tp_original_scheme_cache.json"
@@ -457,20 +449,13 @@ def canonicalize_car_directory(value: str | None) -> str:
     return text
 
 
-def bundled_tp_showroom_mapping_path() -> Path:
-    return resource_path(TP_SHOWROOM_MAPPING_RESOURCE)
+def default_tp_showroom_mapping_path() -> None:
+    """Compatibility shim for callers that still pass a mapping argument.
 
-
-def user_tp_showroom_mapping_path() -> Path:
-    return default_app_config_dir() / TP_SHOWROOM_MAPPING_FILENAME
-
-
-def default_tp_showroom_mapping_path() -> Path:
-    return user_tp_showroom_mapping_path()
-
-
-def default_tp_showroom_review_dir() -> Path:
-    return default_app_config_dir() / TP_SHOWROOM_REVIEW_DIRNAME
+    Car identities are resolved from Trading Paints' live template catalog.
+    There is no bundled seed or user-editable mapping file anymore.
+    """
+    return None
 
 
 def default_tp_showroom_profile_dir() -> Path:
@@ -1535,6 +1520,8 @@ def _manifest_file_url_is_superspeedway_variant(file_url: str, paint_type: Paint
 class SessionUser:
     user_id: int
     directory: str
+    car_name: str = ""
+    car_id: int = 0
     team_id: int | None = None
     number: str = "0"
     paint_ext: str = ""
@@ -3277,10 +3264,20 @@ def _build_session_from_parts(
             team_id = None
         car_path = d.get('CarPath')
         if isinstance(car_path, str) and car_path.strip():
+            car_name = str(
+                d.get('CarScreenName')
+                or d.get('CarScreenNameShort')
+                or d.get('CarClassShortName')
+                or ""
+            ).strip()
+            car_id = _to_int_or_none(d.get('CarID')) or 0
+            _observe_iracing_car_identity(car_path.strip(), car_name, car_id)
             users.add(
                 SessionUser(
                     user_id=user_id,
                     directory=car_path.strip(),
+                    car_name=car_name,
+                    car_id=int(car_id),
                     team_id=team_id,
                     number=_driver_number_text(d),
                     paint_ext=_driver_paint_ext(d),
@@ -3338,6 +3335,7 @@ def _parse_fetch_user_manifest_xml(user_id: int, xml_text: str) -> list[Download
         type_raw = (car.findtext("type") or '').strip().lower()
         if not file_url or not directory or not type_raw:
             continue
+        _observe_tp_manifest_directory(directory)
         try:
             paint_type = PaintType(type_raw)
         except ValueError:
@@ -5481,171 +5479,9 @@ def _run_tp_sync_api_in_thread(func: Callable[[], object]) -> object:
     return result_holder.get('value')
 
 
-@dataclass(frozen=True)
-class TPShowroomCatalogVehicle:
-    mid: int
-    category: str
-    slug: str
-    tp_name: str
-    showroom_url: str
-
-
-@dataclass(frozen=True)
-class IRacingActiveCar:
-    iracing_name: str
-    filepath_full: str
-    directory_leaf: str
-
-
 def _canonicalize_tp_mapping_key(value: object) -> str:
     text = canonicalize_car_directory(str(value or '').strip())
     return text.lower() if text else ""
-
-
-def _normalize_tp_showroom_mapping_doc(raw: Any) -> dict[str, Any]:
-    if isinstance(raw, dict) and isinstance(raw.get('cars'), dict):
-        cars = {
-            _canonicalize_tp_mapping_key(key): dict(value)
-            for key, value in (raw.get('cars') or {}).items()
-            if _canonicalize_tp_mapping_key(key) and isinstance(value, dict)
-        }
-        unsupported = {
-            _canonicalize_tp_mapping_key(key): dict(value)
-            for key, value in (raw.get('unsupported') or {}).items()
-            if _canonicalize_tp_mapping_key(key) and isinstance(value, dict)
-        }
-        return {
-            "schema_version": int(raw.get("schema_version") or 1),
-            "cars": cars,
-            "unsupported": unsupported,
-        }
-    if isinstance(raw, dict):
-        cars = {
-            _canonicalize_tp_mapping_key(key): dict(value)
-            for key, value in raw.items()
-            if _canonicalize_tp_mapping_key(key) and isinstance(value, dict)
-        }
-        return {"schema_version": 1, "cars": cars, "unsupported": {}}
-    return {"schema_version": 1, "cars": {}, "unsupported": {}}
-
-
-def _merge_tp_showroom_mapping_docs(base_doc: dict[str, Any], override_doc: dict[str, Any]) -> dict[str, Any]:
-    base = _normalize_tp_showroom_mapping_doc(base_doc)
-    override = _normalize_tp_showroom_mapping_doc(override_doc)
-    merged = {
-        "schema_version": max(int(base.get("schema_version") or 1), int(override.get("schema_version") or 1)),
-        "cars": dict(base.get("cars") or {}),
-        "unsupported": dict(base.get("unsupported") or {}),
-    }
-    for key, value in (override.get("cars") or {}).items():
-        normalized_key = _canonicalize_tp_mapping_key(key)
-        if normalized_key and isinstance(value, dict):
-            merged["cars"][normalized_key] = dict(value)
-    for key, value in (override.get("unsupported") or {}).items():
-        normalized_key = _canonicalize_tp_mapping_key(key)
-        if normalized_key and isinstance(value, dict):
-            merged["unsupported"][normalized_key] = dict(value)
-    return merged
-
-
-_TP_SHOWROOM_RAW_MAPPING_CACHE_LOCK = threading.Lock()
-_TP_SHOWROOM_RAW_MAPPING_CACHE: dict[str, tuple[tuple[int, int], Any]] = {}
-
-
-def _tp_showroom_mapping_file_cache_key(path: Path) -> str:
-    try:
-        return str(path.resolve()).lower()
-    except Exception:
-        return str(path).lower()
-
-
-def _tp_showroom_mapping_file_signature(path: Path) -> tuple[int, int]:
-    try:
-        stat = path.stat()
-        return int(stat.st_mtime_ns), int(stat.st_size)
-    except Exception:
-        return -1, -1
-
-
-def _invalidate_tp_showroom_mapping_cache(path: Path) -> None:
-    cache_key = _tp_showroom_mapping_file_cache_key(path)
-    with _TP_SHOWROOM_RAW_MAPPING_CACHE_LOCK:
-        _TP_SHOWROOM_RAW_MAPPING_CACHE.pop(cache_key, None)
-
-
-def _load_raw_tp_showroom_mapping_file(path: Path) -> Any:
-    cache_key = _tp_showroom_mapping_file_cache_key(path)
-    signature = _tp_showroom_mapping_file_signature(path)
-    with _TP_SHOWROOM_RAW_MAPPING_CACHE_LOCK:
-        cached = _TP_SHOWROOM_RAW_MAPPING_CACHE.get(cache_key)
-        if cached is not None and cached[0] == signature:
-            return cached[1]
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-    except Exception:
-        raw = {}
-    with _TP_SHOWROOM_RAW_MAPPING_CACHE_LOCK:
-        _TP_SHOWROOM_RAW_MAPPING_CACHE[cache_key] = (signature, raw)
-    return raw
-
-
-def _load_tp_showroom_mapping(mapping_path: Path | None = None) -> dict:
-    bundled_path = bundled_tp_showroom_mapping_path()
-    user_path = user_tp_showroom_mapping_path()
-    bundled_doc = _normalize_tp_showroom_mapping_doc(_load_raw_tp_showroom_mapping_file(bundled_path))
-    if mapping_path is None:
-        return _merge_tp_showroom_mapping_docs(bundled_doc, _load_raw_tp_showroom_mapping_file(user_path))
-    resolved_path = Path(mapping_path)
-    try:
-        if resolved_path.resolve() == bundled_path.resolve():
-            return bundled_doc
-    except Exception:
-        if str(resolved_path).lower() == str(bundled_path).lower():
-            return bundled_doc
-    try:
-        if resolved_path.resolve() == user_path.resolve():
-            return _merge_tp_showroom_mapping_docs(bundled_doc, _load_raw_tp_showroom_mapping_file(user_path))
-    except Exception:
-        if str(resolved_path).lower() == str(user_path).lower():
-            return _merge_tp_showroom_mapping_docs(bundled_doc, _load_raw_tp_showroom_mapping_file(user_path))
-    return _merge_tp_showroom_mapping_docs(bundled_doc, _load_raw_tp_showroom_mapping_file(resolved_path))
-
-
-def _save_tp_showroom_mapping_user_doc(doc: dict[str, Any], path: Path | None = None) -> Path:
-    resolved_path = Path(path) if path is not None else user_tp_showroom_mapping_path()
-    normalized_doc = _normalize_tp_showroom_mapping_doc(doc)
-    resolved_path.parent.mkdir(parents=True, exist_ok=True)
-    resolved_path.write_text(json.dumps(normalized_doc, ensure_ascii=False, indent=2), encoding="utf-8")
-    _invalidate_tp_showroom_mapping_cache(resolved_path)
-    return resolved_path
-
-
-def _ensure_user_tp_showroom_mapping_file(*, seed_from_effective: bool = True) -> Path:
-    resolved_path = user_tp_showroom_mapping_path()
-    if resolved_path.exists():
-        return resolved_path
-    if seed_from_effective:
-        doc = _load_tp_showroom_mapping()
-    else:
-        doc = {"schema_version": 1, "cars": {}, "unsupported": {}}
-    return _save_tp_showroom_mapping_user_doc(doc, resolved_path)
-
-
-def _tp_mapping_read_text_source(source: str, timeout: float) -> str:
-    if re.match(r"^https?://", str(source or "").strip(), flags=re.IGNORECASE):
-        response = requests.get(
-            str(source).strip(),
-            timeout=max(1.0, float(timeout)),
-            headers={"User-Agent": APP_USER_AGENT},
-        )
-        response.raise_for_status()
-        return response.text
-    return Path(source).read_text(encoding="utf-8", errors="replace")
-
-
-def _tp_mapping_safe_json_dump(path: Path, payload: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def _tp_mapping_normalize_text(value: str) -> str:
@@ -5656,312 +5492,352 @@ def _tp_mapping_normalize_text(value: str) -> str:
     return " ".join(text.split())
 
 
-def _tp_mapping_tokenize(value: str) -> set[str]:
-    return set(_tp_mapping_normalize_text(value).split())
+_TP_CAR_TEMPLATE_ENTRY_RE = re.compile(
+    r'<div\s+id=["\']car_(?P<mid>\d+)["\'][^>]*>'
+    r'.*?<h3[^>]*>(?P<name>.*?)</h3>'
+    r'.*?<span[^>]*>\s*Documents/iRacing/paint/(?P<directory>.*?)\s*</span>',
+    flags=re.IGNORECASE | re.DOTALL,
+)
+_TP_CAR_IDENTITY_CACHE_LOCK = threading.RLock()
+_TP_CAR_IDENTITY_CACHE_DOC: dict[str, Any] | None = None
+_TP_CAR_IDENTITY_CACHE_AT = 0.0
+_TP_CAR_IDENTITY_LAST_ATTEMPT_AT = 0.0
+_TP_CAR_IDENTITY_LAST_ERROR = ""
+_TP_CAR_IDENTITY_LAST_UNKNOWN_REFRESH_AT = 0.0
+_TP_MANIFEST_OBSERVED_DIRECTORIES_LOCK = threading.Lock()
+_TP_MANIFEST_OBSERVED_DIRECTORIES: set[str] = set()
+_IRACING_OBSERVED_CAR_IDENTITIES_LOCK = threading.Lock()
+_IRACING_OBSERVED_CAR_IDENTITIES: dict[str, dict[str, Any]] = {}
 
 
-def _tp_mapping_leaf_from_path(path: str) -> str:
-    raw = str(path or "").strip().replace("/", "\\")
-    if not raw:
-        return ""
-    return raw.split("\\")[-1].lower()
+def _tp_clean_html_text(value: object) -> str:
+    text = re.sub(r"(?is)<[^>]+>", " ", str(value or ""))
+    return " ".join(html.unescape(text).replace("\xa0", " ").split())
 
 
-def _parse_iracing_active_cars_for_mapping(source: str, timeout: float) -> dict[str, IRacingActiveCar]:
-    source_text = str(source or "").strip()
-    if source_text and not re.match(r"^https?://", source_text, flags=re.IGNORECASE):
-        source_path = Path(source_text)
-        if source_path.exists() and source_path.suffix.lower() == ".json":
-            try:
-                raw = json.loads(source_path.read_text(encoding="utf-8"))
-            except Exception:
-                raw = {}
-            if isinstance(raw, dict) and isinstance(raw.get("cars"), dict):
-                result: dict[str, IRacingActiveCar] = {}
-                for key, entry in raw["cars"].items():
-                    if not isinstance(entry, dict):
-                        continue
-                    filepath = str(entry.get("filepath_full") or key).replace("/", "\\").strip("\\")
-                    normalized_key = _canonicalize_tp_mapping_key(filepath)
-                    if not normalized_key:
-                        continue
-                    result[normalized_key] = IRacingActiveCar(
-                        iracing_name=str(entry.get("iracing_name") or filepath),
-                        filepath_full=filepath,
-                        directory_leaf=_tp_mapping_leaf_from_path(filepath),
-                    )
-                if result:
-                    return result
+def _tp_vehicle_slug(value: object, mid: int = 0) -> str:
+    text = unicodedata.normalize("NFKD", str(value or "")).encode("ascii", "ignore").decode("ascii")
+    slug = re.sub(r"[^A-Za-z0-9._()]+", "-", text).strip("-")
+    return slug or f"car-{int(mid or 0)}"
 
-    text = _tp_mapping_read_text_source(source_text or TP_SHOWROOM_SCAN_IRACING_SOURCE, timeout)
-    parsed_rows: list[tuple[str, str]] = []
-    try:
-        from bs4 import BeautifulSoup  # type: ignore
 
-        soup = BeautifulSoup(text, "html.parser")
-        for tr in soup.find_all("tr"):
-            cells = [cell.get_text(" ", strip=True) for cell in tr.find_all(["td", "th"])]
-            if len(cells) < 2:
-                continue
-            name = str(cells[0]).strip()
-            filepath = str(cells[1]).strip().strip("\\/")
-            if "\\" in filepath or re.fullmatch(r"[a-z0-9_\\]+", filepath, flags=re.IGNORECASE):
-                parsed_rows.append((name, filepath))
-    except Exception:
-        pass
+def _tp_template_is_superspeedway_variant(name: object) -> bool:
+    normalized = _tp_mapping_normalize_text(str(name or ""))
+    return bool(re.search(r"(?:^|\s)ss(?:$|\s)", normalized))
 
-    lines: list[str] = []
-    if parsed_rows:
-        lines = [f"{name}\\{filepath}" for name, filepath in parsed_rows]
-    else:
-        if "<" in text and ">" in text:
-            html = re.sub(r"(?is)<\s*br\s*/?\s*>", "\n", text)
-            html = re.sub(r"(?is)</\s*(p|div|tr|li|h1|h2|h3|h4|h5|h6)\s*>", "\n", html)
-            html = re.sub(r"(?is)<[^>]+>", "", html)
-            html = html.replace("&nbsp;", " ")
-            lines = [line.strip() for line in html.splitlines() if line.strip()]
-        else:
-            lines = [line.strip() for line in text.splitlines() if line.strip()]
 
-    joined = "\n".join(lines)
-    pattern = re.compile(
-        r"(?P<name>[^\n\\][^\n]*?)\\(?P<path>[A-Za-z0-9_]+(?:\\[A-Za-z0-9_]+)+|[A-Za-z0-9_]+)\s*(?:\n|$)"
-    )
-    result: dict[str, IRacingActiveCar] = {}
-    for match in pattern.finditer(joined):
-        name = re.sub(r"\s+", " ", match.group("name")).strip(" -\t\r\n")
-        filepath = match.group("path").strip("\\")
-        normalized_key = _canonicalize_tp_mapping_key(filepath)
-        if not name or not normalized_key:
+def _tp_identity_name_key(value: object) -> str:
+    normalized = _tp_mapping_normalize_text(str(value or ""))
+    tokens = [token for token in normalized.split() if token not in {"legacy"}]
+    return "".join(tokens)
+
+
+def _parse_tp_car_templates_html(page_html: str) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    for match in _TP_CAR_TEMPLATE_ENTRY_RE.finditer(str(page_html or "")):
+        mid = _to_int_or_none(match.group("mid")) or 0
+        name = _tp_clean_html_text(match.group("name"))
+        raw_directory = _tp_clean_html_text(match.group("directory"))
+        directory = canonicalize_car_directory(raw_directory)
+        if mid <= 0 or not name or not directory:
             continue
-        if _tp_mapping_normalize_text(name) in {"filepath", "car name", "name"}:
-            continue
-        result[normalized_key] = IRacingActiveCar(
-            iracing_name=name,
-            filepath_full=filepath,
-            directory_leaf=_tp_mapping_leaf_from_path(filepath),
-        )
-    if result:
-        return result
-    raise RuntimeError("No iRacing cars could be parsed from the configured source.")
-
-
-def _parse_tp_showroom_catalog_for_mapping(timeout: float, sleep_seconds: float) -> list[TPShowroomCatalogVehicle]:
-    out: dict[tuple[str, int], TPShowroomCatalogVehicle] = {}
-    link_pattern = re.compile(r"/showroom/(Road|Oval)/(\d+)/([A-Za-z0-9._()\-]+)", re.IGNORECASE)
-    for root in TP_SHOWROOM_SCAN_ROOTS:
-        response = requests.get(root, timeout=max(1.0, float(timeout)), headers={"User-Agent": APP_USER_AGENT})
-        response.raise_for_status()
-        html = response.text
-        vehicles: list[tuple[str, int, str, str]] = []
-        try:
-            from bs4 import BeautifulSoup  # type: ignore
-
-            soup = BeautifulSoup(html, "html.parser")
-            for anchor in soup.find_all("a", href=True):
-                href = str(anchor.get("href") or "").strip()
-                match = link_pattern.search(href)
-                if not match:
-                    continue
-                category = match.group(1)
-                mid = int(match.group(2))
-                slug = match.group(3)
-                tp_name = anchor.get_text(" ", strip=True) or slug.replace("-", " ")
-                vehicles.append((category, mid, slug, tp_name))
-        except Exception:
-            for match in re.finditer(
-                r'href=["\'](?P<href>/showroom/(Road|Oval)/(?P<mid>\d+)/(?P<slug>[A-Za-z0-9\-\._\(\)]+))["\'][^>]*>(?P<label>.*?)</a>',
-                html,
-                flags=re.IGNORECASE | re.DOTALL,
-            ):
-                category = "Road" if "/Road/" in match.group("href") else "Oval"
-                mid = int(match.group("mid"))
-                slug = match.group("slug")
-                label = re.sub(r"(?is)<[^>]+>", " ", match.group("label"))
-                tp_name = " ".join(label.split()) or slug.replace("-", " ")
-                vehicles.append((category, mid, slug, tp_name))
-        for category, mid, slug, tp_name in vehicles:
-            showroom_url = f"https://www.tradingpaints.com/showroom/{category}/{mid}/{slug}"
-            key = (category.lower(), int(mid))
-            current = out.get(key)
-            if current is None or len(tp_name) > len(current.tp_name):
-                out[key] = TPShowroomCatalogVehicle(
-                    mid=int(mid),
-                    category=str(category),
-                    slug=str(slug),
-                    tp_name=str(tp_name),
-                    showroom_url=showroom_url,
-                )
-        if sleep_seconds > 0:
-            time.sleep(float(sleep_seconds))
-    return sorted(out.values(), key=lambda item: (item.category.lower(), item.mid, item.slug.lower()))
-
-
-def _score_tp_mapping_candidate(car: IRacingActiveCar, tp_vehicle: TPShowroomCatalogVehicle) -> float:
-    ir_name = _tp_mapping_normalize_text(car.iracing_name)
-    tp_name = _tp_mapping_normalize_text(tp_vehicle.tp_name)
-    slug_text = _tp_mapping_normalize_text(tp_vehicle.slug.replace("-", " "))
-    path_text = _tp_mapping_normalize_text(car.filepath_full.replace("\\", " "))
-    leaf_text = _tp_mapping_normalize_text(car.directory_leaf)
-    ir_core = ir_name.replace("legacy ", "").strip()
-    tp_core = tp_name.replace("legacy ", "").strip()
-    seq_name = SequenceMatcher(None, ir_core, tp_core).ratio() * 70.0
-    seq_slug = SequenceMatcher(None, ir_core, slug_text).ratio() * 20.0
-    seq_path = SequenceMatcher(None, path_text, tp_core).ratio() * 10.0
-    ir_tokens = _tp_mapping_tokenize(ir_core) | _tp_mapping_tokenize(leaf_text)
-    tp_tokens = _tp_mapping_tokenize(tp_core) | _tp_mapping_tokenize(slug_text)
-    overlap = 0.0
-    if ir_tokens and tp_tokens:
-        overlap = (len(ir_tokens & tp_tokens) / len(ir_tokens | tp_tokens)) * 30.0
-    score = max(seq_name + overlap, seq_name + seq_slug, seq_name + seq_path)
-    if ir_core == tp_core:
-        score = 100.0
-    elif leaf_text and leaf_text == _tp_mapping_normalize_text(tp_vehicle.slug).replace(" ", ""):
-        score = max(score, 97.0)
-    elif ir_tokens and tp_tokens and ir_tokens == tp_tokens:
-        score = max(score, 96.0)
-    return round(min(score, 100.0), 2)
-
-
-def _build_tp_showroom_mapping_candidates(
-    cars: dict[str, IRacingActiveCar],
-    catalog: list[TPShowroomCatalogVehicle],
-    *,
-    top_n: int = TP_SHOWROOM_SCAN_TOP_N,
-) -> dict[str, list[dict[str, Any]]]:
-    out: dict[str, list[dict[str, Any]]] = {}
-    limit = max(1, int(top_n))
-    for key, car in cars.items():
-        scored: list[tuple[float, TPShowroomCatalogVehicle]] = []
-        for tp_vehicle in catalog:
-            score = _score_tp_mapping_candidate(car, tp_vehicle)
-            if score >= TP_SHOWROOM_SCAN_MIN_SCORE:
-                scored.append((score, tp_vehicle))
-        scored.sort(key=lambda item: (-item[0], item[1].category.lower(), item[1].mid, item[1].slug.lower()))
-        out[key] = [
+        entries.append(
             {
-                "score": score,
-                "mid": vehicle.mid,
-                "slug": vehicle.slug,
-                "category": vehicle.category,
-                "tp_name": vehicle.tp_name,
-                "showroom_url": vehicle.showroom_url,
+                "mid": int(mid),
+                "tp_name": name,
+                "iracing_name": name,
+                "directory": directory,
+                "slug": _tp_vehicle_slug(name, mid),
+                "category": "Road",
+                "is_superspeedway_variant": False,
+                "source": "trading_paints_cartemplates",
             }
-            for score, vehicle in scored[:limit]
+        )
+    return entries
+
+
+def _build_tp_car_identity_doc(entries: Iterable[dict[str, Any]]) -> dict[str, Any]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for raw_entry in entries:
+        if not isinstance(raw_entry, dict):
+            continue
+        key = _canonicalize_tp_mapping_key(raw_entry.get("directory"))
+        mid = _to_int_or_none(raw_entry.get("mid")) or 0
+        if not key or mid <= 0:
+            continue
+        entry = dict(raw_entry)
+        entry["mid"] = int(mid)
+        entry["directory"] = canonicalize_car_directory(str(entry.get("directory") or key))
+        entry["slug"] = str(entry.get("slug") or _tp_vehicle_slug(entry.get("tp_name"), mid))
+        entry["category"] = str(entry.get("category") or "Road")
+        entry["status"] = "mapped"
+        grouped.setdefault(key, []).append(entry)
+
+    cars: dict[str, dict[str, Any]] = {}
+    for key, variants in grouped.items():
+        has_directory_variants = len(variants) > 1
+        for item in variants:
+            item["is_superspeedway_variant"] = bool(
+                has_directory_variants
+                and (
+                    item.get("is_superspeedway_variant")
+                    or _tp_template_is_superspeedway_variant(item.get("tp_name"))
+                )
+            )
+        ordered = sorted(
+            variants,
+            key=lambda item: (
+                bool(item.get("is_superspeedway_variant")),
+                int(item.get("mid") or 0),
+            ),
+        )
+        primary = dict(ordered[0])
+        primary["variants"] = [dict(item) for item in ordered]
+        primary["alternate_mids"] = [
+            int(item.get("mid") or 0)
+            for item in ordered[1:]
+            if int(item.get("mid") or 0) > 0
         ]
-    return out
-
-
-def scan_tp_showroom_mapping_review(
-    *,
-    seed_path: Path | None = None,
-    iracing_source: str = TP_SHOWROOM_SCAN_IRACING_SOURCE,
-    timeout: float = TP_SHOWROOM_SCAN_TIMEOUT_SECONDS,
-    sleep_seconds: float = TP_SHOWROOM_SCAN_SLEEP_SECONDS,
-    top_n: int = TP_SHOWROOM_SCAN_TOP_N,
-    report_dir: Path | None = None,
-) -> dict[str, Any]:
-    mapping_doc = _load_tp_showroom_mapping(seed_path)
-    cars = _parse_iracing_active_cars_for_mapping(iracing_source, timeout=max(1.0, float(timeout)))
-    catalog = _parse_tp_showroom_catalog_for_mapping(timeout=max(1.0, float(timeout)), sleep_seconds=max(0.0, float(sleep_seconds)))
-    candidates_map = _build_tp_showroom_mapping_candidates(cars, catalog, top_n=max(1, int(top_n)))
-    mapped = set((mapping_doc.get("cars") or {}).keys())
-    unsupported = set((mapping_doc.get("unsupported") or {}).keys())
-    pending_keys = [key for key in sorted(cars) if key not in mapped and key not in unsupported]
-    pending = [
-        {
-            "key": key,
-            "iracing_name": cars[key].iracing_name,
-            "filepath_full": cars[key].filepath_full,
-            "directory_leaf": cars[key].directory_leaf,
-            "candidates": list(candidates_map.get(key) or []),
-        }
-        for key in pending_keys
-    ]
-    resolved_report_dir = Path(report_dir) if report_dir is not None else default_tp_showroom_review_dir()
-    resolved_report_dir.mkdir(parents=True, exist_ok=True)
-    _tp_mapping_safe_json_dump(
-        resolved_report_dir / "iracing_active_cars_parsed.json",
-        {
-            "schema_version": 1,
-            "source": iracing_source,
-            "count": len(cars),
-            "cars": {
-                key: {
-                    "iracing_name": value.iracing_name,
-                    "filepath_full": value.filepath_full,
-                    "directory_leaf": value.directory_leaf,
-                }
-                for key, value in cars.items()
-            },
-        },
-    )
-    _tp_mapping_safe_json_dump(
-        resolved_report_dir / "tp_showroom_catalog.json",
-        {
-            "schema_version": 1,
-            "source_pages": list(TP_SHOWROOM_SCAN_ROOTS),
-            "count": len(catalog),
-            "vehicles": [
-                {
-                    "mid": vehicle.mid,
-                    "category": vehicle.category,
-                    "slug": vehicle.slug,
-                    "tp_name": vehicle.tp_name,
-                    "showroom_url": vehicle.showroom_url,
-                }
-                for vehicle in catalog
-            ],
-        },
-    )
-    _tp_mapping_safe_json_dump(
-        resolved_report_dir / "tp_showroom_candidates.json",
-        {
-            "schema_version": 1,
-            "count": len(candidates_map),
-            "candidates": candidates_map,
-        },
-    )
-    _tp_mapping_safe_json_dump(
-        resolved_report_dir / "tp_showroom_pending_review.json",
-        {
-            "schema_version": 1,
-            "pending_count": len(pending),
-            "pending": pending,
-        },
-    )
+        cars[key] = primary
     return {
-        "mapping_doc": mapping_doc,
+        "schema_version": 2,
+        "source": TP_CAR_TEMPLATES_URL,
+        "loaded_at": time.time(),
         "cars": cars,
-        "catalog": catalog,
-        "candidates": candidates_map,
-        "pending": pending,
-        "pending_count": len(pending),
-        "mapped_count": len(mapping_doc.get("cars") or {}),
-        "unsupported_count": len(mapping_doc.get("unsupported") or {}),
-        "report_dir": resolved_report_dir,
-        "mapping_path": user_tp_showroom_mapping_path(),
-        "iracing_source": iracing_source,
-        "scanned_at": time.time(),
+        "unsupported": {},
     }
 
 
-def _filter_tp_showroom_pending_items_against_mapping(
-    pending_items: Iterable[dict[str, Any]],
-    mapping_doc: dict[str, Any] | None = None,
-) -> list[dict[str, Any]]:
-    effective_doc = _normalize_tp_showroom_mapping_doc(mapping_doc or _load_tp_showroom_mapping())
-    mapped = set((effective_doc.get("cars") or {}).keys())
-    unsupported = set((effective_doc.get("unsupported") or {}).keys())
-    filtered: list[dict[str, Any]] = []
-    for item in pending_items:
-        key = _canonicalize_tp_mapping_key(item.get("key"))
-        if not key:
+def _fetch_tp_car_identity_doc(timeout: float = 25.0) -> dict[str, Any]:
+    session = get_thread_http_session()
+    response = session.get(
+        TP_CAR_TEMPLATES_URL,
+        timeout=(10, max(10.0, float(timeout))),
+        headers={
+            "Accept": "text/html,application/xhtml+xml",
+            "Cache-Control": "no-cache",
+            "User-Agent": APP_USER_AGENT,
+        },
+    )
+    response.raise_for_status()
+    entries = _parse_tp_car_templates_html(response.text)
+    if len(entries) < TP_CAR_IDENTITY_MIN_EXPECTED_ENTRIES:
+        raise RuntimeError(
+            f"Trading Paints car template catalog returned only {len(entries)} usable entries."
+        )
+    return _build_tp_car_identity_doc(entries)
+
+
+def _load_tp_showroom_mapping(
+    mapping_path: Path | None = None,
+    *,
+    force_refresh: bool = False,
+) -> dict[str, Any]:
+    del mapping_path
+    global _TP_CAR_IDENTITY_CACHE_DOC
+    global _TP_CAR_IDENTITY_CACHE_AT
+    global _TP_CAR_IDENTITY_LAST_ATTEMPT_AT
+    global _TP_CAR_IDENTITY_LAST_ERROR
+    now = time.monotonic()
+    with _TP_CAR_IDENTITY_CACHE_LOCK:
+        cache_is_fresh = (
+            _TP_CAR_IDENTITY_CACHE_DOC is not None
+            and now - _TP_CAR_IDENTITY_CACHE_AT < TP_CAR_IDENTITY_CACHE_TTL_SECONDS
+        )
+        retry_is_throttled = (
+            _TP_CAR_IDENTITY_LAST_ATTEMPT_AT > 0
+            and now - _TP_CAR_IDENTITY_LAST_ATTEMPT_AT < TP_CAR_IDENTITY_RETRY_SECONDS
+        )
+        if cache_is_fresh and not force_refresh:
+            return _TP_CAR_IDENTITY_CACHE_DOC
+        if retry_is_throttled and not force_refresh:
+            return _TP_CAR_IDENTITY_CACHE_DOC or {
+                "schema_version": 2,
+                "source": TP_CAR_TEMPLATES_URL,
+                "cars": {},
+                "unsupported": {},
+            }
+        _TP_CAR_IDENTITY_LAST_ATTEMPT_AT = now
+        try:
+            refreshed = _fetch_tp_car_identity_doc()
+        except Exception as exc:
+            _TP_CAR_IDENTITY_LAST_ERROR = str(exc) or exc.__class__.__name__
+            if _TP_CAR_IDENTITY_CACHE_DOC is not None:
+                logging.warning(
+                    "Trading Paints automatic car catalog refresh failed; using the last in-memory catalog: %s",
+                    exc,
+                )
+                return _TP_CAR_IDENTITY_CACHE_DOC
+            logging.warning("Trading Paints automatic car catalog is unavailable: %s", exc)
+            return {
+                "schema_version": 2,
+                "source": TP_CAR_TEMPLATES_URL,
+                "cars": {},
+                "unsupported": {},
+            }
+        _TP_CAR_IDENTITY_CACHE_DOC = refreshed
+        _TP_CAR_IDENTITY_CACHE_AT = time.monotonic()
+        _TP_CAR_IDENTITY_LAST_ERROR = ""
+        return refreshed
+
+
+def refresh_tp_car_identity_catalog() -> dict[str, Any]:
+    return _load_tp_showroom_mapping(force_refresh=True)
+
+
+def tp_car_identity_catalog_status() -> dict[str, Any]:
+    with _TP_CAR_IDENTITY_CACHE_LOCK:
+        doc = _TP_CAR_IDENTITY_CACHE_DOC or {}
+        loaded_age = (
+            max(0.0, time.monotonic() - _TP_CAR_IDENTITY_CACHE_AT)
+            if _TP_CAR_IDENTITY_CACHE_AT > 0
+            else None
+        )
+        error = _TP_CAR_IDENTITY_LAST_ERROR
+    with _TP_MANIFEST_OBSERVED_DIRECTORIES_LOCK:
+        observed_count = len(_TP_MANIFEST_OBSERVED_DIRECTORIES)
+    return {
+        "count": len(doc.get("cars") or {}),
+        "loaded_age_seconds": loaded_age,
+        "last_error": error,
+        "manifest_observed_directories": observed_count,
+        "source": TP_CAR_TEMPLATES_URL,
+    }
+
+
+def _observe_tp_manifest_directory(directory: object) -> None:
+    key = _canonicalize_tp_mapping_key(directory)
+    if not key or key in {"helmets", "suits"}:
+        return
+    with _TP_MANIFEST_OBSERVED_DIRECTORIES_LOCK:
+        _TP_MANIFEST_OBSERVED_DIRECTORIES.add(key)
+
+
+def _observe_iracing_car_identity(directory: object, car_name: object = "", car_id: object = 0) -> None:
+    key = _canonicalize_tp_mapping_key(directory)
+    if not key:
+        return
+    name = str(car_name or "").strip()
+    iracing_car_id = _to_int_or_none(car_id) or 0
+    with _IRACING_OBSERVED_CAR_IDENTITIES_LOCK:
+        current = dict(_IRACING_OBSERVED_CAR_IDENTITIES.get(key) or {})
+        if name:
+            current["car_name"] = name
+        if iracing_car_id > 0:
+            current["car_id"] = int(iracing_car_id)
+        current["last_seen"] = time.time()
+        _IRACING_OBSERVED_CAR_IDENTITIES[key] = current
+
+
+def _tp_identity_variants(mapping_doc: dict[str, Any]) -> Iterable[tuple[str, dict[str, Any]]]:
+    for directory_key, raw_entry in (mapping_doc.get("cars") or {}).items():
+        if not isinstance(raw_entry, dict):
             continue
-        if key in mapped or key in unsupported:
+        variants = raw_entry.get("variants")
+        if isinstance(variants, list) and variants:
+            for variant in variants:
+                if isinstance(variant, dict):
+                    yield str(directory_key), dict(variant)
+        else:
+            yield str(directory_key), dict(raw_entry)
+
+
+def _tp_identity_match_for_name(
+    name: object,
+    mapping_doc: dict[str, Any],
+) -> tuple[str, dict[str, Any]] | None:
+    wanted = _tp_identity_name_key(name)
+    if not wanted:
+        return None
+    exact: list[tuple[str, dict[str, Any]]] = []
+    scored_by_vehicle: dict[tuple[str, int], tuple[float, str, dict[str, Any]]] = {}
+    for directory_key, entry in _tp_identity_variants(mapping_doc):
+        candidate_names = (
+            entry.get("tp_name"),
+            entry.get("iracing_name"),
+            entry.get("slug"),
+        )
+        candidate_keys = {_tp_identity_name_key(candidate) for candidate in candidate_names}
+        candidate_keys.discard("")
+        if wanted in candidate_keys:
+            exact.append((directory_key, entry))
             continue
-        filtered.append(dict(item))
-    return filtered
+        best_entry_score = 0.0
+        for candidate_key in candidate_keys:
+            score = SequenceMatcher(None, wanted, candidate_key).ratio()
+            if wanted in candidate_key or candidate_key in wanted:
+                score = max(score, 0.94)
+            best_entry_score = max(best_entry_score, score)
+        vehicle_key = (str(directory_key), int(entry.get("mid") or 0))
+        current = scored_by_vehicle.get(vehicle_key)
+        if current is None or best_entry_score > current[0]:
+            scored_by_vehicle[vehicle_key] = (best_entry_score, directory_key, entry)
+    if exact:
+        exact.sort(key=lambda item: (bool(item[1].get("is_superspeedway_variant")), int(item[1].get("mid") or 0)))
+        return exact[0]
+    scored = list(scored_by_vehicle.values())
+    if not scored:
+        return None
+    scored.sort(key=lambda item: item[0], reverse=True)
+    best_score, directory_key, entry = scored[0]
+    next_score = scored[1][0] if len(scored) > 1 else 0.0
+    if best_score < 0.94 or best_score - next_score < 0.03:
+        return None
+    return directory_key, entry
+
+
+def _tp_learn_observed_iracing_alias(
+    directory_key: str,
+    mapping_doc: dict[str, Any],
+) -> tuple[str, dict[str, Any]] | None:
+    with _IRACING_OBSERVED_CAR_IDENTITIES_LOCK:
+        observed = dict(_IRACING_OBSERVED_CAR_IDENTITIES.get(directory_key) or {})
+    car_name = str(observed.get("car_name") or "").strip()
+    if not car_name:
+        return None
+    matched = _tp_identity_match_for_name(car_name, mapping_doc)
+    if matched is None:
+        return None
+    _catalog_directory, matched_entry = matched
+    alias_entry = dict(matched_entry)
+    alias_entry["directory"] = canonicalize_car_directory(directory_key)
+    alias_entry["iracing_name"] = car_name
+    alias_entry["source"] = "iracing_sdk_plus_trading_paints_cartemplates"
+    alias_entry["status"] = "mapped"
+    with _TP_CAR_IDENTITY_CACHE_LOCK:
+        cars_map = mapping_doc.setdefault("cars", {})
+        cars_map[directory_key] = alias_entry
+    logging.info(
+        "Automatic car identity learned from iRacing + Trading Paints: %s (%s) -> TP car %s (%s).",
+        car_name,
+        directory_key,
+        alias_entry.get("mid"),
+        alias_entry.get("tp_name"),
+    )
+    return directory_key, alias_entry
+
+
+def _refresh_tp_car_identity_after_unknown() -> dict[str, Any]:
+    global _TP_CAR_IDENTITY_LAST_UNKNOWN_REFRESH_AT
+    now = time.monotonic()
+    with _TP_CAR_IDENTITY_CACHE_LOCK:
+        if now - _TP_CAR_IDENTITY_LAST_UNKNOWN_REFRESH_AT < TP_CAR_IDENTITY_RETRY_SECONDS:
+            return _TP_CAR_IDENTITY_CACHE_DOC or _load_tp_showroom_mapping()
+        _TP_CAR_IDENTITY_LAST_UNKNOWN_REFRESH_AT = now
+    return _load_tp_showroom_mapping(force_refresh=True)
+
+
+def scan_tp_showroom_mapping_review(**_kwargs: Any) -> dict[str, Any]:
+    mapping_doc = refresh_tp_car_identity_catalog()
+    return {
+        "mapping_doc": mapping_doc,
+        "pending": [],
+        "pending_count": 0,
+        "mapped_count": len(mapping_doc.get("cars") or {}),
+        "unsupported_count": 0,
+        "source": TP_CAR_TEMPLATES_URL,
+        "scanned_at": time.time(),
+    }
 
 
 def _tp_showroom_scheme_usable_for_online_fallback(car: dict) -> bool:
@@ -6099,7 +5975,6 @@ def _showroom_available_count(
 
 def _tp_showroom_mapping_entry_for_directory(directory: str, mapping_path: Path | None = None) -> tuple[str, dict] | None:
     mapping_doc = _load_tp_showroom_mapping(mapping_path)
-    cars_map = mapping_doc.get("cars") or {}
     raw_directory = str(directory or "").strip()
     canonical_directory = canonicalize_car_directory(raw_directory).lower()
     candidates = [
@@ -6112,29 +5987,46 @@ def _tp_showroom_mapping_entry_for_directory(directory: str, mapping_path: Path 
         for prefix in ("chevrolet", "chevy"):
             if leaf.startswith(prefix) and len(leaf) > len(prefix):
                 candidates.append(f"{root}\\{leaf[len(prefix):]}")
-    seen: set[str] = set()
-    for key in candidates:
-        key = str(key or "").strip()
-        if not key or key in seen:
-            continue
-        seen.add(key)
-        raw_entry = cars_map.get(key)
-        if not isinstance(raw_entry, dict):
-            continue
-        entry = dict(raw_entry)
-        status = str(entry.get("status") or "mapped").strip().lower()
-        if status in {"unsupported", "disabled", "missing"}:
-            return None
-        try:
-            mid = int(entry.get("mid") or 0)
-        except Exception:
-            mid = 0
-        if mid <= 0:
-            return None
-        entry["mid"] = mid
-        entry["category"] = str(entry.get("category") or "Road").strip() or "Road"
-        entry["slug"] = str(entry.get("slug") or entry.get("tp_name") or entry.get("iracing_name") or f"car-{mid}").strip()
-        return key, entry
+
+    def _find(doc: dict[str, Any]) -> tuple[str, dict] | None:
+        cars_map = doc.get("cars") or {}
+        seen: set[str] = set()
+        for key in candidates:
+            key = str(key or "").strip()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            raw_entry = cars_map.get(key)
+            if not isinstance(raw_entry, dict):
+                continue
+            entry = dict(raw_entry)
+            status = str(entry.get("status") or "mapped").strip().lower()
+            if status in {"unsupported", "disabled", "missing"}:
+                return None
+            mid = _to_int_or_none(entry.get("mid")) or 0
+            if mid <= 0:
+                return None
+            entry["mid"] = int(mid)
+            entry["category"] = str(entry.get("category") or "Road").strip() or "Road"
+            entry["slug"] = str(
+                entry.get("slug")
+                or entry.get("tp_name")
+                or entry.get("iracing_name")
+                or f"car-{mid}"
+            ).strip()
+            return key, entry
+        if canonical_directory:
+            learned = _tp_learn_observed_iracing_alias(canonical_directory, doc)
+            if learned is not None:
+                return learned
+        return None
+
+    found = _find(mapping_doc)
+    if found is not None:
+        return found
+    refreshed_doc = _refresh_tp_car_identity_after_unknown()
+    if refreshed_doc is not mapping_doc:
+        return _find(refreshed_doc)
     return None
 
 
@@ -6146,23 +6038,19 @@ def _tp_showroom_mapping_entry_for_mid(mid: int, mapping_path: Path | None = Non
     if wanted_mid <= 0:
         return None
     mapping_doc = _load_tp_showroom_mapping(mapping_path)
-    cars_map = mapping_doc.get("cars") or {}
-    for directory_key, raw_entry in cars_map.items():
-        if not isinstance(raw_entry, dict):
-            continue
-        try:
-            entry_mid = int(raw_entry.get("mid") or 0)
-        except Exception:
-            entry_mid = 0
+    for directory_key, raw_entry in _tp_identity_variants(mapping_doc):
+        entry_mid = _to_int_or_none(raw_entry.get("mid")) or 0
         if entry_mid != wanted_mid:
             continue
         entry = dict(raw_entry)
-        status = str(entry.get("status") or "mapped").strip().lower()
-        if status in {"unsupported", "disabled", "missing"}:
-            continue
         entry["mid"] = wanted_mid
         entry["category"] = str(entry.get("category") or "Road").strip() or "Road"
-        entry["slug"] = str(entry.get("slug") or entry.get("tp_name") or entry.get("iracing_name") or f"car-{wanted_mid}").strip()
+        entry["slug"] = str(
+            entry.get("slug")
+            or entry.get("tp_name")
+            or entry.get("iracing_name")
+            or f"car-{wanted_mid}"
+        ).strip()
         return str(directory_key), entry
     return None
 
@@ -6177,44 +6065,23 @@ def _tp_normalized_vehicle_name(value: object) -> str:
 
 
 def _tp_showroom_mapping_entry_for_name(name: object, mapping_path: Path | None = None) -> tuple[str, dict] | None:
-    wanted = _tp_normalized_vehicle_name(name)
-    if not wanted:
-        return None
     mapping_doc = _load_tp_showroom_mapping(mapping_path)
-    cars_map = mapping_doc.get("cars") or {}
-    best: tuple[str, dict] | None = None
-    best_score = 0.0
-    for directory_key, raw_entry in cars_map.items():
-        if not isinstance(raw_entry, dict):
-            continue
-        status = str(raw_entry.get("status") or "mapped").strip().lower()
-        if status in {"unsupported", "disabled", "missing"}:
-            continue
-        names = [
-            directory_key,
-            raw_entry.get("tp_name"),
-            raw_entry.get("iracing_name"),
-            raw_entry.get("slug"),
-        ]
-        normalized_names = [_tp_normalized_vehicle_name(item) for item in names]
-        if wanted in normalized_names:
-            entry = dict(raw_entry)
-            entry["category"] = str(entry.get("category") or "Road").strip() or "Road"
-            entry["slug"] = str(entry.get("slug") or entry.get("tp_name") or entry.get("iracing_name") or f"car-{entry.get('mid') or ''}").strip()
-            return str(directory_key), entry
-        for normalized in normalized_names:
-            if not normalized:
-                continue
-            score = SequenceMatcher(None, wanted, normalized).ratio()
-            if wanted in normalized or normalized in wanted:
-                score = max(score, 0.92)
-            if score > best_score:
-                entry = dict(raw_entry)
-                entry["category"] = str(entry.get("category") or "Road").strip() or "Road"
-                entry["slug"] = str(entry.get("slug") or entry.get("tp_name") or entry.get("iracing_name") or f"car-{entry.get('mid') or ''}").strip()
-                best = (str(directory_key), entry)
-                best_score = score
-    return best if best is not None and best_score >= 0.88 else None
+    matched = _tp_identity_match_for_name(name, mapping_doc)
+    if matched is None:
+        refreshed_doc = _refresh_tp_car_identity_after_unknown()
+        if refreshed_doc is not mapping_doc:
+            matched = _tp_identity_match_for_name(name, refreshed_doc)
+    if matched is None:
+        return None
+    directory_key, entry = matched
+    entry["category"] = str(entry.get("category") or "Road").strip() or "Road"
+    entry["slug"] = str(
+        entry.get("slug")
+        or entry.get("tp_name")
+        or entry.get("iracing_name")
+        or f"car-{entry.get('mid') or ''}"
+    ).strip()
+    return str(directory_key), entry
 
 
 def _tp_fetch_showroom_page_batch_http(
@@ -6427,7 +6294,10 @@ def choose_showroom_paint_direct(
     raw_directory = str(directory or "").strip()
     mapping = _tp_showroom_mapping_entry_for_directory(raw_directory, mapping_path)
     if mapping is None:
-        return TPShowroomSyncResult(ok=False, message=f"No Trading Paints showroom mapping exists for {raw_directory}.")
+        return TPShowroomSyncResult(
+            ok=False,
+            message=f"Trading Paints automatic car identification did not resolve {raw_directory} yet.",
+        )
     directory_key, entry = mapping
     mid = int(entry.get("mid") or 0)
     category = str(entry.get("category") or "Road").strip() or "Road"
@@ -6984,7 +6854,7 @@ def _tp_random_pool_candidate_from_collection_item(
         elif mid and int(mid) > 0:
             directory = f"tp_car_{int(mid)}"
             if log:
-                log(f"Collection paint {scheme_id} uses TP car ID {mid}, which is not in the local mapping yet; using RandomPool bucket {directory}.")
+                log(f"Collection paint {scheme_id} uses TP car ID {mid}, which is not in the live car catalog yet; using RandomPool bucket {directory}.")
         else:
             if log:
                 log(f"Skipped collection paint {scheme_id}: Trading Paints did not provide a usable car ID.")
@@ -7318,7 +7188,7 @@ def download_showroom_paints_to_random_pool(
     directory = str(directory or "").strip()
     if not directory:
         directory = f"tp_car_{target_mid}"
-        write(f"Car ID {target_mid} is not in the local showroom mapping yet; using RandomPool bucket {directory}.")
+        write(f"Car ID {target_mid} is not in the live Trading Paints car catalog yet; using RandomPool bucket {directory}.")
     category = str(category or "Road").strip() or "Road"
     slug = str(slug or f"car-{target_mid}").strip() or f"car-{target_mid}"
     target_count = max(1, min(int(count or 1), 100))
@@ -7523,19 +7393,10 @@ def _tp_team_mapping_entries_for_mid(mid: int, mapping_path: Path | None = None)
         return []
     if wanted_mid <= 0:
         return []
-    mapping_doc = _load_tp_showroom_mapping(mapping_path)
-    cars_map = mapping_doc.get("cars") or {}
     matches: list[tuple[str, dict]] = []
-    for directory_key, raw_entry in cars_map.items():
-        if not isinstance(raw_entry, dict):
-            continue
-        status = str(raw_entry.get("status") or "mapped").strip().lower()
-        if status in {"unsupported", "disabled", "missing"}:
-            continue
-        try:
-            entry_mid = int(raw_entry.get("mid") or 0)
-        except Exception:
-            entry_mid = 0
+    mapping_doc = _load_tp_showroom_mapping(mapping_path)
+    for directory_key, raw_entry in _tp_identity_variants(mapping_doc):
+        entry_mid = _to_int_or_none(raw_entry.get("mid")) or 0
         if entry_mid != wanted_mid:
             continue
         entry = dict(raw_entry)
@@ -7636,15 +7497,9 @@ def tp_showroom_car_choice_labels(mapping_path: Path | None = None) -> list[str]
         mapping_doc = _load_tp_showroom_mapping(mapping_path)
     except Exception:
         return []
-    cars_map = mapping_doc.get("cars") or {}
     choices: list[tuple[str, str]] = []
     seen: set[tuple[int, str]] = set()
-    for directory_key, raw_entry in cars_map.items():
-        if not isinstance(raw_entry, dict):
-            continue
-        status = str(raw_entry.get("status") or "mapped").strip().lower()
-        if status in {"unsupported", "disabled", "missing"}:
-            continue
+    for directory_key, raw_entry in _tp_identity_variants(mapping_doc):
         mid = _to_int_or_none(raw_entry.get("mid")) or 0
         name = str(raw_entry.get("tp_name") or raw_entry.get("iracing_name") or raw_entry.get("slug") or directory_key).strip()
         if not name:
@@ -7717,6 +7572,7 @@ def _parse_tp_team_fetch_manifest_root(root: ET.Element, target: TPTeamPaintTarg
         if team_id != int(target.team_id):
             continue
         directory = (car.findtext("directory") or "").strip()
+        _observe_tp_manifest_directory(directory)
         if _is_car_related_paint_type(paint_type):
             directory_key = directory.strip().lower()
             canonical_key = canonicalize_car_directory(directory).lower()
@@ -8176,15 +8032,9 @@ def iter_tp_team_paint_targets(team_id: int, mapping_path: Path | None = None) -
     if target_team_id <= 0:
         raise ValueError("Team ID must be greater than zero.")
     mapping_doc = _load_tp_showroom_mapping(mapping_path)
-    cars_map = mapping_doc.get("cars") or {}
     seeds: list[tuple[str, int, str]] = []
     seen: set[tuple[str, object]] = set()
-    for directory_key, raw_entry in cars_map.items():
-        if not isinstance(raw_entry, dict):
-            continue
-        status = str(raw_entry.get("status") or "mapped").strip().lower()
-        if status in {"unsupported", "disabled", "missing"}:
-            continue
+    for directory_key, raw_entry in _tp_identity_variants(mapping_doc):
         mid = _to_int_or_none(raw_entry.get("mid")) or 0
         display_name = str(raw_entry.get("tp_name") or raw_entry.get("iracing_name") or raw_entry.get("slug") or directory_key).strip()
         key: tuple[str, object] = ("mid", int(mid)) if mid > 0 else ("directory", str(directory_key).strip().lower())
@@ -8260,7 +8110,7 @@ def fetch_tp_team_all_paint_files(
     found: list[DownloadFile] = []
     attempts = 0
     accessory_logged = False
-    write(f"Team all-paints scan started for Team ID {target_team_id}: checking {len(targets)} mapped Trading Paints car(s) in {len(batches)} manifest batch(es).")
+    write(f"Team all-paints scan started for Team ID {target_team_id}: checking {len(targets)} live Trading Paints car identities in {len(batches)} manifest batch(es).")
     checked_rows = 0
     for batch_index, batch_rows in enumerate(batches, start=1):
         if _cancel_requested(cancel_event):
@@ -12915,17 +12765,10 @@ def fetch_tp_collection_pool(
     return pool
 
 def _tp_collection_candidates_for_car(items: list[dict], directory: str, mapping_path: Path | None) -> list[dict]:
-    directory_key = canonicalize_car_directory(directory).lower()
-    mapping_doc = _load_tp_showroom_mapping(mapping_path)
-    cars_map = mapping_doc.get("cars") or {}
-    entry = None
-    for candidate_key in _tp_directory_candidate_keys(directory_key):
-        possible = cars_map.get(candidate_key)
-        if isinstance(possible, dict):
-            entry = possible
-            break
-    if not isinstance(entry, dict):
+    mapping = _tp_showroom_mapping_entry_for_directory(directory, mapping_path)
+    if mapping is None:
         return []
+    _directory_key, entry = mapping
     wanted_mid = _to_int_or_none(entry.get("mid"))
     if wanted_mid is None or wanted_mid <= 0:
         return []
@@ -15520,6 +15363,7 @@ def fetch_context_files(
                     team_id_text = (car.findtext("teamid") or "0").strip() or "0"
                     if not file_url or not type_raw:
                         continue
+                    _observe_tp_manifest_directory(directory)
                     if not directory and type_raw.startswith("car"):
                         continue
                     try:
@@ -20900,7 +20744,7 @@ class DownloaderUI:
         self.showroom_download_pages_var = tk.IntVar(value=TP_SHOWROOM_MAX_PAGES)
         self.showroom_download_status_var = tk.StringVar(value="Choose a car to download random public non-PRO paints into the RandomPool.")
         self.showroom_download_custom_folder_var = tk.StringVar(value="Custom folder: not selected.")
-        self.showroom_car_choices = tp_showroom_car_choice_labels(default_tp_showroom_mapping_path())
+        self.showroom_car_choices: list[str] = []
         self.showroom_download_car_suggestions_var = tk.StringVar(value="")
         self.showroom_member_id_var = tk.StringVar(value="")
         self.showroom_member_car_var = tk.StringVar(value="")
@@ -20929,9 +20773,9 @@ class DownloaderUI:
         self.update_status_var = tk.StringVar(value="Updates: waiting")
         self.tp_monitor_detail_var = tk.StringVar(value="Run a session and the app will estimate the effective Trading Paints parallel allowance from observed throughput.")
         self.tp_monitor_save_var = tk.StringVar(value="Save stage stats will appear here too.")
-        self.tp_mapping_status_var = tk.StringVar(value="TP showroom mapping tools: waiting for the first scan.")
-        self.tp_mapping_hint_var = tk.StringVar(value="The app can now scan iRacing + Trading Paints for new cars and keep a user-editable showroom mapping JSON in AppData.")
-        self.tp_mapping_file_var = tk.StringVar(value=str(user_tp_showroom_mapping_path()))
+        self.tp_mapping_status_var = tk.StringVar(value="Automatic car identification: waiting for the Trading Paints catalog.")
+        self.tp_mapping_hint_var = tk.StringVar(value="The app resolves iRacing paint directories from the live Trading Paints template catalog and validates directories observed in manifests.")
+        self.tp_mapping_file_var = tk.StringVar(value=f"Source: {TP_CAR_TEMPLATES_URL}")
         self._update_check_in_progress = False
         self._latest_release_info: GitHubReleaseInfo | None = None
         self._last_notified_update_tag: str | None = None
@@ -21704,7 +21548,7 @@ class DownloaderUI:
         ttk.Checkbutton(logs_toolbar, text="Show TP monitor", variable=self.show_tp_monitor_var, command=self.on_setting_changed).pack(side="left", padx=(12, 0))
         ttk.Button(logs_toolbar, text="Export log", command=self.export_log).pack(side="right")
         ttk.Button(logs_toolbar, text="Reset app settings", command=self.reset_program_config).pack(side="right", padx=(0, 8))
-        mapping_tools = ttk.LabelFrame(logs_tab, text="Showroom mapping tools", padding=10)
+        mapping_tools = ttk.LabelFrame(logs_tab, text="Automatic car identification", padding=10)
         mapping_tools.grid(row=1, column=0, sticky="ew", pady=(10, 0))
         mapping_tools.columnconfigure(0, weight=1)
         ttk.Label(mapping_tools, textvariable=self.tp_mapping_status_var, justify="left", font=("Segoe UI", 9, "bold"), foreground="#0b63b6", wraplength=980).grid(row=0, column=0, sticky="w")
@@ -21712,12 +21556,8 @@ class DownloaderUI:
         ttk.Label(mapping_tools, textvariable=self.tp_mapping_file_var, justify="left", foreground="#666666", wraplength=980).grid(row=2, column=0, sticky="w", pady=(4, 0))
         mapping_actions = ttk.Frame(mapping_tools)
         mapping_actions.grid(row=3, column=0, sticky="ew", pady=(10, 0))
-        ttk.Button(mapping_actions, text="Scan now", command=self.scan_tp_showroom_mappings_now).pack(side="left")
-        ttk.Button(mapping_actions, text="Review pending cars", command=self.review_tp_showroom_mappings).pack(side="left", padx=(8, 0))
-        ttk.Button(mapping_actions, text="Open editable JSON", command=self.open_tp_showroom_mapping_json).pack(side="left", padx=(8, 0))
-        ttk.Button(mapping_actions, text="Reset user mapping", command=self.reset_tp_showroom_user_mapping).pack(side="left", padx=(8, 0))
-        ttk.Button(mapping_actions, text="Open mapping folder", command=self.open_tp_showroom_mapping_folder).pack(side="left", padx=(8, 0))
-        ttk.Button(mapping_actions, text="Open bundled seed", command=self.open_bundled_tp_showroom_mapping).pack(side="left", padx=(8, 0))
+        ttk.Button(mapping_actions, text="Refresh catalog now", command=self.scan_tp_showroom_mappings_now).pack(side="left")
+        ttk.Button(mapping_actions, text="Open Trading Paints templates", command=self.open_bundled_tp_showroom_mapping).pack(side="left", padx=(8, 0))
         ttk.Label(logs_tab, text="Reset app settings deletes the saved settings file and restarts the app with defaults.", foreground="#b00020", justify="left").grid(row=2, column=0, sticky="w", pady=(8, 0))
         self.monitor_frame = ttk.LabelFrame(logs_tab, text="TP worker monitor", padding=8)
         self.monitor_frame.grid(row=3, column=0, sticky="ew", pady=(10, 0))
@@ -23066,20 +22906,24 @@ class DownloaderUI:
         text = str(line or "").strip()
         if not text:
             return
-        missing_match = re.search(r"No Trading Paints showroom mapping exists for '([^']+)'", text, flags=re.IGNORECASE)
+        missing_match = re.search(
+            r"(?:No Trading Paints showroom mapping exists for|automatic car identification did not resolve)\s+'?([^'.]+)'?",
+            text,
+            flags=re.IGNORECASE,
+        )
         if missing_match:
             missing_key = _canonicalize_tp_mapping_key(missing_match.group(1))
             if missing_key:
                 self._tp_mapping_last_missing_key = missing_key
-                self.tp_mapping_status_var.set(f"Missing showroom mapping detected in the log: {missing_key}")
-                self.tp_mapping_hint_var.set("Use Review pending cars to match it inside the app, or open the editable JSON if you want to fix it by hand.")
+                self.tp_mapping_status_var.set(f"Automatic car identity was not found yet: {missing_key}")
+                self.tp_mapping_hint_var.set("The app will refresh the live Trading Paints template catalog automatically; no JSON edit is required.")
             return
         unsupported_match = re.search(r"Trading Paints does not currently have a supported showroom car for '([^']+)'", text, flags=re.IGNORECASE)
         if unsupported_match:
             unsupported_key = _canonicalize_tp_mapping_key(unsupported_match.group(1))
             if unsupported_key:
                 self.tp_mapping_status_var.set(f"Unsupported showroom car detected in the log: {unsupported_key}")
-                self.tp_mapping_hint_var.set("Open the editable JSON to remove or change the unsupported entry if you want to try another mapping.")
+                self.tp_mapping_hint_var.set("The live Trading Paints catalog does not currently expose this car.")
     def _drain_log_queue_once(self, *, render: bool, limit: int) -> int:
         appended = 0
         try:
@@ -24522,49 +24366,20 @@ class DownloaderUI:
             self._append_log(f"Could not open {description}: {exc}")
 
     def open_tp_showroom_mapping_json(self) -> None:
-        path = _ensure_user_tp_showroom_mapping_file(seed_from_effective=True)
-        self.tp_mapping_file_var.set(f"Editable JSON: {path} | Scan cache: {default_tp_showroom_review_dir()}")
-        self._append_log(f"Opened editable TP showroom mapping JSON: {path}")
-        self._open_path_in_shell(path, description="editable TP showroom mapping JSON")
+        self.open_bundled_tp_showroom_mapping()
 
     def open_tp_showroom_mapping_folder(self) -> None:
-        path = default_app_config_dir()
-        path.mkdir(parents=True, exist_ok=True)
-        self._append_log(f"Opened TP showroom mapping folder: {path}")
-        self._open_path_in_shell(path, description="TP showroom mapping folder")
+        self.open_bundled_tp_showroom_mapping()
 
     def open_bundled_tp_showroom_mapping(self) -> None:
-        path = bundled_tp_showroom_mapping_path()
-        self._append_log(f"Opened bundled TP showroom mapping seed: {path}")
-        self._open_path_in_shell(path, description="bundled TP showroom mapping seed")
+        try:
+            webbrowser.open(TP_CAR_TEMPLATES_URL)
+            self._append_log(f"Opened Trading Paints live car template catalog: {TP_CAR_TEMPLATES_URL}")
+        except Exception as exc:
+            self._append_log(f"Could not open Trading Paints live car template catalog: {exc}")
 
     def reset_tp_showroom_user_mapping(self) -> None:
-        path = user_tp_showroom_mapping_path()
-        if not path.exists():
-            self.tp_mapping_status_var.set("TP showroom user mapping is already at bundled defaults.")
-            self.tp_mapping_hint_var.set("There is no editable AppData override file yet. The app is using only the bundled seed right now.")
-            self._append_log("Reset user mapping requested, but no AppData TP showroom mapping override file exists yet.")
-            return
-        confirmed = self.messagebox.askyesno(
-            APP_NAME,
-            "Delete the editable TP showroom mapping override file and return to the bundled defaults?\n\n"
-            "This only resets the user mapping in AppData. The bundled seed inside the app will stay untouched.",
-            parent=self.root,
-        )
-        if not confirmed:
-            return
-        try:
-            path.unlink(missing_ok=True)
-            self._tp_mapping_scan_result = None
-            self._tp_mapping_last_missing_key = ""
-            self.tp_mapping_file_var.set(f"Editable JSON: {path} | Scan cache: {default_tp_showroom_review_dir()}")
-            self.tp_mapping_status_var.set("TP showroom user mapping reset to bundled defaults.")
-            self.tp_mapping_hint_var.set("The AppData override file was removed. A fresh editable JSON will be recreated automatically the next time you open it.")
-            self._append_log(f"Reset TP showroom user mapping by deleting AppData override file: {path}")
-            self.scan_tp_showroom_mappings_now()
-        except Exception as exc:
-            self._append_log(f"Could not reset TP showroom user mapping: {exc}")
-            self.messagebox.showerror(APP_NAME, f"Could not reset the editable TP showroom mapping.\n\n{exc}", parent=self.root)
+        self.scan_tp_showroom_mappings_now()
 
     def _start_tp_showroom_mapping_startup_scan(self) -> None:
         if self._exiting or self._tp_mapping_startup_scan_requested:
@@ -24575,7 +24390,7 @@ class DownloaderUI:
         self._tp_mapping_startup_scan_deferred = False
         self._tp_mapping_startup_scan_requested = True
         self._run_tp_showroom_mapping_scan(
-            prompt_on_completion=True,
+            prompt_on_completion=False,
             focus_key=self._tp_mapping_last_missing_key,
             source="startup",
         )
@@ -24597,22 +24412,15 @@ class DownloaderUI:
         self._tp_mapping_scan_in_progress = True
         self._tp_mapping_prompt_after_scan = bool(prompt_on_completion)
         self._tp_mapping_prompt_focus_key = _canonicalize_tp_mapping_key(focus_key)
-        self.tp_mapping_status_var.set("Scanning public iRacing + Trading Paints car lists for showroom mapping changes...")
-        self.tp_mapping_hint_var.set("This runs in the background and will prompt you if new cars need review.")
-        self._append_log(f"TP showroom mapping scan started ({source}).")
+        self.tp_mapping_status_var.set("Refreshing the live Trading Paints car identity catalog...")
+        self.tp_mapping_hint_var.set("This runs in the background. New cars become available without an app update or manual mapping.")
+        self._append_log(f"Trading Paints automatic car catalog refresh started ({source}).")
 
         def _worker() -> None:
             result: dict[str, Any] | None = None
             error = ""
             try:
-                result = scan_tp_showroom_mapping_review(
-                    seed_path=default_tp_showroom_mapping_path(),
-                    iracing_source=TP_SHOWROOM_SCAN_IRACING_SOURCE,
-                    timeout=TP_SHOWROOM_SCAN_TIMEOUT_SECONDS,
-                    sleep_seconds=TP_SHOWROOM_SCAN_SLEEP_SECONDS,
-                    top_n=TP_SHOWROOM_SCAN_TOP_N,
-                    report_dir=default_tp_showroom_review_dir(),
-                )
+                result = scan_tp_showroom_mapping_review()
             except Exception as exc:
                 error = str(exc) or exc.__class__.__name__
             self.root.after(0, lambda: self._finish_tp_showroom_mapping_scan(result, error, source=source))
@@ -24626,489 +24434,46 @@ class DownloaderUI:
         self._tp_mapping_prompt_after_scan = False
         self._tp_mapping_prompt_focus_key = ""
         if error:
-            self.tp_mapping_status_var.set("TP showroom mapping scan failed.")
-            self.tp_mapping_hint_var.set(f"Scan error: {error}")
-            self._append_log(f"TP showroom mapping scan failed: {error}")
+            self.tp_mapping_status_var.set("Trading Paints automatic car catalog refresh failed.")
+            self.tp_mapping_hint_var.set(f"Refresh error: {error}")
+            self._append_log(f"Trading Paints automatic car catalog refresh failed: {error}")
             return
         assert result is not None
-        latest_mapping_doc = _load_tp_showroom_mapping()
-        filtered_pending = _filter_tp_showroom_pending_items_against_mapping(
-            list(result.get("pending") or []),
-            latest_mapping_doc,
-        )
-        if len(filtered_pending) != len(list(result.get("pending") or [])):
-            resolved_count = len(list(result.get("pending") or [])) - len(filtered_pending)
-            self._append_log(f"Skipped {resolved_count} stale TP showroom pending mapping entr{'y' if resolved_count == 1 else 'ies'} that are already mapped.")
-        result["mapping_doc"] = latest_mapping_doc
-        result["pending"] = filtered_pending
-        result["pending_count"] = len(filtered_pending)
-        result["mapped_count"] = len(latest_mapping_doc.get("cars") or {})
-        result["unsupported_count"] = len(latest_mapping_doc.get("unsupported") or {})
         self._tp_mapping_scan_result = result
-        pending_count = int(result.get("pending_count") or 0)
         mapped_count = int(result.get("mapped_count") or 0)
-        unsupported_count = int(result.get("unsupported_count") or 0)
-        report_dir = Path(result.get("report_dir") or default_tp_showroom_review_dir())
-        self.tp_mapping_file_var.set(f"Editable JSON: {user_tp_showroom_mapping_path()} | Scan cache: {report_dir}")
-        if pending_count > 0:
-            self.tp_mapping_status_var.set(
-                f"TP showroom mapping review needed: {pending_count} public iRacing car(s) are still not mapped."
-            )
-            self.tp_mapping_hint_var.set(
-                f"Mapped: {mapped_count} | Unsupported: {unsupported_count} | Use Review pending cars to accept matches or mark unsupported."
-            )
-        else:
-            self.tp_mapping_status_var.set("TP showroom mapping scan complete: no new public cars need review.")
-            self.tp_mapping_hint_var.set(
-                f"Mapped: {mapped_count} | Unsupported: {unsupported_count} | You can still open the editable JSON at any time if you want to adjust something manually."
-            )
-        self._append_log(
-            f"TP showroom mapping scan complete ({source}): {pending_count} pending, {mapped_count} mapped, {unsupported_count} unsupported."
+        status = tp_car_identity_catalog_status()
+        observed_count = int(status.get("manifest_observed_directories") or 0)
+        self.tp_mapping_file_var.set(f"Live source: {TP_CAR_TEMPLATES_URL}")
+        self.tp_mapping_status_var.set(f"Automatic car identification ready: {mapped_count} Trading Paints car directories loaded.")
+        self.tp_mapping_hint_var.set(
+            f"Manifest-validated directories this run: {observed_count}. Catalog refreshes automatically every 6 hours and immediately when an unknown car appears."
         )
-        if pending_count > 0 and prompt_after_scan and not self._exiting:
-            try:
-                open_now = self.messagebox.askyesno(
-                    APP_NAME,
-                    f"Nishizumi Paints found {pending_count} iRacing car(s) that are not mapped yet in the Trading Paints showroom seed.\n\nOpen the in-app review now?",
-                    parent=self.root,
-                )
-            except Exception:
-                open_now = True
-            if open_now:
-                self.review_tp_showroom_mappings(focus_key=focus_key)
+        self.showroom_car_choices = tp_showroom_car_choice_labels()
+        for combo_name in ("showroom_download_car_combo", "showroom_member_car_combo", "showroom_team_car_combo"):
+            combo = getattr(self, combo_name, None)
+            if combo is not None:
+                try:
+                    combo.configure(values=self.showroom_car_choices)
+                except Exception:
+                    pass
+        self._append_log(
+            f"Trading Paints automatic car catalog refresh complete ({source}): {mapped_count} directories loaded; {observed_count} manifest directories observed."
+        )
 
     def review_tp_showroom_mappings(self, focus_key: str = "") -> None:
-        normalized_focus_key = _canonicalize_tp_mapping_key(focus_key or self._tp_mapping_last_missing_key)
-        if self._tp_mapping_scan_in_progress:
-            self._tp_mapping_prompt_after_scan = True
-            if normalized_focus_key:
-                self._tp_mapping_prompt_focus_key = normalized_focus_key
-            self._append_log("TP showroom mapping review will open after the current scan finishes.")
-            return
-        if not self._tp_mapping_scan_result:
-            self._run_tp_showroom_mapping_scan(prompt_on_completion=True, focus_key=normalized_focus_key, source="review")
-            return
-        latest_mapping_doc = _load_tp_showroom_mapping()
-        pending = _filter_tp_showroom_pending_items_against_mapping(
-            list(self._tp_mapping_scan_result.get("pending") or []),
-            latest_mapping_doc,
-        )
-        self._tp_mapping_scan_result["mapping_doc"] = latest_mapping_doc
-        self._tp_mapping_scan_result["pending"] = pending
-        self._tp_mapping_scan_result["pending_count"] = len(pending)
-        if normalized_focus_key and normalized_focus_key not in {
-            _canonicalize_tp_mapping_key(item.get("key")) for item in pending
-        }:
-            normalized_focus_key = ""
-        if normalized_focus_key:
-            pending.sort(key=lambda item: 0 if _canonicalize_tp_mapping_key(item.get("key")) == normalized_focus_key else 1)
-        if not pending:
-            self.tp_mapping_status_var.set("TP showroom mapping scan complete: no new public cars need review.")
-            self.tp_mapping_hint_var.set("Any stale pending entries were removed because they are already mapped in the current JSON.")
-            self.messagebox.showinfo(APP_NAME, "There are no pending showroom mappings to review right now.", parent=self.root)
-            return
-        if self._tp_mapping_review_window is not None:
-            try:
-                if self._tp_mapping_review_window.winfo_exists():
-                    self._tp_mapping_review_window.deiconify()
-                    self._tp_mapping_review_window.lift()
-                    self._tp_mapping_review_window.focus_force()
-                    return
-            except Exception:
-                pass
-
-        dialog = self.tk.Toplevel(self.root)
-        self._tp_mapping_review_window = dialog
-        dialog.title("TP showroom mapping review")
-        dialog.transient(self.root)
-        dialog.geometry("1180x760")
-        dialog.minsize(1020, 660)
-        dialog.columnconfigure(0, weight=1)
-        dialog.rowconfigure(1, weight=1)
-
-        header = self.ttk.Frame(dialog, padding=12)
-        header.grid(row=0, column=0, sticky="ew")
-        header.columnconfigure(0, weight=1)
-        progress_var = self.tk.StringVar(value="")
-        title_var = self.tk.StringVar(value="Which Trading Paints showroom car matches this iRacing car?")
-        path_var = self.tk.StringVar(value="")
-        hint_var = self.tk.StringVar(
-            value=(
-                "You are choosing the TP showroom vehicle page for this iRacing car model. "
-                "You are not choosing a paint here. Pick the row that refers to the same car, "
-                "then accept it."
-            )
-        )
-        self.ttk.Label(header, textvariable=progress_var, font=("Segoe UI", 10, "bold"), foreground="#0b63b6").grid(row=0, column=0, sticky="w")
-        self.ttk.Label(header, textvariable=title_var, font=("Segoe UI", 11, "bold")).grid(row=1, column=0, sticky="w", pady=(6, 0))
-        self.ttk.Label(header, textvariable=path_var, foreground="#555555", wraplength=1120, justify="left").grid(row=2, column=0, sticky="w", pady=(4, 0))
-        self.ttk.Label(header, textvariable=hint_var, foreground="#666666", wraplength=1120, justify="left").grid(row=3, column=0, sticky="w", pady=(6, 0))
-
-        body = self.ttk.Frame(dialog, padding=(12, 0, 12, 12))
-        body.grid(row=1, column=0, sticky="nsew")
-        body.columnconfigure(0, weight=0)
-        body.columnconfigure(1, weight=1)
-        body.rowconfigure(0, weight=1)
-        details_box = self.ttk.Frame(body)
-        details_box.grid(row=0, column=0, sticky="nsw", padx=(0, 12))
-        details_box.columnconfigure(0, weight=1)
-
-        iracing_box = self.ttk.LabelFrame(details_box, text="iRacing car that needs mapping", padding=10)
-        iracing_box.grid(row=0, column=0, sticky="ew")
-        iracing_box.columnconfigure(0, weight=1)
-        iracing_name_var = self.tk.StringVar(value="")
-        iracing_key_var = self.tk.StringVar(value="")
-        iracing_leaf_var = self.tk.StringVar(value="")
-        iracing_path_var = self.tk.StringVar(value="")
-        iracing_help_var = self.tk.StringVar(
-            value=(
-                "Match the same vehicle model. Ignore paint names, liveries, sponsors, and artwork."
-            )
-        )
-        self.ttk.Label(iracing_box, textvariable=iracing_name_var, font=("Segoe UI", 10, "bold"), wraplength=300, justify="left").grid(row=0, column=0, sticky="w")
-        self.ttk.Label(iracing_box, textvariable=iracing_key_var, foreground="#555555", wraplength=300, justify="left").grid(row=1, column=0, sticky="w", pady=(6, 0))
-        self.ttk.Label(iracing_box, textvariable=iracing_leaf_var, foreground="#555555", wraplength=300, justify="left").grid(row=2, column=0, sticky="w", pady=(4, 0))
-        self.ttk.Label(iracing_box, textvariable=iracing_path_var, foreground="#555555", wraplength=300, justify="left").grid(row=3, column=0, sticky="w", pady=(4, 0))
-        self.ttk.Label(iracing_box, textvariable=iracing_help_var, foreground="#666666", wraplength=300, justify="left").grid(row=4, column=0, sticky="w", pady=(8, 0))
-
-        selected_box = self.ttk.LabelFrame(details_box, text="Selected Trading Paints candidate", padding=10)
-        selected_box.grid(row=1, column=0, sticky="ew", pady=(12, 0))
-        selected_box.columnconfigure(0, weight=1)
-        selected_score_var = self.tk.StringVar(value="Confidence: -")
-        selected_name_var = self.tk.StringVar(value="Select a row on the right.")
-        selected_category_var = self.tk.StringVar(value="")
-        selected_mid_var = self.tk.StringVar(value="")
-        selected_slug_var = self.tk.StringVar(value="")
-        selected_url_var = self.tk.StringVar(value="")
-        selected_hint_var = self.tk.StringVar(
-            value="Tip: double-click a row or use Enter to accept the current selection."
-        )
-        self.ttk.Label(selected_box, textvariable=selected_score_var, foreground="#0b63b6", font=("Segoe UI", 9, "bold")).grid(row=0, column=0, sticky="w")
-        self.ttk.Label(selected_box, textvariable=selected_name_var, font=("Segoe UI", 10, "bold"), wraplength=300, justify="left").grid(row=1, column=0, sticky="w", pady=(6, 0))
-        self.ttk.Label(selected_box, textvariable=selected_category_var, foreground="#555555", wraplength=300, justify="left").grid(row=2, column=0, sticky="w", pady=(4, 0))
-        self.ttk.Label(selected_box, textvariable=selected_mid_var, foreground="#555555", wraplength=300, justify="left").grid(row=3, column=0, sticky="w", pady=(2, 0))
-        self.ttk.Label(selected_box, textvariable=selected_slug_var, foreground="#555555", wraplength=300, justify="left").grid(row=4, column=0, sticky="w", pady=(2, 0))
-        self.ttk.Label(selected_box, textvariable=selected_url_var, foreground="#555555", wraplength=300, justify="left").grid(row=5, column=0, sticky="w", pady=(2, 0))
-        self.ttk.Label(selected_box, textvariable=selected_hint_var, foreground="#666666", wraplength=300, justify="left").grid(row=6, column=0, sticky="w", pady=(8, 0))
-
-        actions_box = self.ttk.LabelFrame(details_box, text="Quick help", padding=10)
-        actions_box.grid(row=2, column=0, sticky="ew", pady=(12, 0))
-        actions_box.columnconfigure(0, weight=1)
-        actions_help = (
-            "Enter: accept selected match\n"
-            "Double-click: open selected TP page\n"
-            "1-9: select a candidate row quickly\n"
-            "Alt+S: skip this car\n"
-            "Alt+U: mark this car as not available in TP"
-        )
-        self.ttk.Label(actions_box, text=actions_help, foreground="#555555", justify="left", wraplength=300).grid(row=0, column=0, sticky="w")
-
-        candidate_box = self.ttk.LabelFrame(body, text="Suggested Trading Paints matches", padding=8)
-        candidate_box.grid(row=0, column=1, sticky="nsew")
-        candidate_box.columnconfigure(0, weight=1)
-        candidate_box.rowconfigure(0, weight=1)
-        candidate_tree = self.ttk.Treeview(candidate_box, columns=("score", "fit", "category", "mid", "name"), show="headings", height=14)
-        candidate_tree.heading("score", text="Score")
-        candidate_tree.heading("fit", text="Fit")
-        candidate_tree.heading("category", text="Category")
-        candidate_tree.heading("mid", text="MID")
-        candidate_tree.heading("name", text="Trading Paints car")
-        candidate_tree.column("score", width=80, minwidth=70, anchor="center", stretch=False)
-        candidate_tree.column("fit", width=110, minwidth=100, anchor="center", stretch=False)
-        candidate_tree.column("category", width=92, minwidth=80, anchor="center", stretch=False)
-        candidate_tree.column("mid", width=90, minwidth=84, anchor="center", stretch=False)
-        candidate_tree.column("name", width=620, minwidth=260, anchor="w")
-        candidate_tree.grid(row=0, column=0, sticky="nsew")
-        candidate_scroll = self.ttk.Scrollbar(candidate_box, orient="vertical", command=candidate_tree.yview)
-        candidate_tree.configure(yscrollcommand=candidate_scroll.set)
-        candidate_scroll.grid(row=0, column=1, sticky="ns")
-
-        footer = self.ttk.Frame(dialog, padding=(12, 0, 12, 12))
-        footer.grid(row=2, column=0, sticky="ew")
-        footer.columnconfigure(0, weight=1)
-        status_var = self.tk.StringVar(value="")
-        self.ttk.Label(footer, textvariable=status_var, foreground="#555555", wraplength=980, justify="left").grid(row=0, column=0, columnspan=6, sticky="w")
-
-        state = {"items": pending, "index": 0}
-
-        def _mapping_score_label(score_value: object) -> str:
-            try:
-                score = float(score_value)
-            except Exception:
-                return "Unknown"
-            if score >= 97.0:
-                return "Exact"
-            if score >= 92.0:
-                return "Very high"
-            if score >= 85.0:
-                return "High"
-            if score >= 75.0:
-                return "Medium"
-            return "Low"
-
-        def _close_dialog() -> None:
-            try:
-                dialog.destroy()
-            finally:
-                self._tp_mapping_review_window = None
-
-        def _current_item() -> dict[str, Any] | None:
-            items = state["items"]
-            if not items:
-                return None
-            index = max(0, min(int(state["index"]), len(items) - 1))
-            state["index"] = index
-            return items[index]
-
-        def _update_selected_candidate_details() -> None:
-            item = _current_item()
-            if item is None:
-                selected_score_var.set("Confidence: -")
-                selected_name_var.set("No pending car selected.")
-                selected_category_var.set("")
-                selected_mid_var.set("")
-                selected_slug_var.set("")
-                selected_url_var.set("")
-                selected_hint_var.set("")
-                return
-            candidates = list(item.get("candidates") or [])
-            selection = candidate_tree.selection()
-            index = int(selection[0]) if selection else 0
-            if index < 0 or index >= len(candidates):
-                if candidates:
-                    candidate_tree.selection_set("0")
-                    candidate_tree.focus("0")
-                    index = 0
-                else:
-                    selected_score_var.set("Confidence: -")
-                    selected_name_var.set("No suggested Trading Paints car passed the minimum score.")
-                    selected_category_var.set("")
-                    selected_mid_var.set("")
-                    selected_slug_var.set("")
-                    selected_url_var.set("")
-                    selected_hint_var.set("Use Open JSON for a manual override, or mark this car as not available in TP.")
-                    return
-            candidate = candidates[index]
-            selected_score_var.set(f"Confidence: {_mapping_score_label(candidate.get('score'))} ({candidate.get('score')})")
-            selected_name_var.set(str(candidate.get("tp_name") or "Unknown Trading Paints car"))
-            selected_category_var.set(f"Category: {candidate.get('category') or '-'}")
-            selected_mid_var.set(f"MID: {candidate.get('mid') or '-'}")
-            selected_slug_var.set(f"Slug: {candidate.get('slug') or '-'}")
-            selected_url_var.set(f"Page: {candidate.get('showroom_url') or '-'}")
-            selected_hint_var.set("Open the TP page if you want to verify the vehicle page before accepting it.")
-
-        def _refresh_dialog() -> None:
-            item = _current_item()
-            for row in candidate_tree.get_children():
-                candidate_tree.delete(row)
-            if item is None:
-                progress_var.set("TP showroom mapping review complete")
-                title_var.set("No pending cars remain in the current review session.")
-                path_var.set("")
-                hint_var.set("You can close this window now. The next scan will only show truly new pending cars again.")
-                iracing_name_var.set("")
-                iracing_key_var.set("")
-                iracing_leaf_var.set("")
-                iracing_path_var.set("")
-                _update_selected_candidate_details()
-                status_var.set("")
-                return
-            progress_var.set(f"Pending car {state['index'] + 1} of {len(state['items'])}")
-            title_var.set("Which Trading Paints showroom car matches this iRacing car?")
-            path_var.set("Pick the Trading Paints vehicle page that refers to the same car model below.")
-            iracing_name_var.set(str(item.get("iracing_name") or item.get("key") or "Unknown car"))
-            iracing_key_var.set(f"Mapping key: {item.get('key') or '-'}")
-            iracing_leaf_var.set(f"Folder name: {item.get('directory_leaf') or '-'}")
-            iracing_path_var.set(f"iRacing filepath: {item.get('filepath_full') or '-'}")
-            candidates = list(item.get("candidates") or [])
-            if candidates:
-                hint_var.set(
-                    "Choose the same vehicle model on the right. The top score is usually the correct showroom car. "
-                    "If you want to verify first, open the selected TP page."
-                )
-            else:
-                hint_var.set("No candidate cleared the minimum score. Open the editable JSON if you want to add a custom mapping manually.")
-            for idx, candidate in enumerate(candidates):
-                candidate_tree.insert(
-                    "",
-                    "end",
-                    iid=str(idx),
-                    values=(
-                        candidate.get("score"),
-                        _mapping_score_label(candidate.get("score")),
-                        candidate.get("category"),
-                        candidate.get("mid"),
-                        candidate.get("tp_name"),
-                    ),
-                )
-            if candidates:
-                candidate_tree.selection_set("0")
-                candidate_tree.focus("0")
-                candidate_tree.see("0")
-            _update_selected_candidate_details()
-            status_var.set("")
-
-        def _save_mapping_choice(entry: dict[str, Any] | None, *, unsupported: bool) -> None:
-            item = _current_item()
-            if item is None:
-                return
-            key = _canonicalize_tp_mapping_key(item.get("key"))
-            if not key:
-                return
-            path = _ensure_user_tp_showroom_mapping_file(seed_from_effective=True)
-            doc = _load_tp_showroom_mapping(path)
-            doc.setdefault("cars", {})
-            doc.setdefault("unsupported", {})
-            if unsupported:
-                doc["cars"].pop(key, None)
-                doc["unsupported"][key] = {
-                    "iracing_name": str(item.get("iracing_name") or key),
-                    "status": "unsupported_in_tp",
-                    "source": "mapping_review_ui",
-                }
-                _save_tp_showroom_mapping_user_doc(doc, path)
-                self._append_log(f"Marked TP showroom mapping as unsupported: {key}")
-            else:
-                assert entry is not None
-                doc["unsupported"].pop(key, None)
-                doc["cars"][key] = {
-                    "mid": int(entry.get("mid") or 0),
-                    "slug": str(entry.get("slug") or ""),
-                    "category": str(entry.get("category") or "Road"),
-                    "tp_name": str(entry.get("tp_name") or ""),
-                    "iracing_name": str(item.get("iracing_name") or key),
-                    "status": "mapped",
-                    "source": "mapping_review_ui",
-                }
-                _save_tp_showroom_mapping_user_doc(doc, path)
-                self._append_log(f"Saved TP showroom mapping: {key} -> {entry.get('category')}/{entry.get('mid')}/{entry.get('slug')}")
-            self.tp_mapping_file_var.set(f"Editable JSON: {path} | Scan cache: {default_tp_showroom_review_dir()}")
-            if self._tp_mapping_scan_result is not None:
-                self._tp_mapping_scan_result["mapping_doc"] = doc
-                self._tp_mapping_scan_result["pending"] = [
-                    existing
-                    for existing in list(self._tp_mapping_scan_result.get("pending") or [])
-                    if _canonicalize_tp_mapping_key(existing.get("key")) != key
-                ]
-                self._tp_mapping_scan_result["pending_count"] = len(self._tp_mapping_scan_result["pending"])
-            if self._tp_mapping_last_missing_key == key:
-                self._tp_mapping_last_missing_key = ""
-
-        def _accept_selected() -> None:
-            item = _current_item()
-            if item is None:
-                return
-            selection = candidate_tree.selection()
-            if not selection:
-                status_var.set("Select a candidate first.")
-                return
-            index = int(selection[0])
-            candidates = list(item.get("candidates") or [])
-            if index < 0 or index >= len(candidates):
-                status_var.set("The selected candidate is no longer available.")
-                return
-            _save_mapping_choice(candidates[index], unsupported=False)
-            state["items"].pop(state["index"])
-            if state["index"] >= len(state["items"]):
-                state["index"] = max(0, len(state["items"]) - 1)
-            remaining = len(state["items"])
-            if remaining > 0:
-                self.tp_mapping_status_var.set(f"TP showroom mapping review in progress: {remaining} pending car(s) still need attention.")
-            else:
-                self.tp_mapping_status_var.set("TP showroom mapping review complete: no pending cars remain from the latest scan.")
-            _refresh_dialog()
-
-        def _mark_unsupported() -> None:
-            _save_mapping_choice(None, unsupported=True)
-            state["items"].pop(state["index"])
-            if state["index"] >= len(state["items"]):
-                state["index"] = max(0, len(state["items"]) - 1)
-            remaining = len(state["items"])
-            if remaining > 0:
-                self.tp_mapping_status_var.set(f"TP showroom mapping review in progress: {remaining} pending car(s) still need attention.")
-            else:
-                self.tp_mapping_status_var.set("TP showroom mapping review complete: no pending cars remain from the latest scan.")
-            _refresh_dialog()
-
-        def _skip_current() -> None:
-            item = _current_item()
-            if item is None:
-                return
-            self._append_log(f"Skipped TP showroom mapping review for now: {item.get('key')}")
-            state["items"].pop(state["index"])
-            if state["index"] >= len(state["items"]):
-                state["index"] = max(0, len(state["items"]) - 1)
-            remaining = len(state["items"])
-            if remaining > 0:
-                self.tp_mapping_status_var.set(f"TP showroom mapping review paused with {remaining} remaining pending car(s) from the latest scan.")
-            else:
-                self.tp_mapping_status_var.set("TP showroom mapping review complete: no pending cars remain from the latest scan.")
-            _refresh_dialog()
-
-        def _open_selected_tp_page() -> None:
-            item = _current_item()
-            if item is None:
-                return
-            candidates = list(item.get("candidates") or [])
-            if not candidates:
-                status_var.set("No Trading Paints candidate page is available for this car.")
-                return
-            selection = candidate_tree.selection()
-            index = int(selection[0]) if selection else 0
-            if index < 0 or index >= len(candidates):
-                status_var.set("The selected candidate is no longer available.")
-                return
-            target_url = str(candidates[index].get("showroom_url") or "").strip()
-            if not target_url:
-                status_var.set("The selected candidate did not include a Trading Paints page URL.")
-                return
-            try:
-                webbrowser.open(target_url)
-                status_var.set(f"Opened {target_url}")
-            except Exception as exc:
-                status_var.set(f"Could not open Trading Paints page: {exc}")
-
-        self.ttk.Button(footer, text="Open selected TP page", command=_open_selected_tp_page).grid(row=1, column=0, sticky="w", pady=(10, 0))
-        self.ttk.Button(footer, text="Accept selected car match", command=_accept_selected).grid(row=1, column=1, sticky="w", padx=(8, 0), pady=(10, 0))
-        self.ttk.Button(footer, text="Mark as not in TP", command=_mark_unsupported).grid(row=1, column=2, sticky="w", padx=(8, 0), pady=(10, 0))
-        self.ttk.Button(footer, text="Skip this car", command=_skip_current).grid(row=1, column=3, sticky="w", padx=(8, 0), pady=(10, 0))
-        self.ttk.Button(footer, text="Open JSON", command=self.open_tp_showroom_mapping_json).grid(row=1, column=4, sticky="w", padx=(8, 0), pady=(10, 0))
-        self.ttk.Button(footer, text="Close", command=_close_dialog).grid(row=1, column=5, sticky="e", padx=(8, 0), pady=(10, 0))
-
-        def _on_candidate_tree_select(_event: object = None) -> None:
-            _update_selected_candidate_details()
-
-        def _select_candidate_index(index: int) -> str | None:
-            item = _current_item()
-            if item is None:
-                return None
-            candidates = list(item.get("candidates") or [])
-            if index < 0 or index >= len(candidates):
-                return None
-            iid = str(index)
-            candidate_tree.selection_set(iid)
-            candidate_tree.focus(iid)
-            candidate_tree.see(iid)
-            _update_selected_candidate_details()
-            return "break"
-
-        candidate_tree.bind("<<TreeviewSelect>>", _on_candidate_tree_select)
-        candidate_tree.bind("<Double-1>", lambda _event: _open_selected_tp_page())
-        candidate_tree.bind("<Return>", lambda _event: _accept_selected() or "break")
-        dialog.bind("<Return>", lambda _event: _accept_selected() or "break")
-        dialog.bind("<Alt-s>", lambda _event: _skip_current() or "break")
-        dialog.bind("<Alt-S>", lambda _event: _skip_current() or "break")
-        dialog.bind("<Alt-u>", lambda _event: _mark_unsupported() or "break")
-        dialog.bind("<Alt-U>", lambda _event: _mark_unsupported() or "break")
-        for digit in range(1, 10):
-            dialog.bind(str(digit), lambda _event, idx=digit - 1: _select_candidate_index(idx))
-        dialog.protocol("WM_DELETE_WINDOW", _close_dialog)
-        _refresh_dialog()
+        del focus_key
+        self.scan_tp_showroom_mappings_now()
         try:
-            dialog.grab_set()
-            candidate_tree.focus_set()
+            self.messagebox.showinfo(
+                APP_NAME,
+                "Car identification is automatic now.\n\n"
+                "Nishizumi Paints reads the live Trading Paints template catalog and combines it with "
+                "the iRacing SDK and observed manifests. There is no JSON or manual review step.",
+                parent=self.root,
+            )
         except Exception:
             pass
+
     def _prompt_tp_account_kind(self) -> str | None:
         dialog = self.tk.Toplevel(self.root)
         dialog.title("Trading Paints account")

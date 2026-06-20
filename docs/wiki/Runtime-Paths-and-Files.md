@@ -7,7 +7,6 @@ This page documents where the app stores its runtime data and how that differs f
 The repository now keeps bundled resources in dedicated folders:
 
 - `assets/icons/`
-- `data/`
 - `docs/wiki/`
 - `archive/`
 - `scripts/`
@@ -30,17 +29,9 @@ The app stores the main config at:
 
 That file contains the saved `AppConfig` state, including UI mode, startup settings, fallback choices, worker preferences, and path overrides.
 
-## Bundled versus user showroom mapping
+## Automatic car identity
 
-Bundled seed:
-
-- `data/tp_showroom_mapping.seed.json`
-
-User override:
-
-- `%APPDATA%\NishizumiPaints\tp_showroom_mapping.seed.json`
-
-The app merges both at runtime.
+Car identity is loaded from the live Trading Paints template catalog and cached in memory. There is no bundled showroom seed and no AppData mapping JSON.
 
 ## Additional AppData files
 

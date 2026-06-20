@@ -57,11 +57,14 @@ Important functions here include:
 
 This section owns durable local fallback data.
 
-## Mapping and showroom functions
+## Automatic identity and showroom functions
 
 Important mapping and showroom functions include:
 
 - `_load_tp_showroom_mapping`
+- `_parse_tp_car_templates_html`
+- `_observe_iracing_car_identity`
+- `_observe_tp_manifest_directory`
 - `scan_tp_showroom_mapping_review`
 - `_tp_showroom_mapping_entry_for_directory`
 - `_tp_showroom_mapping_entry_for_mid`
@@ -71,7 +74,7 @@ Important mapping and showroom functions include:
 - `choose_showroom_paint_direct`
 - `choose_showroom_accessory_direct`
 
-This is the best section to read when investigating public showroom behavior.
+The historical function names remain for compatibility, but the data now comes from the live Trading Paints template catalog rather than JSON mapping files.
 
 ## Collection functions
 

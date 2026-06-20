@@ -2,6 +2,19 @@
 
 All notable user-facing changes to Nishizumi Paints are documented here.
 
+## [7.2.0] - 2026-06-20
+
+### Added
+
+- Replaced the bundled/user-edited showroom car mapping with automatic car identification from the live Trading Paints template catalog.
+- The iRacing SDK now contributes the active car name and directory, while Trading Paints manifests validate directories seen in real sessions.
+- Unknown iRacing directories can be learned automatically by matching the SDK car name to the live Trading Paints vehicle catalog.
+
+### Changed
+
+- New cars no longer require a Nishizumi Paints update, seed-file change, JSON edit, or mapping-review dialog.
+- Removed the bundled `data/tp_showroom_mapping.seed.json` resource from source and release builds.
+
 ## [7.1.3] - 2026-06-07
 
 ### Fixed

@@ -4,6 +4,8 @@
 
 Nishizumi Paints is a Windows desktop companion for iRacing. It watches live sessions, downloads Trading Paints liveries, fills missing car, helmet, and suit assets from online or local fallback sources, and gives you manual control over individual drivers from the Session table.
 
+Car identification is automatic: the app combines the iRacing SDK, Trading Paints manifests, and the live Trading Paints template catalog. New cars do not require a bundled mapping update or a user-edited JSON file.
+
 [Download the latest release](https://github.com/nishizumi-maho/Nishizumi-Paints/releases/latest)
 ;
 [Read the manual](./docs/wiki/Home.md)
@@ -27,13 +29,12 @@ Nishizumi Paints is a Windows desktop companion for iRacing. It watches live ses
 
 Upgrades use the same app ID and install path, so a newer installer can be run over an existing installation.
 
-## What's new in 7.1
+## What's new in 7.2
 
-- Manual Showroom collection imports now keep all downloadable public collection paints, including public paints owned by Pro users or paints with stamped numbers, instead of using the stricter online-fallback filter.
-- The Session table `Random` action now honors Local mode and pulls from the Local RandomPool when Online fallback is disabled.
-- First-run setup keeps the iRacing Documents folder automatic unless detection fails; Advanced mode exposes a `Customize iRacing Documents folder` checkbox for manual paths.
-- Double-click camera switching from the Session table now targets the selected driver with the Chase camera.
-- The 7.0 Team-session fallback, driver-swap, multi-select Session actions, favorites/blocklist, and paint-history restore work remain included.
+- Car identification is now automatic through the live Trading Paints template catalog, iRacing SDK car data, and directories observed in Trading Paints manifests.
+- New cars no longer require a Nishizumi Paints update, bundled seed, user JSON edit, or mapping-review workflow.
+- The legacy 7.1 session, Team fallback, RandomPool, collection, and camera-switching improvements remain included.
+
 
 ## Session table quick guide
 
@@ -69,7 +70,7 @@ The Team driver-personal fallback options are split by car, suit, and helmet. Pr
 
 Open **Showroom** when you want to pre-fill paints manually instead of waiting for a live session fallback.
 
-- **Car** downloads random public non-PRO paints for one mapped iRacing car.
+- **Car** downloads random public non-PRO paints for a car discovered from the live Trading Paints catalog.
 - **Member ID** downloads a known member's car, helmet, and suit paints.
 - **Teams** downloads known Team paints.
 - **Showroom links** accepts one or more Trading Paints paint links.

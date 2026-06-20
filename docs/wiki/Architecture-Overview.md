@@ -17,7 +17,7 @@ The top of the file defines:
 - runtime filenames
 - resource and AppData path helpers
 
-This section is where the repository reorganization matters, because the script now resolves bundled files from `assets/` and `data/` instead of the repo root.
+This section also defines the live Trading Paints car-template endpoint used for automatic car identity.
 
 ## 2. Legacy browser and authenticated showroom compatibility
 
@@ -74,17 +74,17 @@ The app then implements:
 
 This layer supports everything above it without being tied to one UI tab.
 
-## 6. RandomPool, overrides, and mapping infrastructure
+## 6. RandomPool, overrides, and automatic car identity
 
 The next large block covers:
 
 - RandomPool size management
 - RandomPool archiving
 - driver override persistence
-- showroom mapping load/save/merge logic
-- mapping scan and review support
+- live Trading Paints template-catalog parsing
+- iRacing SDK alias learning and manifest-directory observation
 
-This is the durable local-state layer of the fallback system.
+This removes the old seed/JSON mapping workflow while keeping the fallback system independent of app releases when new cars appear.
 
 ## 7. Public showroom and collection logic
 

@@ -5,7 +5,7 @@
 
 ## 1. Scope
 
-The current Nishizumi Paints 6.4 codebase talks to Trading Paints in six practical ways:
+The current Nishizumi Paints 7.2 codebase talks to Trading Paints in these practical ways:
 
 1. session-aware manifest lookups for real live-session paints
 2. single-user manifest fallback lookups
@@ -13,8 +13,9 @@ The current Nishizumi Paints 6.4 codebase talks to Trading Paints in six practic
 4. collection and AI-roster metadata lookups
 5. manual team paint manifest lookups by Team ID and car directory
 6. manual member paint manifest lookups by Member ID, including all-paints folder exports
+7. automatic car identity discovery from the live Trading Paints template catalog
 
-The public showroom path is now the main no-browser fallback flow. Legacy authenticated showroom endpoints still exist in the script for compatibility and historical logic, but they are no longer the primary 6.4 path.
+The public showroom path is now the main no-browser fallback flow. Legacy authenticated showroom endpoints still exist in the script for compatibility and historical logic, but they are no longer the primary 7.2 path.
 
 ## 2. Endpoint catalog
 
@@ -342,29 +343,19 @@ When total-page detection is enabled, the app estimates the true showroom page c
 
 If the probe times out, the app falls back to the pages already confirmed.
 
-## 9. Showroom mapping
+## 9. Automatic car identity
 
-The app ships with a bundled seed file and also supports a user override mapping file.
+The app does not ship or require a showroom mapping seed.
 
-Bundled resource:
+It loads the live Trading Paints template catalog:
 
-- `data/tp_showroom_mapping.seed.json`
+- `https://www.tradingpaints.com/cartemplates`
 
-User override file:
+Each record exposes the Trading Paints vehicle MID, vehicle name, and exact `Documents/iRacing/paint/...` directory. The catalog is cached in memory for six hours and refreshed immediately when an unknown directory is requested.
 
-- `%APPDATA%\\NishizumiPaints\\tp_showroom_mapping.seed.json`
+The iRacing SDK contributes the live car name, iRacing car ID, and `CarPath`. When iRacing exposes a directory alias not listed directly in the catalog, the app can bind that alias to a unique Trading Paints vehicle-name match.
 
-At runtime the app merges:
-
-1. bundled seed
-2. user override
-
-The mapping review tools can also:
-
-- scan the iRacing active-car list
-- scan Trading Paints showroom pages
-- score likely matches
-- write pending-review reports
+Trading Paints manifest directories are recorded as runtime validation. Manifest `<carid>` values are paint asset IDs, not showroom vehicle MIDs, and are never used as the car-model identifier.
 
 ## 10. Collection pool behavior
 
