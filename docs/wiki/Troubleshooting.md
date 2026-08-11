@@ -1,5 +1,17 @@
 # Troubleshooting
 
+## My paint does not show in the iRacing UI 3D car viewer
+
+Open `General > iRacing UI car previews` and read the status line first. The most common causes are:
+
+- the feature is turned off
+- no iRacing customer ID is known yet, so nothing can be installed
+- Trading Paints was unreachable on the last check
+- the paint is not the active one in your Trading Paints `My Paints` section
+- your paint is a Custom Number paint and `Hide car numbers` is off in `iRacing Settings > Graphics`
+
+Press `Sync previews now` to force a fresh manifest read. The full behavior and a symptom table are on the [iRacing UI Car Previews](iRacing-UI-Car-Previews) page.
+
 ## The Session tab looks stale after a session change
 
 Check the Logs tab for:

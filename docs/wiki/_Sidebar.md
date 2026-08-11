@@ -2,6 +2,7 @@
 - [Installation and Updating](Installation-and-Updating)
 - [Quick Start Wizard](Quick-Start-Wizard)
 - [General Tab](General-Tab)
+- [iRacing UI Car Previews](iRacing-UI-Car-Previews)
 - [Session Tab](Session-Tab)
 - [AI Tab](AI-Tab)
 - [Random Tab](Random-Tab)

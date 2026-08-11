@@ -29,11 +29,19 @@ Car identification is automatic: the app combines the iRacing SDK, Trading Paint
 
 Upgrades use the same app ID and install path, so a newer installer can be run over an existing installation.
 
-## What's new in 7.2
+## What's new in 7.3
 
-- Car identification is now automatic through the live Trading Paints template catalog, iRacing SDK car data, and directories observed in Trading Paints manifests.
-- New cars no longer require a Nishizumi Paints update, bundled seed, user JSON edit, or mapping-review workflow.
-- The legacy 7.1 session, Team fallback, RandomPool, collection, and camera-switching improvements remain included.
+- The iRacing UI 3D car viewer (`My Content > Cars`) now always shows your own paints. Your Trading Paints car, custom number, spec, decal, helmet, and suit files are kept in the iRacing paint folder at all times instead of only during a live session.
+- Preview files are mirrored locally, so they are restored right after every session cleanup and keep working with no internet connection.
+- Your iRacing customer ID is detected automatically from the live session, the Trading Paints member ID, the AI roster member ID, a confirmed Trading Paints login, or the value remembered from a previous run, with a manual override available.
+- New `iRacing UI car previews` panel in the General tab and on the Easy screen, with a live status line, a configurable re-check interval, and a `Sync previews now` button.
+- The 7.2 automatic car identification and the legacy 7.1 session, Team fallback, RandomPool, collection, and camera-switching improvements remain included.
+
+## iRacing UI car previews
+
+The iRacing UI renders the 3D car viewer from `Documents\iRacing\paint\<car>\car_<customer id>.tga` and the matching number, spec, decal, helmet, and suit files. Nishizumi Paints keeps those files present and current whenever iRacing is idle, and never touches them while a session is being processed.
+
+Read the [iRacing UI Car Previews](./docs/wiki/iRacing-UI-Car-Previews.md) page for the customer ID resolution order, the refresh behavior, and troubleshooting.
 
 
 ## Session table quick guide

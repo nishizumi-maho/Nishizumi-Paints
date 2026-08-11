@@ -7,6 +7,7 @@ The General tab is the advanced-mode control panel for app-wide behavior. It doe
 - interface mode
 - startup and background behavior
 - cleanup and self-protection options
+- iRacing UI car previews
 - general download worker mode
 - online fallback lane behavior
 - automatic iRacing Documents detection with optional custom folder override
@@ -53,6 +54,22 @@ The team-driver options are enabled by default. In Team sessions, the app tries 
 The preload option is also enabled by default. When a Team session is detected, the app caches personal paints for team drivers exposed by the iRacing session data. That cache can be applied immediately if one of those drivers later becomes the active driver in the team car.
 
 In 7.0, Team driver swaps are treated conservatively: the app confirms a detected active-driver change before clearing and reapplying files, then schedules short follow-up refreshes so late iRacing or Trading Paints data can still be applied.
+
+## iRacing UI car previews
+
+This panel keeps your own Trading Paints assets in the iRacing paint folder at all times, so the 3D car viewer in the iRacing UI (`My Content > Cars`) always renders your livery instead of the default one.
+
+It exposes:
+
+- `Always show my paints in the iRacing UI car previews`, on by default
+- `Re-check Trading Paints every N minutes`, default 30
+- an optional `iRacing customer ID` override, empty means automatic detection
+- `Sync previews now`
+- a live status line with the car count, the resolved customer ID, and the last check time
+
+The Easy screen shows a compact version of the same panel.
+
+Session cleanup can no longer delete these files, and they are re-installed immediately after each cleanup pass. See [iRacing UI Car Previews](iRacing-UI-Car-Previews) for the full behavior, the customer ID resolution order, and troubleshooting.
 
 ## Download worker mode
 

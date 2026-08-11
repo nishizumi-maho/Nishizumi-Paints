@@ -108,6 +108,20 @@ The two highest-level fallback entrypoints are:
 
 If you want to understand who gets fallback, how lanes are scheduled, or how a fallback result becomes a saved file, this is the right area.
 
+## iRacing UI car preview functions
+
+The always-on iRacing UI previews live in one block just above `DownloaderService`:
+
+- `resolve_iracing_ui_preview_member_id`
+- `iracing_ui_preview_manifest_items`
+- `sync_iracing_ui_car_previews`
+- `install_iracing_ui_car_previews`
+- `clear_iracing_ui_car_previews`
+- `iracing_ui_preview_protected_paths`
+- `read_iracing_hide_car_numbers`
+
+`DownloaderService._maintain_ui_previews` schedules them from the main loop, `_run_ui_preview_worker` performs the work off the loop thread, and `_reassert_ui_previews_now` restores the files right after each cleanup pass.
+
 ## Main session processing
 
 The central session pipeline eventually converges in:

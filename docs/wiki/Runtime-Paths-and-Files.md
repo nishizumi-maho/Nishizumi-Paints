@@ -41,8 +41,19 @@ Examples of other runtime files include:
 - `%APPDATA%\NishizumiPaints\.nishizumi_driver_paint_overrides.json`
 - `%APPDATA%\NishizumiPaints\.nishizumi_random_paint_preferences.json`
 - `%APPDATA%\NishizumiPaints\.nishizumi_tp_login_status.json`
+- `%APPDATA%\NishizumiPaints\.nishizumi_ui_preview_state.json`
 
 These are state files, not repository assets.
+
+## iRacing UI preview mirror
+
+The always-on iRacing UI car previews keep a durable copy of your own Trading Paints assets in:
+
+- `%APPDATA%\Nishizumi-Paints\UiPreviewCache\<iRacing customer id>`
+
+The layout inside that folder mirrors the iRacing paint folder, so `ferrari296gt3\car_<customer id>.tga` in the mirror maps to the same relative path under `{Documents}\iRacing\paint`. Mirrors for customer IDs that are no longer in use are pruned automatically.
+
+The matching index, including the resolved customer ID and the installed-file signatures, lives in `%APPDATA%\NishizumiPaints\.nishizumi_ui_preview_state.json`.
 
 ## Random and collection caches
 
