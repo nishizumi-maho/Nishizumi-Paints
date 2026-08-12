@@ -2,6 +2,28 @@
 
 All notable user-facing changes to Nishizumi Paints are documented here.
 
+## [7.3.0] - 2026-08-11
+
+### Added
+
+- Added an always-on **iRacing UI car previews** system. Your own Trading Paints car, custom number, spec map, decal, helmet, and suit files are kept in the iRacing paint folder at all times, so the 3D car viewer in the iRacing UI (`My Content > Cars`) always renders your livery instead of the default one.
+- Added a durable local mirror of your own paints in `%APPDATA%\Nishizumi-Paints\UiPreviewCache`, so the previews are restored instantly after every session cleanup, even with no internet connection.
+- Added automatic iRacing customer ID detection for the previews, using the live session, the Trading Paints member ID, the AI roster member ID, a confirmed Trading Paints login, and the ID remembered from previous runs, plus a manual override field.
+- Added an "iRacing UI car previews" panel to the General tab and the Easy screen with a live status line, a configurable re-check interval, and a `Sync previews now` button.
+- Added a read-only check of the iRacing `app.ini` `hideCarNum` graphics option so the app can explain why a Custom Number paint is not showing in the preview.
+- Added the `--no-ui-previews` command line switch and the `sync_ui_previews` headless control command.
+
+### Changed
+
+- Session cleanup no longer removes the paint files that back the iRacing UI previews, and it re-installs them immediately after each cleanup pass.
+- Preview files are refreshed from Trading Paints on a timer (30 minutes by default) and only re-downloaded when the manifest URL actually changes.
+- Paints removed from your Trading Paints account stop being previewed, and the matching files are cleaned up from the iRacing paint folder.
+- Turning the previews off removes only the preview files the app itself installed, leaving hand-made or third-party paints untouched.
+
+### Fixed
+
+- Fixed inconsistent iRacing UI car previews: they no longer depend on having just finished a live session with `Keep my livery locally` enabled.
+
 ## [7.2.0] - 2026-06-20
 
 ### Added

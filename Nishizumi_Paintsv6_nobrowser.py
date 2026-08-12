@@ -43,7 +43,7 @@ from requests.adapters import HTTPAdapter
 # Browserless copy: Trading Paints browser automation is intentionally disabled.
 sync_playwright = None
 APP_NAME = "Nishizumi Paints"
-APP_VERSION = "7.2.0"
+APP_VERSION = "7.3.0"
 APP_REGISTRY_NAME = "NishizumiPaints"
 APP_CONFIG_DIRNAME = "NishizumiPaints"
 APP_TOOLTIP = f"{APP_NAME} {APP_VERSION}"
@@ -136,6 +136,17 @@ AI_GENERIC_RANDOM_ROSTER_NAME = "Nishizumi Random AI - Current"
 AI_GENERIC_RANDOM_ROSTER_FOLDER_FALLBACK = "Nishizumi_Random_AI_Current"
 REPLAY_PACK_INDEX_FILENAME = ".nishizumi_replay_packs.json"
 REPLAY_PACK_MANIFEST_FILENAME = "manifest.json"
+IRACING_UI_PREVIEW_CACHE_DIRNAME = "UiPreviewCache"
+IRACING_UI_PREVIEW_STATE_FILENAME = ".nishizumi_ui_preview_state.json"
+IRACING_UI_PREVIEW_STATE_VERSION = 1
+IRACING_UI_PREVIEW_DEFAULT_REFRESH_MINUTES = 30
+IRACING_UI_PREVIEW_MIN_REFRESH_MINUTES = 5
+IRACING_UI_PREVIEW_MAX_REFRESH_MINUTES = 1440
+IRACING_UI_PREVIEW_REASSERT_SECONDS = 20.0
+IRACING_UI_PREVIEW_RETRY_SECONDS = 120.0
+IRACING_UI_PREVIEW_STARTUP_DELAY_SECONDS = 5.0
+IRACING_UI_PREVIEW_DOWNLOAD_WORKERS = 4
+IRACING_APP_INI_FILENAME = "app.ini"
 SDK_UNCHANGED_FORCE_REFRESH_SECONDS = 1.5
 SESSION_CANCEL_POLL_SECONDS = 0.75
 REPLAY_PACK_ACTIVE_SCAN_SECONDS = 2.5
@@ -1395,6 +1406,7 @@ class HeadlessControlServer:
         if command == "status":
             snapshot = self._service.get_runtime_snapshot()
             current_session = snapshot.current_session.session_id.folder_name() if snapshot.current_session is not None else ""
+            preview_status = self._service.get_ui_preview_status()
             return {
                 "ok": True,
                 "mode": "headless",
@@ -1403,7 +1415,14 @@ class HeadlessControlServer:
                 "current_session": current_session,
                 "session_driver_count": len(snapshot.session_rows),
                 "replay_mode_active": bool(getattr(snapshot, "replay_mode_active", False)),
+                "ui_preview_state": preview_status.state,
+                "ui_preview_message": preview_status.message,
+                "ui_preview_member_id": int(preview_status.member_id),
+                "ui_preview_cars": int(preview_status.car_directories),
             }
+        if command == "sync_ui_previews":
+            self._service.request_ui_preview_sync()
+            return {"ok": True, "requested": True}
         if command == "reload_config":
             config = self._config_store.load()
             self._service.update_config(config)
@@ -2602,6 +2621,14 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=1.0,
         help="Base retry backoff in seconds. Attempts wait 1x, 2x, 4x... (default: 1.0).",
+    )
+    parser.add_argument(
+        "--no-ui-previews",
+        action="store_true",
+        help=(
+            "Do not keep your own paints in the iRacing paint folder for the iRacing UI 3D car viewer. "
+            "By default the previews are always kept up to date."
+        ),
     )
     launch_group = parser.add_mutually_exclusive_group()
     launch_group.add_argument(
@@ -17112,14 +17139,18 @@ def delete_saved(
     files: Iterable[SavedFile],
     keep_targets: set[tuple[bool, int]] | None = None,
     paints_root: Path | None = None,
+    protected_paths: set[str] | None = None,
 ) -> list[SavedFile]:
     kept: list[SavedFile] = []
     to_delete: list[SavedFile] = []
+    protected = {str(path).lower() for path in (protected_paths or set())}
     for f in files:
         target_key = (bool(f.download_id.is_team_paint), int(f.download_id.user_id))
         if bool(getattr(f.download_id, "preserve_on_cleanup", False)):
             kept.append(f)
         elif keep_targets and target_key in keep_targets:
+            kept.append(f)
+        elif protected and str(f.file_path).lower() in protected:
             kept.append(f)
         else:
             to_delete.append(f)
@@ -18716,6 +18747,9 @@ class AppConfig:
     delete_downloaded_livery: bool = True
     sync_my_livery_from_server: bool = True
     keep_my_livery_locally: bool = True
+    iracing_ui_car_previews: bool = True
+    iracing_ui_preview_refresh_minutes: int = IRACING_UI_PREVIEW_DEFAULT_REFRESH_MINUTES
+    iracing_ui_preview_member_id: int = 0
     sync_ai_rosters_from_server: bool = True
     ai_roster_member_id_override: int = 0
     ai_roster_member_id_auto_filled: bool = False
@@ -18881,6 +18915,11 @@ class ConfigStore:
         config.delete_downloaded_livery = bool(config.delete_downloaded_livery)
         config.sync_my_livery_from_server = bool(config.sync_my_livery_from_server)
         config.keep_my_livery_locally = bool(config.keep_my_livery_locally)
+        config.iracing_ui_car_previews = bool(getattr(config, "iracing_ui_car_previews", True))
+        config.iracing_ui_preview_refresh_minutes = normalize_iracing_ui_preview_refresh_minutes(
+            getattr(config, "iracing_ui_preview_refresh_minutes", IRACING_UI_PREVIEW_DEFAULT_REFRESH_MINUTES)
+        )
+        config.iracing_ui_preview_member_id = normalize_tp_member_id(getattr(config, "iracing_ui_preview_member_id", 0))
         config.sync_ai_rosters_from_server = bool(getattr(config, "sync_ai_rosters_from_server", True))
         config.ai_roster_member_id_override = normalize_tp_member_id(getattr(config, "ai_roster_member_id_override", 0))
         config.ai_roster_member_id_auto_filled = bool(getattr(config, "ai_roster_member_id_auto_filled", False))
@@ -19077,6 +19116,724 @@ def build_tp_ceiling_hint(download_stats: StageTransferStats) -> str:
     if high - low <= 1:
         return f"Approx observed ceiling: ~{int(round(effective))} parallel downloads"
     return f"Approx observed ceiling: ~{low}-{high} parallel downloads"
+
+
+# ---------------------------------------------------------------------------
+# iRacing UI car previews
+#
+# The iRacing UI renders a car in its 3D viewer (My Content -> Cars -> vehicle)
+# by reading the very same custom paint files the sim uses, taken from
+# ``Documents\iRacing\paint\<car directory>\car_<customer id>.tga`` (plus the
+# matching ``car_num_``, ``car_spec_`` and ``decal_`` files, and the root-level
+# ``helmet_<customer id>.tga`` / ``suit_<customer id>.tga``). The UI reloads the
+# preview whenever those files change on disk.
+#
+# The catch is that the session pipeline only writes those files while a session
+# is live and removes them again on cleanup, so the previews were only correct by
+# accident. This subsystem keeps a durable AppData mirror of the local driver's
+# own Trading Paints assets and re-installs it into the iRacing paint folder
+# whenever iRacing is idle, so the UI previews are always present and current.
+# ---------------------------------------------------------------------------
+IRACING_UI_PREVIEW_PAINT_TYPES: tuple[PaintType, ...] = (
+    PaintType.CAR,
+    PaintType.CAR_NUMBER,
+    PaintType.CAR_SPEC,
+    PaintType.CAR_DECAL,
+    PaintType.HELMET,
+    PaintType.SUIT,
+)
+_IRACING_UI_PREVIEW_STATE_LOCK = threading.Lock()
+_IRACING_UI_PREVIEW_PROTECTED_PATHS: set[str] = set()
+_IRACING_UI_PREVIEW_PROTECTED_LOCK = threading.Lock()
+
+
+@dataclass(frozen=True)
+class IracingUiPreviewSyncResult:
+    ok: bool = False
+    member_id: int = 0
+    member_id_source: str = ""
+    manifest_items: int = 0
+    downloaded: int = 0
+    installed: int = 0
+    files_in_place: int = 0
+    removed: int = 0
+    cached_files: int = 0
+    car_directories: int = 0
+    custom_number_cars: int = 0
+    hide_car_numbers: bool | None = None
+    message: str = ""
+    logs: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class IracingUiPreviewStatus:
+    enabled: bool = True
+    state: str = "idle"
+    message: str = "Waiting for the first iRacing UI preview sync."
+    member_id: int = 0
+    member_id_source: str = ""
+    car_directories: int = 0
+    cached_files: int = 0
+    installed_files: int = 0
+    custom_number_cars: int = 0
+    hide_car_numbers: bool | None = None
+    last_sync_at: float = 0.0
+    last_success_at: float = 0.0
+    syncing: bool = False
+
+
+def default_iracing_ui_preview_cache_dir() -> Path:
+    appdata = os.getenv("APPDATA")
+    if appdata:
+        return Path(appdata) / "Nishizumi-Paints" / IRACING_UI_PREVIEW_CACHE_DIRNAME
+    return Path.home() / "AppData" / "Roaming" / "Nishizumi-Paints" / IRACING_UI_PREVIEW_CACHE_DIRNAME
+
+
+def default_iracing_ui_preview_state_path() -> Path:
+    appdata = os.getenv("APPDATA")
+    if appdata:
+        return Path(appdata) / APP_CONFIG_DIRNAME / IRACING_UI_PREVIEW_STATE_FILENAME
+    return Path.home() / f".{APP_CONFIG_DIRNAME.lower()}_{IRACING_UI_PREVIEW_STATE_FILENAME}"
+
+
+def _empty_iracing_ui_preview_state() -> dict[str, object]:
+    return {
+        "version": IRACING_UI_PREVIEW_STATE_VERSION,
+        "member_id": 0,
+        "member_id_source": "",
+        "last_sync_at": 0.0,
+        "last_success_at": 0.0,
+        "entries": {},
+    }
+
+
+def load_iracing_ui_preview_state(path: Path | None = None) -> dict[str, object]:
+    resolved = Path(path) if path is not None else default_iracing_ui_preview_state_path()
+    state = _empty_iracing_ui_preview_state()
+    try:
+        raw = json.loads(resolved.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return state
+    except Exception:
+        logging.debug("Could not read the iRacing UI preview state file", exc_info=True)
+        return state
+    if not isinstance(raw, dict):
+        return state
+    if int(raw.get("version") or 0) != IRACING_UI_PREVIEW_STATE_VERSION:
+        return state
+    entries = raw.get("entries")
+    state["member_id"] = normalize_tp_member_id(raw.get("member_id"))
+    state["member_id_source"] = str(raw.get("member_id_source") or "")
+    try:
+        state["last_sync_at"] = float(raw.get("last_sync_at") or 0.0)
+    except Exception:
+        state["last_sync_at"] = 0.0
+    try:
+        state["last_success_at"] = float(raw.get("last_success_at") or 0.0)
+    except Exception:
+        state["last_success_at"] = 0.0
+    if isinstance(entries, dict):
+        clean: dict[str, dict[str, object]] = {}
+        for key, value in entries.items():
+            if isinstance(key, str) and isinstance(value, dict):
+                clean[key] = dict(value)
+        state["entries"] = clean
+    return state
+
+
+def save_iracing_ui_preview_state(state: dict[str, object], path: Path | None = None) -> None:
+    resolved = Path(path) if path is not None else default_iracing_ui_preview_state_path()
+    payload = dict(state or {})
+    payload["version"] = IRACING_UI_PREVIEW_STATE_VERSION
+    try:
+        resolved.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = resolved.with_name(resolved.name + ".tmp")
+        temp_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        os.replace(temp_path, resolved)
+    except Exception:
+        logging.debug("Could not persist the iRacing UI preview state file", exc_info=True)
+
+
+def remember_iracing_ui_preview_member_id(member_id: object, source: str = "", path: Path | None = None) -> int:
+    normalized = normalize_tp_member_id(member_id)
+    if normalized <= 0:
+        return 0
+    with _IRACING_UI_PREVIEW_STATE_LOCK:
+        state = load_iracing_ui_preview_state(path)
+        if normalize_tp_member_id(state.get("member_id")) == normalized:
+            return normalized
+        state["member_id"] = normalized
+        state["member_id_source"] = str(source or "")
+        save_iracing_ui_preview_state(state, path)
+    return normalized
+
+
+def resolve_iracing_ui_preview_member_id(
+    config: AppConfig | None = None,
+    live_member_id: object = 0,
+    state_path: Path | None = None,
+) -> tuple[int, str]:
+    """Resolve the iRacing customer ID whose paints drive the UI previews.
+
+    The UI viewer only ever renders ``car_<customer id>.tga``, so a wrong ID
+    means silently empty previews. Every known source is tried in order of how
+    trustworthy it is, ending on the value persisted from a previous run so the
+    previews still work before iRacing has been started even once.
+    """
+    manual = normalize_tp_member_id(getattr(config, "iracing_ui_preview_member_id", 0)) if config is not None else 0
+    if manual > 0:
+        return manual, "manual"
+    live = normalize_tp_member_id(live_member_id)
+    if live > 0:
+        return live, "iRacing session"
+    if config is not None:
+        override = normalize_tp_member_id(getattr(config, "tp_manifest_member_id_override", 0))
+        if override > 0:
+            return override, "Trading Paints member ID"
+        roster_override = normalize_tp_member_id(getattr(config, "ai_roster_member_id_override", 0))
+        if roster_override > 0:
+            return roster_override, "AI roster member ID"
+    try:
+        login_member_id = normalize_tp_member_id(read_tp_login_status().get("member_id"))
+    except Exception:
+        login_member_id = 0
+    if login_member_id > 0:
+        return login_member_id, "Trading Paints login"
+    try:
+        remembered = normalize_tp_member_id(load_iracing_ui_preview_state(state_path).get("member_id"))
+    except Exception:
+        remembered = 0
+    if remembered > 0:
+        return remembered, "saved from a previous run"
+    return 0, ""
+
+
+def normalize_iracing_ui_preview_refresh_minutes(value: object) -> int:
+    try:
+        minutes = int(float(value))
+    except Exception:
+        minutes = IRACING_UI_PREVIEW_DEFAULT_REFRESH_MINUTES
+    return max(IRACING_UI_PREVIEW_MIN_REFRESH_MINUTES, min(IRACING_UI_PREVIEW_MAX_REFRESH_MINUTES, minutes))
+
+
+def read_iracing_hide_car_numbers(documents_dir: Path | str | None = None) -> bool | None:
+    """Read ``[Graphics] hideCarNum`` from the iRacing ``app.ini``.
+
+    iRacing only uses a Custom Number paint (``car_num_<id>.tga``) when the
+    "Hide car numbers" graphics option is on. This is read-only: the app never
+    edits iRacing settings, it just reports the mismatch so a blank-looking
+    preview can be explained.
+    """
+    try:
+        root = resolve_iracing_documents_dir(documents_dir)
+        ini_path = Path(root) / IRACING_APP_INI_FILENAME
+        if not ini_path.is_file():
+            return None
+        text = ini_path.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return None
+    section = ""
+    for raw_line in text.splitlines():
+        line = raw_line.split(";", 1)[0].strip()
+        if not line:
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1].strip().lower()
+            continue
+        if section != "graphics" or "=" not in line:
+            continue
+        key, _sep, value = line.partition("=")
+        if key.strip().lower() != "hidecarnum":
+            continue
+        try:
+            return bool(int(float(value.strip())))
+        except Exception:
+            return value.strip().lower() in {"true", "yes", "on"}
+    return None
+
+
+def iracing_ui_preview_manifest_items(items: Iterable[DownloadFile], member_id: int) -> list[DownloadFile]:
+    """Pick the local driver's own manifest assets that drive the UI previews.
+
+    Team paints are excluded on purpose: they land on ``car_team_<team>.tga``,
+    which the UI viewer never reads. Superspeedway variants are dropped too,
+    because the viewer always renders the standard paint.
+    """
+    target_id = normalize_tp_member_id(member_id)
+    if target_id <= 0:
+        return []
+    candidates = [
+        item
+        for item in items or []
+        if str(item.url or "").strip()
+        and not bool(item.download_id.is_team_paint)
+        and item.download_id.paint_type in IRACING_UI_PREVIEW_PAINT_TYPES
+        and int(item.download_id.user_id) == target_id
+        and not bool(item.download_id.is_superspeedway_variant)
+    ]
+    return _select_manifest_variants_for_track(False, candidates)
+
+
+def _iracing_ui_preview_member_cache_root(cache_dir: Path, member_id: int) -> Path:
+    return Path(cache_dir) / str(normalize_tp_member_id(member_id))
+
+
+def _iracing_ui_preview_entry_key(paints_dir: Path, download_id: DownloadId) -> str:
+    destination = save_path_for(download_id, Path(paints_dir))
+    try:
+        relative = destination.relative_to(Path(paints_dir))
+    except ValueError:
+        relative = Path(destination.name)
+    return str(relative).replace("/", "\\").lower()
+
+
+def _file_signature(path: Path) -> tuple[int, int] | None:
+    try:
+        stat_result = path.stat()
+    except OSError:
+        return None
+    return int(stat_result.st_size), int(stat_result.st_mtime_ns)
+
+
+def _iracing_ui_preview_store_download(downloaded: DownloadedFile, cache_root: Path) -> Path | None:
+    """Move one freshly downloaded asset into the durable preview mirror."""
+    source = downloaded.file_path
+    try:
+        destination = save_path_for(downloaded.download_id, Path(cache_root))
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = destination.with_name(destination.name + ".tmp")
+        temp_path.unlink(missing_ok=True)
+        if source.suffix.lower() == ".bz2":
+            with source.open("rb") as handle, bz2.open(handle, "rb") as decompressor, temp_path.open("wb") as out:
+                shutil.copyfileobj(decompressor, out)
+        else:
+            shutil.copy2(source, temp_path)
+        os.replace(temp_path, destination)
+    except Exception as exc:  # noqa: BLE001
+        logging.debug("Could not cache iRacing UI preview asset %s: %s", source, exc)
+        return None
+    finally:
+        source.unlink(missing_ok=True)
+    return destination
+
+
+def _install_iracing_ui_preview_file(cache_path: Path, destination: Path) -> bool:
+    """Copy one cached asset into the iRacing paint folder atomically."""
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = destination.with_name(destination.name + ".nptmp")
+        temp_path.unlink(missing_ok=True)
+        shutil.copy2(cache_path, temp_path)
+        os.replace(temp_path, destination)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logging.debug("Could not install iRacing UI preview file %s -> %s: %s", cache_path, destination, exc)
+        try:
+            destination.with_name(destination.name + ".nptmp").unlink(missing_ok=True)
+        except Exception:
+            pass
+        return False
+
+
+def _set_iracing_ui_preview_protected_paths(paths: Iterable[Path | str]) -> None:
+    normalized = {str(path).lower() for path in paths}
+    with _IRACING_UI_PREVIEW_PROTECTED_LOCK:
+        _IRACING_UI_PREVIEW_PROTECTED_PATHS.clear()
+        _IRACING_UI_PREVIEW_PROTECTED_PATHS.update(normalized)
+
+
+def iracing_ui_preview_protected_paths() -> set[str]:
+    with _IRACING_UI_PREVIEW_PROTECTED_LOCK:
+        return set(_IRACING_UI_PREVIEW_PROTECTED_PATHS)
+
+
+def install_iracing_ui_car_previews(
+    *,
+    member_id: int,
+    paints_dir: Path,
+    cache_dir: Path | None = None,
+    state_path: Path | None = None,
+) -> tuple[int, int]:
+    """Re-install every cached preview asset that is missing or was replaced.
+
+    This never touches the network, so it is cheap enough to run whenever
+    iRacing is idle. Files already matching the recorded signature are skipped,
+    which keeps the steady-state cost at one ``stat`` per asset.
+    """
+    target_id = normalize_tp_member_id(member_id)
+    if target_id <= 0:
+        return 0, 0
+    resolved_cache = Path(cache_dir) if cache_dir is not None else default_iracing_ui_preview_cache_dir()
+    cache_root = _iracing_ui_preview_member_cache_root(resolved_cache, target_id)
+    paints_root = Path(paints_dir)
+    installed = 0
+    present = 0
+    protected: list[str] = []
+    with _IRACING_UI_PREVIEW_STATE_LOCK:
+        state = load_iracing_ui_preview_state(state_path)
+        if normalize_tp_member_id(state.get("member_id")) != target_id:
+            _set_iracing_ui_preview_protected_paths([])
+            return 0, 0
+        entries = state.get("entries")
+        if not isinstance(entries, dict) or not entries:
+            _set_iracing_ui_preview_protected_paths([])
+            return 0, 0
+        changed = False
+        for key, entry in entries.items():
+            cache_relative = str(entry.get("cache") or key)
+            try:
+                cache_path = safe_join_under(cache_root, *[part for part in cache_relative.split("\\") if part])
+                destination = safe_join_under(paints_root, *[part for part in key.split("\\") if part])
+            except ValueError:
+                continue
+            if not cache_path.is_file():
+                continue
+            protected.append(str(destination))
+            expected_size = int(entry.get("installed_size") or 0)
+            expected_mtime = int(entry.get("installed_mtime_ns") or 0)
+            signature = _file_signature(destination)
+            if signature is not None and expected_size > 0 and signature == (expected_size, expected_mtime):
+                present += 1
+                continue
+            if not _install_iracing_ui_preview_file(cache_path, destination):
+                continue
+            new_signature = _file_signature(destination)
+            if new_signature is not None:
+                entry["installed_size"] = new_signature[0]
+                entry["installed_mtime_ns"] = new_signature[1]
+                changed = True
+            installed += 1
+            present += 1
+        if changed:
+            save_iracing_ui_preview_state(state, state_path)
+    _set_iracing_ui_preview_protected_paths(protected)
+    if installed:
+        logging.info(
+            "Restored %s iRacing UI car preview file(s) for member %s so the UI 3D viewer keeps showing your paints.",
+            installed,
+            target_id,
+        )
+    return installed, present
+
+
+def clear_iracing_ui_car_previews(
+    *,
+    paints_dir: Path,
+    cache_dir: Path | None = None,
+    state_path: Path | None = None,
+    remove_cache: bool = True,
+) -> tuple[int, int]:
+    """Remove installed preview files (and optionally the mirror) again."""
+    resolved_cache = Path(cache_dir) if cache_dir is not None else default_iracing_ui_preview_cache_dir()
+    paints_root = Path(paints_dir)
+    removed_installed = 0
+    removed_cached = 0
+    with _IRACING_UI_PREVIEW_STATE_LOCK:
+        state = load_iracing_ui_preview_state(state_path)
+        member_id = normalize_tp_member_id(state.get("member_id"))
+        entries = state.get("entries")
+        entries = entries if isinstance(entries, dict) else {}
+        cache_root = _iracing_ui_preview_member_cache_root(resolved_cache, member_id) if member_id > 0 else None
+        for key, entry in entries.items():
+            try:
+                destination = safe_join_under(paints_root, *[part for part in key.split("\\") if part])
+            except ValueError:
+                continue
+            expected = (int(entry.get("installed_size") or 0), int(entry.get("installed_mtime_ns") or 0))
+            signature = _file_signature(destination)
+            if signature is not None and expected[0] > 0 and signature == expected:
+                if _hard_delete_file(destination, paints_root=paints_root):
+                    removed_installed += 1
+            if remove_cache and cache_root is not None:
+                cache_relative = str(entry.get("cache") or key)
+                try:
+                    cache_path = safe_join_under(cache_root, *[part for part in cache_relative.split("\\") if part])
+                except ValueError:
+                    continue
+                try:
+                    if cache_path.is_file():
+                        cache_path.unlink()
+                        removed_cached += 1
+                except OSError:
+                    continue
+        if remove_cache:
+            state["entries"] = {}
+            save_iracing_ui_preview_state(state, state_path)
+    if remove_cache:
+        _set_iracing_ui_preview_protected_paths([])
+    return removed_installed, removed_cached
+
+
+def sync_iracing_ui_car_previews(
+    *,
+    member_id: int,
+    member_id_source: str = "",
+    paints_dir: Path,
+    cache_dir: Path | None = None,
+    state_path: Path | None = None,
+    retries: int = 3,
+    retry_backoff_seconds: float = 1.0,
+    cancel_event: threading.Event | None = None,
+    log: Callable[[str], None] | None = None,
+    force: bool = False,
+) -> IracingUiPreviewSyncResult:
+    """Refresh the local mirror from Trading Paints and install it for the UI.
+
+    Only assets whose manifest URL changed are re-downloaded, so a periodic
+    refresh normally costs one small manifest request.
+    """
+    logs: list[str] = []
+
+    def write(message: str) -> None:
+        logs.append(message)
+        if log is not None:
+            try:
+                log(message)
+            except Exception:
+                pass
+
+    target_id = normalize_tp_member_id(member_id)
+    if target_id <= 0:
+        return IracingUiPreviewSyncResult(
+            ok=False,
+            message="No iRacing customer ID is known yet, so the iRacing UI car previews cannot be synced.",
+            logs=tuple(logs),
+        )
+    resolved_cache = Path(cache_dir) if cache_dir is not None else default_iracing_ui_preview_cache_dir()
+    cache_root = _iracing_ui_preview_member_cache_root(resolved_cache, target_id)
+    paints_root = Path(paints_dir)
+    cache_root.mkdir(parents=True, exist_ok=True)
+    paints_root.mkdir(parents=True, exist_ok=True)
+    try:
+        manifest_items = fetch_user_files(
+            target_id,
+            retries=max(1, int(retries)),
+            retry_backoff_seconds=max(0.1, float(retry_backoff_seconds)),
+            cancel_event=cancel_event,
+        )
+    except Exception as exc:  # noqa: BLE001
+        write(f"Could not read the Trading Paints manifest for member {target_id}: {exc}")
+        return IracingUiPreviewSyncResult(
+            ok=False,
+            member_id=target_id,
+            member_id_source=member_id_source,
+            message=f"Trading Paints manifest unavailable: {exc}",
+            logs=tuple(logs),
+        )
+    if _cancel_requested(cancel_event):
+        return IracingUiPreviewSyncResult(
+            ok=False,
+            member_id=target_id,
+            member_id_source=member_id_source,
+            message="iRacing UI preview sync cancelled.",
+            logs=tuple(logs),
+        )
+    wanted = iracing_ui_preview_manifest_items(manifest_items, target_id)
+    wanted_by_key: dict[str, DownloadFile] = {}
+    for item in wanted:
+        try:
+            wanted_by_key[_iracing_ui_preview_entry_key(paints_root, item.download_id)] = item
+        except ValueError:
+            continue
+    with _IRACING_UI_PREVIEW_STATE_LOCK:
+        state = load_iracing_ui_preview_state(state_path)
+        previous_member_id = normalize_tp_member_id(state.get("member_id"))
+        entries = state.get("entries")
+        entries = dict(entries) if isinstance(entries, dict) else {}
+    if previous_member_id != target_id:
+        if previous_member_id > 0 and entries:
+            write(f"iRacing customer ID changed from {previous_member_id} to {target_id}. Rebuilding the UI previews.")
+            clear_iracing_ui_car_previews(
+                paints_dir=paints_root,
+                cache_dir=resolved_cache,
+                state_path=state_path,
+                remove_cache=True,
+            )
+        entries = {}
+    pending: list[DownloadFile] = []
+    for key, item in wanted_by_key.items():
+        entry = entries.get(key) if isinstance(entries.get(key), dict) else None
+        cache_path = save_path_for(item.download_id, cache_root)
+        if force or entry is None or str(entry.get("url") or "") != str(item.url or "") or not cache_path.is_file():
+            pending.append(item)
+    downloaded_count = 0
+    if pending:
+        write(f"Refreshing {len(pending)} iRacing UI preview asset(s) for member {target_id}.")
+        temp_root = default_temp_dir() / "UiPreviewDownloads"
+        temp_session_id = SessionId(int(time.time() * 1000), None)
+        worker_count = max(1, min(IRACING_UI_PREVIEW_DOWNLOAD_WORKERS, len(pending)))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="NishizumiUiPreview") as executor:
+            future_map = {
+                executor.submit(
+                    download_file,
+                    temp_session_id,
+                    temp_root,
+                    item,
+                    max(1, int(retries)),
+                    max(0.1, float(retry_backoff_seconds)),
+                    index,
+                    len(pending),
+                    None,
+                    cancel_event,
+                ): item
+                for index, item in enumerate(pending, start=1)
+            }
+            for future in concurrent.futures.as_completed(future_map):
+                item = future_map[future]
+                try:
+                    downloaded = future.result()
+                except Exception as exc:  # noqa: BLE001
+                    write(f"iRacing UI preview download failed for {item.url}: {exc}")
+                    continue
+                if downloaded is None:
+                    write(f"iRacing UI preview asset unavailable: {item.download_id.paint_type.value} {item.url}")
+                    continue
+                cached_path = _iracing_ui_preview_store_download(downloaded, cache_root)
+                if cached_path is None:
+                    continue
+                try:
+                    key = _iracing_ui_preview_entry_key(paints_root, item.download_id)
+                    cache_relative = str(cached_path.relative_to(cache_root)).replace("/", "\\")
+                except (ValueError, OSError):
+                    continue
+                entries[key] = {
+                    "url": str(item.url or ""),
+                    "cache": cache_relative,
+                    "paint_type": item.download_id.paint_type.value,
+                    "directory": str(item.download_id.directory or ""),
+                    "cached_at": time.time(),
+                    "installed_size": 0,
+                    "installed_mtime_ns": 0,
+                }
+                downloaded_count += 1
+        shutil.rmtree(temp_root / temp_session_id.folder_name(), ignore_errors=True)
+    removed_count = 0
+    for key in [key for key in entries if key not in wanted_by_key]:
+        entry = entries.pop(key)
+        if not isinstance(entry, dict):
+            continue
+        try:
+            destination = safe_join_under(paints_root, *[part for part in key.split("\\") if part])
+        except ValueError:
+            continue
+        expected = (int(entry.get("installed_size") or 0), int(entry.get("installed_mtime_ns") or 0))
+        signature = _file_signature(destination)
+        if signature is not None and expected[0] > 0 and signature == expected:
+            if _hard_delete_file(destination, paints_root=paints_root):
+                removed_count += 1
+        cache_relative = str(entry.get("cache") or key)
+        try:
+            cache_path = safe_join_under(cache_root, *[part for part in cache_relative.split("\\") if part])
+            cache_path.unlink(missing_ok=True)
+        except (ValueError, OSError):
+            pass
+    now = time.time()
+    with _IRACING_UI_PREVIEW_STATE_LOCK:
+        state = load_iracing_ui_preview_state(state_path)
+        state["member_id"] = target_id
+        state["member_id_source"] = str(member_id_source or state.get("member_id_source") or "")
+        state["entries"] = entries
+        state["last_sync_at"] = now
+        if wanted_by_key:
+            state["last_success_at"] = now
+        save_iracing_ui_preview_state(state, state_path)
+    installed_count, present_count = install_iracing_ui_car_previews(
+        member_id=target_id,
+        paints_dir=paints_root,
+        cache_dir=resolved_cache,
+        state_path=state_path,
+    )
+    _prune_iracing_ui_preview_cache_roots(resolved_cache, target_id)
+    car_directories = sorted(
+        {
+            str(item.download_id.directory or "").lower()
+            for item in wanted_by_key.values()
+            if _is_car_related_paint_type(item.download_id.paint_type)
+        }
+        - {""}
+    )
+    custom_number_cars = sorted(
+        {
+            str(item.download_id.directory or "").lower()
+            for item in wanted_by_key.values()
+            if item.download_id.paint_type is PaintType.CAR_NUMBER
+        }
+        - {""}
+    )
+    hide_car_numbers = read_iracing_hide_car_numbers(paints_root)
+    if not wanted_by_key:
+        message = (
+            f"Trading Paints returned no personal paints for member {target_id}, "
+            "so there is nothing to preview in the iRacing UI yet."
+        )
+        write(message)
+        return IracingUiPreviewSyncResult(
+            ok=True,
+            member_id=target_id,
+            member_id_source=member_id_source,
+            manifest_items=0,
+            downloaded=downloaded_count,
+            installed=installed_count,
+            removed=removed_count,
+            cached_files=0,
+            car_directories=0,
+            custom_number_cars=0,
+            hide_car_numbers=hide_car_numbers,
+            message=message,
+            logs=tuple(logs),
+        )
+    complete = present_count >= len(wanted_by_key)
+    message = (
+        f"iRacing UI previews ready for {len(car_directories)} car(s) "
+        f"({present_count}/{len(wanted_by_key)} file(s) in place)."
+        if complete
+        else (
+            f"Only {present_count} of {len(wanted_by_key)} iRacing UI preview file(s) could be put in place. "
+            "The remaining Trading Paints assets will be retried on the next check."
+        )
+    )
+    write(message)
+    if custom_number_cars and hide_car_numbers is False:
+        warning = (
+            "Custom Number paints were synced, but iRacing has \"Hide car numbers\" turned off. "
+            "Turn it on in iRacing Settings > Graphics so the UI preview uses your custom number art."
+        )
+        write(warning)
+        logging.warning(warning)
+    return IracingUiPreviewSyncResult(
+        ok=complete,
+        member_id=target_id,
+        member_id_source=member_id_source,
+        manifest_items=len(wanted_by_key),
+        downloaded=downloaded_count,
+        installed=installed_count,
+        files_in_place=present_count,
+        removed=removed_count,
+        cached_files=len(entries),
+        car_directories=len(car_directories),
+        custom_number_cars=len(custom_number_cars),
+        hide_car_numbers=hide_car_numbers,
+        message=message,
+        logs=tuple(logs),
+    )
+
+
+def _prune_iracing_ui_preview_cache_roots(cache_dir: Path, keep_member_id: int) -> None:
+    """Drop mirrors belonging to customer IDs that are no longer in use."""
+    keep = str(normalize_tp_member_id(keep_member_id))
+    try:
+        children = [child for child in Path(cache_dir).iterdir() if child.is_dir()]
+    except OSError:
+        return
+    for child in children:
+        if child.name == keep:
+            continue
+        try:
+            shutil.rmtree(child, ignore_errors=True)
+        except Exception:
+            logging.debug("Could not prune stale iRacing UI preview cache %s", child, exc_info=True)
+
+
 class DownloaderService:
     def __init__(self, config: AppConfig, log_queue: BoundedLogQueue | None = None) -> None:
         self._config = replace(config)
@@ -19091,6 +19848,12 @@ class DownloaderService:
         self._clear_current_event = threading.Event()
         self._sync_ai_rosters_event = threading.Event()
         self._global_texture_reload_event = threading.Event()
+        self._ui_preview_sync_event = threading.Event()
+        self._ui_preview_status = IracingUiPreviewStatus()
+        self._ui_preview_worker_active = False
+        self._ui_preview_member_id = 0
+        self._ui_preview_next_full_sync_at = 0.0
+        self._ui_preview_next_reassert_at = 0.0
         self._monitor_snapshot = ThroughputMonitorSnapshot()
         self._runtime_snapshot = RuntimeSnapshot()
         self._runtime_snapshot_version = 0
@@ -19321,7 +20084,18 @@ class DownloaderService:
     def update_config(self, config: AppConfig) -> None:
         normalized = enforce_hidden_tp_speed_modes(replace(config))
         with self._lock:
+            previous = self._config
             self._config = normalized
+            preview_settings_changed = (
+                bool(getattr(previous, "iracing_ui_car_previews", True)) != bool(getattr(normalized, "iracing_ui_car_previews", True))
+                or normalize_tp_member_id(getattr(previous, "iracing_ui_preview_member_id", 0))
+                != normalize_tp_member_id(getattr(normalized, "iracing_ui_preview_member_id", 0))
+                or normalize_iracing_ui_preview_refresh_minutes(getattr(previous, "iracing_ui_preview_refresh_minutes", 0))
+                != normalize_iracing_ui_preview_refresh_minutes(getattr(normalized, "iracing_ui_preview_refresh_minutes", 0))
+            )
+            if preview_settings_changed:
+                self._ui_preview_next_full_sync_at = 0.0
+                self._ui_preview_next_reassert_at = 0.0
         root = logging.getLogger()
         root.setLevel(logging.DEBUG if normalized.verbose else logging.INFO)
         logging.debug(
@@ -19600,6 +20374,205 @@ class DownloaderService:
         self._sync_ai_rosters_event.set()
     def request_global_texture_reload(self) -> None:
         self._global_texture_reload_event.set()
+    def request_ui_preview_sync(self) -> None:
+        self._ui_preview_sync_event.set()
+    def get_ui_preview_status(self) -> IracingUiPreviewStatus:
+        with self._lock:
+            return replace(self._ui_preview_status)
+    def _set_ui_preview_status(self, **updates: object) -> None:
+        with self._lock:
+            self._ui_preview_status = replace(self._ui_preview_status, **updates)
+    def _run_ui_preview_worker(
+        self,
+        *,
+        config: AppConfig,
+        paints_dir: Path,
+        member_id: int,
+        member_id_source: str,
+        do_full_sync: bool,
+    ) -> None:
+        cache_dir = default_iracing_ui_preview_cache_dir()
+        try:
+            if do_full_sync:
+                self._set_ui_preview_status(syncing=True, state="syncing", message="Syncing your paints for the iRacing UI previews...")
+                result = sync_iracing_ui_car_previews(
+                    member_id=member_id,
+                    member_id_source=member_id_source,
+                    paints_dir=paints_dir,
+                    cache_dir=cache_dir,
+                    retries=positive_int(getattr(config, "retries", 3), 3),
+                    retry_backoff_seconds=max(0.1, float(getattr(config, "retry_backoff_seconds", 1.0))),
+                    cancel_event=self._stop_event,
+                )
+                refresh_minutes = normalize_iracing_ui_preview_refresh_minutes(
+                    getattr(config, "iracing_ui_preview_refresh_minutes", IRACING_UI_PREVIEW_DEFAULT_REFRESH_MINUTES)
+                )
+                now = time.monotonic()
+                with self._lock:
+                    self._ui_preview_next_full_sync_at = now + (
+                        refresh_minutes * 60.0 if result.ok else IRACING_UI_PREVIEW_RETRY_SECONDS
+                    )
+                    self._ui_preview_member_id = member_id if result.ok else self._ui_preview_member_id
+                if result.ok:
+                    logging.info("iRacing UI car previews: %s", result.message)
+                    state_label = "ok"
+                elif result.files_in_place > 0:
+                    logging.warning("iRacing UI car previews are incomplete: %s", result.message)
+                    state_label = "warning"
+                else:
+                    logging.warning("iRacing UI car previews could not be synced: %s", result.message)
+                    state_label = "error"
+                self._set_ui_preview_status(
+                    state=state_label,
+                    message=result.message,
+                    member_id=member_id,
+                    member_id_source=member_id_source,
+                    car_directories=result.car_directories,
+                    cached_files=result.cached_files,
+                    installed_files=result.files_in_place,
+                    custom_number_cars=result.custom_number_cars,
+                    hide_car_numbers=result.hide_car_numbers,
+                    last_sync_at=time.time(),
+                    last_success_at=time.time() if result.ok else self.get_ui_preview_status().last_success_at,
+                )
+            else:
+                install_iracing_ui_car_previews(
+                    member_id=member_id,
+                    paints_dir=paints_dir,
+                    cache_dir=cache_dir,
+                )
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("iRacing UI car preview maintenance failed: %s", exc)
+            logging.debug("iRacing UI car preview traceback\n%s", traceback.format_exc())
+            self._set_ui_preview_status(state="error", message=f"iRacing UI preview sync failed: {exc}")
+            with self._lock:
+                self._ui_preview_next_full_sync_at = time.monotonic() + IRACING_UI_PREVIEW_RETRY_SECONDS
+        finally:
+            with self._lock:
+                self._ui_preview_worker_active = False
+            self._set_ui_preview_status(syncing=False)
+    def _maintain_ui_previews(
+        self,
+        config: AppConfig,
+        paints_dir: Path,
+        *,
+        live_member_id: int | None = None,
+        session_active: bool = False,
+    ) -> None:
+        """Keep the iRacing UI previews correct while iRacing is idle.
+
+        Nothing is touched while a session is being processed, so this never
+        competes with the live paint pipeline; the previews are re-asserted as
+        soon as the session is gone.
+        """
+        if not bool(getattr(config, "iracing_ui_car_previews", True)):
+            if self._ui_preview_sync_event.is_set():
+                self._ui_preview_sync_event.clear()
+            status = self.get_ui_preview_status()
+            if status.enabled or status.state != "disabled":
+                _set_iracing_ui_preview_protected_paths([])
+                removed_installed = 0
+                if not session_active:
+                    try:
+                        removed_installed, _removed_cached = clear_iracing_ui_car_previews(
+                            paints_dir=paints_dir,
+                            cache_dir=default_iracing_ui_preview_cache_dir(),
+                            remove_cache=False,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logging.debug("Could not remove installed iRacing UI car previews: %s", exc)
+                if removed_installed:
+                    logging.info(
+                        "iRacing UI car previews turned off. Removed %s preview file(s) from the iRacing paint folder.",
+                        removed_installed,
+                    )
+                self._set_ui_preview_status(
+                    enabled=False,
+                    state="disabled",
+                    message="iRacing UI car previews are turned off.",
+                )
+            return
+        manual_request = self._ui_preview_sync_event.is_set()
+        now = time.monotonic()
+        with self._lock:
+            if self._ui_preview_worker_active:
+                return
+            due = bool(
+                manual_request
+                or now >= self._ui_preview_next_reassert_at
+                or now >= self._ui_preview_next_full_sync_at
+            )
+        if not due:
+            return
+        if not self.get_ui_preview_status().enabled:
+            self._set_ui_preview_status(enabled=True, state="idle", message="iRacing UI car previews are enabled.")
+        member_id, member_id_source = resolve_iracing_ui_preview_member_id(config, live_member_id)
+        if member_id <= 0:
+            if manual_request:
+                self._ui_preview_sync_event.clear()
+            with self._lock:
+                self._ui_preview_next_reassert_at = now + IRACING_UI_PREVIEW_REASSERT_SECONDS
+            self._set_ui_preview_status(
+                state="waiting",
+                message=(
+                    "Waiting for your iRacing customer ID. Join any iRacing session once, "
+                    "or type the ID in the iRacing UI previews box."
+                ),
+                member_id=0,
+                member_id_source="",
+            )
+            return
+        remember_iracing_ui_preview_member_id(member_id, member_id_source)
+        if session_active:
+            with self._lock:
+                self._ui_preview_next_reassert_at = now + IRACING_UI_PREVIEW_REASSERT_SECONDS
+            return
+        with self._lock:
+            if self._ui_preview_worker_active:
+                return
+            member_changed = int(self._ui_preview_member_id) != int(member_id)
+            do_full_sync = bool(manual_request or member_changed or now >= self._ui_preview_next_full_sync_at)
+            do_reassert = bool(now >= self._ui_preview_next_reassert_at)
+            if not do_full_sync and not do_reassert:
+                return
+            self._ui_preview_member_id = int(member_id)
+            self._ui_preview_worker_active = True
+            self._ui_preview_next_reassert_at = now + IRACING_UI_PREVIEW_REASSERT_SECONDS
+            if do_full_sync:
+                self._ui_preview_next_full_sync_at = now + IRACING_UI_PREVIEW_RETRY_SECONDS
+        if manual_request:
+            self._ui_preview_sync_event.clear()
+        threading.Thread(
+            target=self._run_ui_preview_worker,
+            kwargs={
+                "config": config,
+                "paints_dir": paints_dir,
+                "member_id": member_id,
+                "member_id_source": member_id_source,
+                "do_full_sync": do_full_sync,
+            },
+            name="NishizumiUiPreviewSync",
+            daemon=True,
+        ).start()
+    def _reassert_ui_previews_now(self, config: AppConfig, paints_dir: Path) -> None:
+        """Put the UI preview files back immediately after a cleanup pass."""
+        if not bool(getattr(config, "iracing_ui_car_previews", True)):
+            return
+        member_id = int(self._ui_preview_member_id or 0)
+        if member_id <= 0:
+            member_id, _source = resolve_iracing_ui_preview_member_id(config)
+        if member_id <= 0:
+            return
+        try:
+            install_iracing_ui_car_previews(
+                member_id=member_id,
+                paints_dir=paints_dir,
+                cache_dir=default_iracing_ui_preview_cache_dir(),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logging.debug("Could not re-assert iRacing UI car previews: %s", exc)
+        with self._lock:
+            self._ui_preview_next_reassert_at = time.monotonic() + IRACING_UI_PREVIEW_REASSERT_SECONDS
     def start(self) -> None:
         if self.is_running():
             return
@@ -19646,7 +20619,15 @@ class DownloaderService:
         if not saved:
             return []
         logging.info(reason)
-        kept = delete_saved(saved, keep_targets=keep_targets, paints_root=paints_root)
+        preview_paths = iracing_ui_preview_protected_paths()
+        kept = delete_saved(
+            saved,
+            keep_targets=keep_targets,
+            paints_root=paints_root,
+            protected_paths=preview_paths,
+        )
+        if preview_paths and paints_root is not None:
+            self._reassert_ui_previews_now(self.get_config(), paints_root)
         if keep_targets and kept:
             labels = []
             for is_team, target_id in sorted(keep_targets):
@@ -19703,6 +20684,9 @@ class DownloaderService:
         last_replay_dir_token = _replay_dir_change_token(replay_dir)
         inactive_cleanup_done = False
         reopen_sdk_after_inactive = False
+        with self._lock:
+            self._ui_preview_next_full_sync_at = time.monotonic() + IRACING_UI_PREVIEW_STARTUP_DELAY_SECONDS
+            self._ui_preview_next_reassert_at = 0.0
         def _maybe_sync_replay_packs(
             config: AppConfig,
             *,
@@ -19818,6 +20802,12 @@ class DownloaderService:
                         logging.info("Manual global texture reload requested from General tab.")
                     else:
                         logging.info("Manual global texture reload requested, but the texture refresh could not be triggered right now.")
+                self._maintain_ui_previews(
+                    config,
+                    paints_dir,
+                    live_member_id=last_known_member_id,
+                    session_active=current_session is not None,
+                )
                 self._set_status("Watching")
                 if sdk_reader is None:
                     now = time.monotonic()
@@ -19863,6 +20853,8 @@ class DownloaderService:
                         last_session_fingerprint = None
                         last_session_preserve_targets = set()
                         self._reset_team_driver_swap_tracking()
+                        with self._lock:
+                            self._ui_preview_next_reassert_at = 0.0
                         self._update_runtime_snapshot(None, last_saved, last_known_member_id, session_rows=[])
                     self._stop_event.wait(max(config.poll_seconds, 0.2))
                     continue
@@ -20676,6 +21668,18 @@ class DownloaderUI:
         self.cleanup_before_fetch_var = tk.BooleanVar(value=self.config.cleanup_before_fetch)
         self.sync_my_livery_var = tk.BooleanVar(value=self.config.sync_my_livery_from_server)
         self.keep_my_livery_var = tk.BooleanVar(value=self.config.keep_my_livery_locally)
+        self.iracing_ui_previews_var = tk.BooleanVar(value=bool(getattr(self.config, "iracing_ui_car_previews", True)))
+        self.iracing_ui_preview_refresh_var = tk.IntVar(
+            value=normalize_iracing_ui_preview_refresh_minutes(
+                getattr(self.config, "iracing_ui_preview_refresh_minutes", IRACING_UI_PREVIEW_DEFAULT_REFRESH_MINUTES)
+            )
+        )
+        current_preview_member_id = normalize_tp_member_id(getattr(self.config, "iracing_ui_preview_member_id", 0))
+        self.iracing_ui_preview_member_id_var = tk.StringVar(
+            value=str(current_preview_member_id) if current_preview_member_id > 0 else ""
+        )
+        self.iracing_ui_preview_status_var = tk.StringVar(value="iRacing UI previews: starting...")
+        self._last_iracing_ui_preview_status_text = ""
         self.sync_ai_rosters_var = tk.BooleanVar(value=getattr(self.config, "sync_ai_rosters_from_server", True))
         current_ai_member_id = normalize_tp_member_id(getattr(self.config, "ai_roster_member_id_override", 0))
         self.ai_roster_member_id_var = tk.StringVar(value=str(current_ai_member_id) if current_ai_member_id > 0 else "")
@@ -21138,6 +22142,58 @@ class DownloaderUI:
             command=self.on_setting_changed,
         ).grid(row=10, column=0, columnspan=2, sticky="w", pady=(8, 0))
         ttk.Label(perf, text="Safe = one online car lane at a time. Session Total = one car lane per active car group. Manual = cap the concurrent car lanes yourself. The retry option keeps timed-out online paints in one last online recovery pass before the app falls back to the local pool.", foreground="#666666", wraplength=320, justify="left").grid(row=11, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
+        ui_previews = ttk.LabelFrame(general_tab, text="iRacing UI car previews", padding=10)
+        ui_previews.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        ui_previews.columnconfigure(0, weight=1)
+        ttk.Checkbutton(
+            ui_previews,
+            text="Always show my paints in the iRacing UI car previews",
+            variable=self.iracing_ui_previews_var,
+            command=self.on_iracing_ui_previews_changed,
+        ).grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Label(
+            ui_previews,
+            text=(
+                "Keeps your own Trading Paints car, number, spec, helmet, and suit files in the iRacing paint folder at all "
+                "times, so the 3D car viewer in the iRacing UI (My Content > Cars) always renders your livery instead of the "
+                "default one. The files are mirrored locally, so they are restored right after every session cleanup, even "
+                "with no internet connection."
+            ),
+            foreground="#666666",
+            wraplength=700,
+            justify="left",
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        ui_preview_controls = ttk.Frame(ui_previews)
+        ui_preview_controls.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        ttk.Label(ui_preview_controls, text="Re-check Trading Paints every").pack(side="left")
+        self.iracing_ui_preview_refresh_spin = ttk.Spinbox(
+            ui_preview_controls,
+            from_=IRACING_UI_PREVIEW_MIN_REFRESH_MINUTES,
+            to=IRACING_UI_PREVIEW_MAX_REFRESH_MINUTES,
+            width=6,
+            textvariable=self.iracing_ui_preview_refresh_var,
+            command=self.on_iracing_ui_preview_refresh_changed,
+        )
+        self.iracing_ui_preview_refresh_spin.pack(side="left", padx=(6, 0))
+        self.iracing_ui_preview_refresh_spin.bind("<FocusOut>", lambda _e: self.on_iracing_ui_preview_refresh_changed())
+        self.iracing_ui_preview_refresh_spin.bind("<Return>", lambda _e: self.on_iracing_ui_preview_refresh_changed())
+        ttk.Label(ui_preview_controls, text="minutes").pack(side="left", padx=(6, 0))
+        ttk.Button(ui_preview_controls, text="Sync previews now", command=self.sync_iracing_ui_previews_now).pack(side="left", padx=(16, 0))
+        ui_preview_member_row = ttk.Frame(ui_previews)
+        ui_preview_member_row.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        ttk.Label(ui_preview_member_row, text="iRacing customer ID (leave empty for automatic)").pack(side="left")
+        self.iracing_ui_preview_member_id_entry = ttk.Entry(ui_preview_member_row, textvariable=self.iracing_ui_preview_member_id_var, width=14)
+        self.iracing_ui_preview_member_id_entry.pack(side="left", padx=(8, 0))
+        self.iracing_ui_preview_member_id_entry.bind("<Return>", lambda _e: self.save_iracing_ui_preview_member_id())
+        ttk.Button(ui_preview_member_row, text="OK", command=self.save_iracing_ui_preview_member_id).pack(side="left", padx=(8, 0))
+        ttk.Label(
+            ui_previews,
+            textvariable=self.iracing_ui_preview_status_var,
+            foreground="#0b63b6",
+            wraplength=700,
+            justify="left",
+        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
         ai_tab.columnconfigure(0, weight=0)
         ai_tab.columnconfigure(1, weight=1)
@@ -21612,6 +22668,30 @@ class DownloaderUI:
         ttk.Checkbutton(easy_safe, text="Clear old driver paints before fetching", variable=self.cleanup_before_fetch_var, command=self.on_setting_changed).pack(anchor="w", pady=(4, 0))
         ttk.Checkbutton(easy_safe, text="Update my own paints", variable=self.sync_my_livery_var, command=self.on_setting_changed).pack(anchor="w", pady=(4, 0))
         ttk.Checkbutton(easy_safe, text="Keep my own paint locally", variable=self.keep_my_livery_var, command=self.on_setting_changed).pack(anchor="w", pady=(4, 0))
+
+        easy_previews = ttk.LabelFrame(easy_left, text="iRacing UI car previews", padding=10)
+        easy_previews.pack(fill="x", pady=(10, 0))
+        ttk.Checkbutton(
+            easy_previews,
+            text="Always show my paints in the iRacing UI",
+            variable=self.iracing_ui_previews_var,
+            command=self.on_iracing_ui_previews_changed,
+        ).pack(anchor="w")
+        ttk.Label(
+            easy_previews,
+            text="Keeps your own paints in the iRacing paint folder so the 3D car viewer in the iRacing UI always shows your livery.",
+            foreground="#555555",
+            justify="left",
+            wraplength=320,
+        ).pack(anchor="w", pady=(4, 0))
+        ttk.Button(easy_previews, text="Sync previews now", command=self.sync_iracing_ui_previews_now).pack(anchor="w", pady=(6, 0))
+        ttk.Label(
+            easy_previews,
+            textvariable=self.iracing_ui_preview_status_var,
+            foreground="#0b63b6",
+            justify="left",
+            wraplength=320,
+        ).pack(anchor="w", pady=(6, 0))
 
         easy_ai = ttk.LabelFrame(easy_left, text="AI", padding=10)
         easy_ai.pack(fill="x", pady=(10, 0))
@@ -23161,6 +24241,100 @@ class DownloaderUI:
         else:
             self._append_log("AI roster member ID cleared. The app will use the active session member ID when available.")
 
+    def _parse_iracing_ui_preview_member_id_ui(self) -> int:
+        return normalize_tp_member_id(self.iracing_ui_preview_member_id_var.get())
+
+    def _parse_iracing_ui_preview_refresh_minutes_ui(self) -> int:
+        try:
+            raw = self.iracing_ui_preview_refresh_var.get()
+        except Exception:
+            raw = getattr(self.config, "iracing_ui_preview_refresh_minutes", IRACING_UI_PREVIEW_DEFAULT_REFRESH_MINUTES)
+        return normalize_iracing_ui_preview_refresh_minutes(raw)
+
+    def on_iracing_ui_previews_changed(self) -> None:
+        enabled = bool(self.iracing_ui_previews_var.get())
+        self.on_setting_changed()
+        if enabled:
+            self._append_log("iRacing UI car previews enabled. Your own paints will be kept in the iRacing paint folder.")
+            self.service.request_ui_preview_sync()
+        else:
+            self._append_log("iRacing UI car previews disabled. Preview files managed by the app will be removed from the iRacing paint folder.")
+
+    def on_iracing_ui_preview_refresh_changed(self) -> None:
+        minutes = self._parse_iracing_ui_preview_refresh_minutes_ui()
+        self.iracing_ui_preview_refresh_var.set(minutes)
+        self.on_setting_changed()
+
+    def save_iracing_ui_preview_member_id(self) -> None:
+        member_id = self._parse_iracing_ui_preview_member_id_ui()
+        self.iracing_ui_preview_member_id_var.set(str(member_id) if member_id > 0 else "")
+        self.on_setting_changed()
+        if member_id > 0:
+            self._append_log(f"iRacing UI preview customer ID saved: {member_id}")
+        else:
+            self._append_log("iRacing UI preview customer ID cleared. The app will detect it automatically.")
+        self.service.request_ui_preview_sync()
+
+    def sync_iracing_ui_previews_now(self) -> None:
+        if not bool(self.iracing_ui_previews_var.get()):
+            self._append_log("iRacing UI car previews are turned off. Enable them first to sync previews.")
+            return
+        self._append_log("Manual iRacing UI car preview sync requested.")
+        if self._headless_controller_mode:
+            response = send_headless_control_command("sync_ui_previews")
+            if not (response and response.get("ok")):
+                self._append_log("Could not reach the headless service to sync the iRacing UI previews.")
+            return
+        self.service.request_ui_preview_sync()
+
+    def _format_iracing_ui_preview_status(self, status: IracingUiPreviewStatus) -> str:
+        if not status.enabled or status.state == "disabled":
+            return "iRacing UI previews: off."
+        if status.syncing or status.state == "syncing":
+            return "iRacing UI previews: syncing your paints..."
+        if status.state in {"waiting", "warning", "error"}:
+            return f"iRacing UI previews: {status.message}"
+        if status.state == "ok":
+            parts = [f"iRacing UI previews: ready for {status.car_directories} car(s)"]
+            if status.member_id > 0:
+                source = f" via {status.member_id_source}" if status.member_id_source else ""
+                parts.append(f"customer ID {status.member_id}{source}")
+            if status.last_success_at > 0:
+                parts.append(f"last check {time.strftime('%H:%M', time.localtime(status.last_success_at))}")
+            text = " • ".join(parts) + "."
+            if status.custom_number_cars > 0 and status.hide_car_numbers is False:
+                text += " Turn on \"Hide car numbers\" in iRacing Settings > Graphics to preview your Custom Number paints."
+            return text
+        return "iRacing UI previews: starting..."
+
+    def _refresh_headless_iracing_ui_preview_status(self) -> None:
+        response = self._last_headless_status_response or {}
+        message = str(response.get("ui_preview_message") or "").strip()
+        state = str(response.get("ui_preview_state") or "").strip()
+        if not state:
+            text = "iRacing UI previews: managed by the background service."
+        elif state == "disabled":
+            text = "iRacing UI previews: off."
+        else:
+            cars = int(response.get("ui_preview_cars") or 0)
+            prefix = f"iRacing UI previews: ready for {cars} car(s)." if state == "ok" else f"iRacing UI previews: {message or state}"
+            text = prefix
+        if text == self._last_iracing_ui_preview_status_text:
+            return
+        self._last_iracing_ui_preview_status_text = text
+        self.iracing_ui_preview_status_var.set(text)
+
+    def _refresh_iracing_ui_preview_status(self) -> None:
+        try:
+            status = self.service.get_ui_preview_status()
+        except Exception:
+            return
+        text = self._format_iracing_ui_preview_status(status)
+        if text == self._last_iracing_ui_preview_status_text:
+            return
+        self._last_iracing_ui_preview_status_text = text
+        self.iracing_ui_preview_status_var.set(text)
+
     def _maybe_autofill_ai_roster_member_id_from_session(self, snapshot: RuntimeSnapshot) -> None:
         if bool(getattr(self.config, "ai_roster_member_id_auto_filled", False)):
             return
@@ -23446,6 +24620,10 @@ class DownloaderUI:
                     self.service.start()
         self._refresh_monitor_ui()
         self._refresh_random_pool_summary()
+        if self._headless_controller_mode:
+            self._refresh_headless_iracing_ui_preview_status()
+        else:
+            self._refresh_iracing_ui_preview_status()
         if not self._headless_controller_mode:
             runtime_snapshot_version = self.service.get_runtime_snapshot_version()
             if runtime_snapshot_version != self._last_runtime_snapshot_version or self._cached_runtime_snapshot is None:
@@ -23735,6 +24913,9 @@ class DownloaderUI:
             delete_downloaded_livery=bool(self.cleanup_on_exit_var.get()),
             sync_my_livery_from_server=bool(self.sync_my_livery_var.get()),
             keep_my_livery_locally=bool(self.keep_my_livery_var.get()),
+            iracing_ui_car_previews=bool(self.iracing_ui_previews_var.get()),
+            iracing_ui_preview_refresh_minutes=self._parse_iracing_ui_preview_refresh_minutes_ui(),
+            iracing_ui_preview_member_id=self._parse_iracing_ui_preview_member_id_ui(),
             sync_ai_rosters_from_server=bool(self.sync_ai_rosters_var.get()),
             ai_roster_member_id_override=self._parse_ai_roster_member_id_ui(),
             ai_roster_member_id_auto_filled=bool(getattr(self.config, "ai_roster_member_id_auto_filled", False)),
@@ -25883,6 +27064,8 @@ def run_headless(args: argparse.Namespace | None = None) -> int:
     if args.keep_session_paints:
         config.delete_downloaded_livery = False
         config.keep_my_livery_locally = True
+    if getattr(args, "no_ui_previews", False):
+        config.iracing_ui_car_previews = False
     config.verbose = bool(config.verbose or args.verbose)
     config.poll_seconds = max(args.poll_seconds, 0.2)
     config.retries = max(1, args.retries)

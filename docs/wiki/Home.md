@@ -9,6 +9,7 @@ Version 7.0 consolidates the work since 6.5 into one public release: Team-sessio
 ## What the app does
 
 - monitors the iRacing SDK and reacts to session changes
+- keeps your own paints visible in the iRacing UI 3D car viewer at all times
 - downloads real Trading Paints assets when they exist
 - applies public-showroom fallback for cars, helmets, and suits when they do not
 - keeps a local RandomPool for reusable fallback assets
@@ -24,16 +25,17 @@ Version 7.0 consolidates the work since 6.5 into one public release: Team-sessio
 1. [Installation and Updating](Installation-and-Updating)
 2. [Quick Start Wizard](Quick-Start-Wizard)
 3. [General Tab](General-Tab)
-4. [Session Tab](Session-Tab)
-5. [Random Tab](Random-Tab)
-6. [Showroom Tab](Showroom-Tab)
-7. [Online Fallback System](Online-Fallback-System)
-8. [Local RandomPool](Local-RandomPool)
-9. [Showroom Mapping and Collections](Showroom-Mapping-and-Collections)
-10. [AI Tab](AI-Tab)
-11. [Background and Headless Modes](Background-and-Headless-Modes)
-12. [Release 7.0](Release-7.0)
-13. [Troubleshooting](Troubleshooting)
+4. [iRacing UI Car Previews](iRacing-UI-Car-Previews)
+5. [Session Tab](Session-Tab)
+6. [Random Tab](Random-Tab)
+7. [Showroom Tab](Showroom-Tab)
+8. [Online Fallback System](Online-Fallback-System)
+9. [Local RandomPool](Local-RandomPool)
+10. [Showroom Mapping and Collections](Showroom-Mapping-and-Collections)
+11. [AI Tab](AI-Tab)
+12. [Background and Headless Modes](Background-and-Headless-Modes)
+13. [Release 7.0](Release-7.0)
+14. [Troubleshooting](Troubleshooting)
 
 ## Core concepts
 

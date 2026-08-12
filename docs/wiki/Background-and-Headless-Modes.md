@@ -42,6 +42,26 @@ That matters for:
 - service-like usage
 - keeping the app available while relying mostly on logs and tray controls
 
+### Headless control commands
+
+The local control server accepts these commands:
+
+| Command | Effect |
+| --- | --- |
+| `ping` / `hello` | Confirms the headless service is reachable and reports the app version. |
+| `status` | Reports service state, the current session, and the iRacing UI preview state. |
+| `reload_config` | Re-reads `settings.json` and applies it to the running service. |
+| `sync_ui_previews` | Forces an immediate iRacing UI car preview sync. |
+| `stop` | Shuts the headless service down. |
+
+The `status` response includes `ui_preview_state`, `ui_preview_message`, `ui_preview_member_id`, and `ui_preview_cars`, so preview health is visible without the full window. The GUI shows the same information when it attaches to a running headless service.
+
+### Headless command line switches
+
+- `--nogui` runs without the built-in UI.
+- `--keep-session-paints` keeps live session paints instead of cleaning them up.
+- `--no-ui-previews` turns the always-on [iRacing UI car previews](iRacing-UI-Car-Previews) off for that run.
+
 ## Interaction with Easy and Advanced mode
 
 UI mode does not disable background or headless behavior. Easy mode only reduces visible complexity. The background monitor and tray logic still run the same core service underneath.
