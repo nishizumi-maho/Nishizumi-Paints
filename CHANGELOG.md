@@ -2,6 +2,15 @@
 
 All notable user-facing changes to Nishizumi Paints are documented here.
 
+## [7.3.1] - 2026-08-12
+
+### Fixed
+
+- Fixed the automatic car catalog loading zero cars after Trading Paints redesigned the car templates page. The page no longer carries the vehicle ID, so the catalog is now rebuilt by combining the template list (which supplies the iRacing paint folder) with the showroom vehicle index (which supplies the vehicle ID and the category). This restores the public showroom fallback, collections, Member ID tools, Team tools, and the car selectors. Normal session downloads were never affected, because those use the paint folder reported by iRacing and Trading Paints.
+- Vehicles are now filed under their real Oval, Road, or Driver category instead of always being labelled Road, so the showroom links the app builds point at the right page.
+- The car catalog is now saved to disk and reused when Trading Paints cannot be reached or changes its page layout again, instead of the app starting with no catalog at all.
+- Failures to install an iRacing UI preview file are now reported in the log with the reason instead of being silently discarded.
+
 ## [7.3.0] - 2026-08-11
 
 ### Added
