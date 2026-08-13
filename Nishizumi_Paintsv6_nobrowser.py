@@ -43,7 +43,7 @@ from requests.adapters import HTTPAdapter
 # Browserless copy: Trading Paints browser automation is intentionally disabled.
 sync_playwright = None
 APP_NAME = "Nishizumi Paints"
-APP_VERSION = "7.3.1"
+APP_VERSION = "7.3.2"
 APP_REGISTRY_NAME = "NishizumiPaints"
 APP_CONFIG_DIRNAME = "NishizumiPaints"
 APP_TOOLTIP = f"{APP_NAME} {APP_VERSION}"
@@ -123,6 +123,17 @@ GITHUB_RELEASES_API_LATEST = f"https://api.github.com/repos/{GITHUB_RELEASE_OWNE
 GITHUB_RELEASES_PAGE_LATEST = f"https://github.com/{GITHUB_RELEASE_OWNER}/{GITHUB_RELEASE_REPO}/releases/latest"
 GITHUB_API_VERSION = "2022-11-28"
 GITHUB_UPDATE_CHECK_INTERVAL_SECONDS = 6 * 60 * 60
+# Installer downloads are only ever fetched from GitHub's own release hosts, and only
+# after the published SHA-256 digest matches, because the file is executed afterwards.
+GITHUB_RELEASE_ASSET_HOSTS = (
+    "github.com",
+    "api.github.com",
+    "objects.githubusercontent.com",
+    "release-assets.githubusercontent.com",
+)
+UPDATE_INSTALLER_MAX_BYTES = 400 * 1024 * 1024
+UPDATE_DOWNLOAD_TIMEOUT = (10.0, 60.0)
+UPDATE_INSTALLER_SILENT_ARGS = ("/SILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/CLOSEAPPLICATIONS")
 TRADING_PAINTS_FETCH_CONTEXT_URLS = (
     "https://dl.tradingpaints.com/fetch.php",
     "https://fetch.tradingpaints.gg/fetch.php",
@@ -1125,6 +1136,17 @@ class GitHubReleaseInfo:
     asset_name: str | None = None
     asset_download_url: str | None = None
     published_at: str | None = None
+    asset_size: int = 0
+    asset_sha256: str | None = None
+
+    def installer_is_verifiable(self) -> bool:
+        """True when the asset can be downloaded and checked before it is executed."""
+        return bool(
+            self.asset_name
+            and self.asset_name.lower().endswith(".exe")
+            and self.asset_sha256
+            and is_trusted_release_asset_url(self.asset_download_url)
+        )
 def _parse_version_parts(tag: str) -> tuple[int, ...]:
     cleaned = (tag or '').strip()
     if cleaned.lower().startswith("release-"):
@@ -1152,6 +1174,51 @@ def _github_api_headers() -> dict[str, str]:
         "User-Agent": APP_USER_AGENT,
         "X-GitHub-Api-Version": GITHUB_API_VERSION,
     }
+def is_trusted_release_asset_url(url: str | None) -> bool:
+    """Only https URLs served by GitHub's own release hosts may be downloaded."""
+    candidate = str(url or '').strip()
+    if not candidate:
+        return False
+    try:
+        parsed = urllib.parse.urlsplit(candidate)
+    except ValueError:
+        return False
+    if parsed.scheme.lower() != "https":
+        return False
+    host = (parsed.hostname or '').strip().lower()
+    return host in GITHUB_RELEASE_ASSET_HOSTS
+
+
+def _normalize_sha256(value: str | None) -> str | None:
+    candidate = str(value or '').strip().lower()
+    if candidate.startswith("sha256:"):
+        candidate = candidate[7:].strip()
+    if re.fullmatch(r"[0-9a-f]{64}", candidate):
+        return candidate
+    return None
+
+
+def parse_release_body_sha256(body: str | None, asset_name: str | None) -> str | None:
+    """Read the digest for ``asset_name`` out of hand written release notes.
+
+    Supports the two shapes the release notes use, in either order:
+    ``<hex>  NishizumiPaints-Setup-x.y.z.exe`` and ``NishizumiPaints-Setup-x.y.z.exe: <hex>``.
+    """
+    name = str(asset_name or '').strip()
+    if not name or not str(body or '').strip():
+        return None
+    escaped = re.escape(name)
+    patterns = (
+        rf"(?i)\b([0-9a-f]{{64}})\b[^\S\n]*[*]?{escaped}\b",
+        rf"(?i){escaped}\b[^\n]*?\b([0-9a-f]{{64}})\b",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, str(body))
+        if match:
+            return _normalize_sha256(match.group(1))
+    return None
+
+
 def _extract_release_info(payload: dict) -> GitHubReleaseInfo:
     if not isinstance(payload, dict):
         raise RuntimeError("GitHub update check returned an invalid response.")
@@ -1161,6 +1228,8 @@ def _extract_release_info(payload: dict) -> GitHubReleaseInfo:
         raise RuntimeError("GitHub update check did not return a release tag.")
     asset_name = None
     asset_download_url = None
+    asset_size = 0
+    asset_sha256 = None
     assets = payload.get('assets')
     if isinstance(assets, list):
         preferred = None
@@ -1178,6 +1247,15 @@ def _extract_release_info(payload: dict) -> GitHubReleaseInfo:
         if isinstance(preferred, dict):
             asset_name = str(preferred.get('name') or '').strip() or None
             asset_download_url = str(preferred.get('browser_download_url') or '').strip() or None
+            try:
+                asset_size = max(0, int(preferred.get('size') or 0))
+            except (TypeError, ValueError):
+                asset_size = 0
+            # GitHub publishes "sha256:<hex>" on newer assets; older releases only
+            # carry the digest in the notes, so fall back to those.
+            asset_sha256 = _normalize_sha256(preferred.get('digest'))
+    if asset_sha256 is None:
+        asset_sha256 = parse_release_body_sha256(payload.get('body'), asset_name)
     published_at = str(payload.get('published_at') or '').strip() or None
     return GitHubReleaseInfo(
         tag_name=tag_name,
@@ -1185,6 +1263,8 @@ def _extract_release_info(payload: dict) -> GitHubReleaseInfo:
         asset_name=asset_name,
         asset_download_url=asset_download_url,
         published_at=published_at,
+        asset_size=asset_size,
+        asset_sha256=asset_sha256,
     )
 def _github_get_json(url: str, timeout: tuple[float, float] = (5.0, 12.0)) -> dict | list:
     try:
@@ -1221,6 +1301,175 @@ def fetch_latest_github_release() -> GitHubReleaseInfo:
         if isinstance(first, dict):
             return _extract_release_info(first)
     raise RuntimeError("GitHub update check did not find a usable release.")
+
+
+def update_workspace_dir() -> Path:
+    return default_app_config_dir() / "updates"
+
+
+def auto_install_unsupported_reason() -> str:
+    """Empty string when this build can install an update by itself."""
+    if sys.platform != "win32":
+        return "Automatic installation is only available on the Windows build."
+    if not getattr(sys, "frozen", False):
+        return "Automatic installation is only available in the packaged .exe build."
+    return ""
+
+
+def _safe_installer_filename(asset_name: str | None) -> str:
+    name = Path(str(asset_name or '').strip()).name
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,120}\.exe", name, flags=re.IGNORECASE):
+        raise RuntimeError(f"Refusing to download an unexpected release asset name: {asset_name!r}")
+    return name
+
+
+def clean_update_workspace(keep: Path | None = None) -> None:
+    directory = update_workspace_dir()
+    if not directory.is_dir():
+        return
+    keep_key = str(keep.resolve()).lower() if keep is not None else None
+    for item in directory.iterdir():
+        try:
+            if keep_key is not None and str(item.resolve()).lower() == keep_key:
+                continue
+            if item.is_dir():
+                shutil.rmtree(item, ignore_errors=True)
+            else:
+                item.unlink()
+        except OSError:
+            continue
+
+
+def download_release_installer(
+    release: GitHubReleaseInfo,
+    dest_dir: Path | None = None,
+    progress_cb: Callable[[int, int], None] | None = None,
+    session: requests.Session | None = None,
+) -> Path:
+    """Download the release installer and verify it against the published digest.
+
+    The downloaded file is executed afterwards, so every step is fail-closed: the URL
+    must be a GitHub release host, the size is capped, and a SHA-256 mismatch deletes
+    the file instead of keeping it.
+    """
+    expected_digest = _normalize_sha256(release.asset_sha256)
+    if not expected_digest:
+        raise RuntimeError("The release does not publish a SHA-256 digest, so the installer cannot be verified.")
+    if not is_trusted_release_asset_url(release.asset_download_url):
+        raise RuntimeError("The release asset is not hosted on a GitHub release URL.")
+    if release.asset_size and release.asset_size > UPDATE_INSTALLER_MAX_BYTES:
+        raise RuntimeError("The release asset is larger than the maximum supported installer size.")
+    filename = _safe_installer_filename(release.asset_name)
+    directory = Path(dest_dir) if dest_dir is not None else update_workspace_dir()
+    directory.mkdir(parents=True, exist_ok=True)
+    target = directory / filename
+    partial = directory / f"{filename}.part"
+    hasher = hashlib.sha256()
+    downloaded = 0
+    total = int(release.asset_size or 0)
+    http = session or requests
+    try:
+        response = http.get(
+            release.asset_download_url,
+            headers={"Accept": "application/octet-stream", "User-Agent": APP_USER_AGENT},
+            stream=True,
+            timeout=UPDATE_DOWNLOAD_TIMEOUT,
+            allow_redirects=True,
+        )
+    except requests.RequestException as exc:
+        raise RuntimeError(f"Network error while downloading the update: {exc}") from exc
+    with response:
+        if response.status_code >= 400:
+            raise RuntimeError(f"Downloading the update failed with HTTP {response.status_code}.")
+        for hop in list(getattr(response, "history", []) or []) + [response]:
+            hop_url = str(getattr(hop, "url", "") or "")
+            if hop_url and not is_trusted_release_asset_url(hop_url):
+                raise RuntimeError("The update download was redirected away from GitHub and was stopped.")
+        declared = response.headers.get("Content-Length")
+        if declared:
+            try:
+                total = max(total, int(declared))
+            except ValueError:
+                pass
+        if total > UPDATE_INSTALLER_MAX_BYTES:
+            raise RuntimeError("The update download is larger than the maximum supported installer size.")
+        try:
+            with partial.open("wb") as handle:
+                for chunk in response.iter_content(chunk_size=1024 * 256):
+                    if not chunk:
+                        continue
+                    downloaded += len(chunk)
+                    if downloaded > UPDATE_INSTALLER_MAX_BYTES:
+                        raise RuntimeError("The update download exceeded the maximum supported installer size.")
+                    hasher.update(chunk)
+                    handle.write(chunk)
+                    if progress_cb is not None:
+                        progress_cb(downloaded, total)
+        except Exception:
+            partial.unlink(missing_ok=True)
+            raise
+    actual_digest = hasher.hexdigest()
+    if actual_digest != expected_digest:
+        partial.unlink(missing_ok=True)
+        raise RuntimeError(
+            "The downloaded installer did not match the SHA-256 digest published with the release, so it was discarded."
+        )
+    target.unlink(missing_ok=True)
+    partial.replace(target)
+    return target
+
+
+def build_update_launcher_script(installer_path: Path, app_exe: Path, log_path: Path) -> str:
+    """Batch wrapper that installs the update and relaunches the app afterwards.
+
+    The app has to exit before the installer can replace its own files, so the install
+    is handed to a detached script rather than run in-process.
+    """
+    parts = {"installer": Path(installer_path), "app": Path(app_exe), "log": Path(log_path)}
+    for label, value in parts.items():
+        text = str(value)
+        if '"' in text or "%" in text or "\n" in text or "\r" in text:
+            raise RuntimeError(f"Refusing to build an update script for an unsafe {label} path: {text!r}")
+    arguments = " ".join(UPDATE_INSTALLER_SILENT_ARGS)
+    return "\r\n".join(
+        [
+            "@echo off",
+            "setlocal",
+            f'"{parts["installer"]}" {arguments} /LOG="{parts["log"]}"',
+            'if errorlevel 1 exit /b %errorlevel%',
+            f'start "" "{parts["app"]}"',
+            "exit /b 0",
+            "",
+        ]
+    )
+
+
+def start_update_installer(installer_path: Path, app_exe: Path | None = None) -> Path:
+    """Spawn the detached installer script and return the script path."""
+    reason = auto_install_unsupported_reason()
+    if reason:
+        raise RuntimeError(reason)
+    installer = Path(installer_path)
+    if not installer.is_file():
+        raise RuntimeError("The downloaded installer is missing.")
+    target_exe = Path(app_exe) if app_exe is not None else Path(sys.executable).resolve()
+    directory = installer.parent
+    script_path = directory / "run_update.cmd"
+    log_path = directory / "install.log"
+    script_path.write_text(build_update_launcher_script(installer, target_exe, log_path), encoding="ascii")
+    creationflags = 0
+    if sys.platform == "win32":
+        creationflags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        creationflags |= getattr(subprocess, "DETACHED_PROCESS", 0)
+    subprocess.Popen(
+        ["cmd.exe", "/c", str(script_path)],
+        cwd=str(directory),
+        creationflags=creationflags,
+        close_fds=True,
+    )
+    return script_path
+
+
 class SingleInstanceLock:
     def __init__(self, name: str) -> None:
         self.name = name
@@ -19019,6 +19268,7 @@ class AppConfig:
     show_activity_log: bool = True
     show_tp_monitor: bool = True
     check_updates_automatically: bool = True
+    auto_install_updates: bool = False
     download_workers_mode: str = "safe"
     manual_download_workers: int = 100
     manual_manifest_workers: int = 100
@@ -19216,6 +19466,7 @@ class ConfigStore:
         config.show_activity_log = bool(config.show_activity_log)
         config.show_tp_monitor = bool(getattr(config, "show_tp_monitor", True))
         config.check_updates_automatically = bool(getattr(config, "check_updates_automatically", True))
+        config.auto_install_updates = bool(getattr(config, "auto_install_updates", False))
         config.launch_mode_preference = normalize_launch_mode_preference(getattr(config, "launch_mode_preference", "ask"))
         return config
     def save(self, config: AppConfig) -> None:
@@ -21990,6 +22241,7 @@ class DownloaderUI:
         self.show_activity_var = tk.BooleanVar(value=self.config.show_activity_log)
         self.show_tp_monitor_var = tk.BooleanVar(value=getattr(self.config, "show_tp_monitor", False))
         self.check_updates_var = tk.BooleanVar(value=getattr(self.config, "check_updates_automatically", True))
+        self.auto_install_updates_var = tk.BooleanVar(value=getattr(self.config, "auto_install_updates", False))
         self.headless_status_var = tk.StringVar(value="Headless mode is recommended for daily use because it skips the live Tk UI redraws and usually uses less CPU and RAM.")
         self.headless_hint_var = tk.StringVar(value="Save your settings here, then switch to headless whenever you want. The GUI can attach to an already-running headless service too.")
         self.download_workers_mode_var = tk.StringVar(value=download_workers_mode_label(self.config.download_workers_mode))
@@ -22007,8 +22259,10 @@ class DownloaderUI:
             value=f"Sources: {TP_CAR_TEMPLATES_URL} + {TP_SHOWROOM_INDEX_URL}"
         )
         self._update_check_in_progress = False
+        self._update_install_in_progress = False
         self._latest_release_info: GitHubReleaseInfo | None = None
         self._last_notified_update_tag: str | None = None
+        self._last_auto_installed_tag: str | None = None
         self._auto_update_after_id = None
         self._random_pool_opt_in_notified = bool(getattr(self.config, "keep_tp_paints_in_random_pool", False))
         self._headless_controller_mode = False
@@ -22229,6 +22483,7 @@ class DownloaderUI:
         ttk.Button(general_actions, text="Trigger global reload", command=self.trigger_global_reload_now).pack(side="left", padx=(8, 0))
         ttk.Button(general_actions, text="Paint folder", command=self.open_paint_folder).pack(side="left", padx=(8, 0))
         ttk.Button(general_actions, text="Check updates", command=self.check_updates_now).pack(side="left", padx=(8, 0))
+        ttk.Button(general_actions, text="Install update", command=self.download_and_install_update).pack(side="left", padx=(8, 0))
 
         general_settings = ttk.Frame(general_tab)
         general_settings.grid(row=1, column=0, sticky="ew", pady=(10, 0))
@@ -22256,7 +22511,8 @@ class DownloaderUI:
         ttk.Checkbutton(prefs, text="Start minimized", variable=self.start_minimized_var, command=self.on_setting_changed).grid(row=5, column=1, sticky="w", padx=(12, 0))
         ttk.Checkbutton(prefs, text="Keep running in background on close", variable=self.minimize_to_tray_var, command=self.on_setting_changed).grid(row=6, column=0, sticky="w")
         ttk.Checkbutton(prefs, text="Auto refresh paints", variable=self.auto_refresh_var, command=self.on_setting_changed).grid(row=6, column=1, sticky="w", padx=(12, 0))
-        ttk.Checkbutton(prefs, text="Check for updates automatically", variable=self.check_updates_var, command=self.on_setting_changed).grid(row=7, column=0, columnspan=2, sticky="w", pady=(2, 0))
+        ttk.Checkbutton(prefs, text="Check for updates automatically", variable=self.check_updates_var, command=self.on_setting_changed).grid(row=7, column=0, sticky="w", pady=(2, 0))
+        ttk.Checkbutton(prefs, text="Install updates automatically", variable=self.auto_install_updates_var, command=self.on_setting_changed).grid(row=7, column=1, sticky="w", padx=(12, 0), pady=(2, 0))
         ttk.Separator(prefs, orient="horizontal").grid(row=8, column=0, columnspan=2, sticky="ew", pady=(8, 8))
         ttk.Label(prefs, text="Session", font=("Segoe UI", 9, "bold"), foreground="#0b63b6").grid(row=9, column=0, columnspan=2, sticky="w")
         ttk.Checkbutton(prefs, text="Update my own paints", variable=self.sync_my_livery_var, command=self.on_setting_changed).grid(row=10, column=0, sticky="w")
@@ -25056,19 +25312,12 @@ class DownloaderUI:
             self._append_log(f"Update available: {release.tag_name} (current {APP_VERSION}).")
             should_prompt = manual or self._last_notified_update_tag != release.tag_name
             self._last_notified_update_tag = release.tag_name
-            if should_prompt:
-                message = [
-                    "A new version is available.",
-                    "",
-                    f"Current version: {APP_VERSION}",
-                    f"Latest release: {release.tag_name}",
-                ]
-                if release.asset_name:
-                    message.append(f"Asset: {release.asset_name}")
-                message.append("")
-                message.append("Open the GitHub release page now?")
-                if self.messagebox.askyesno(APP_NAME, "\n".join(message)):
-                    self.open_latest_release()
+            if self._should_auto_install(release):
+                self._last_auto_installed_tag = release.tag_name
+                self._append_log(f"Installing update {release.tag_name} automatically.")
+                self.start_update_install(release, manual=False)
+            elif should_prompt:
+                self._prompt_for_update(release)
         elif comparison == 0:
             self.update_status_var.set(f"Up to date: {APP_VERSION}")
             self._append_log(f"Update check complete: already on {APP_VERSION}.")
@@ -25083,6 +25332,153 @@ class DownloaderUI:
             self._update_headless_ui()
         if self.check_updates_var.get() and not self._exiting:
             self._schedule_update_check(initial=False)
+    def _should_auto_install(self, release: GitHubReleaseInfo) -> bool:
+        if not self.auto_install_updates_var.get():
+            return False
+        if self._update_install_in_progress or self._exiting:
+            return False
+        if self._last_auto_installed_tag == release.tag_name:
+            return False
+        if auto_install_unsupported_reason():
+            return False
+        if not release.installer_is_verifiable():
+            self._append_log(
+                f"Update {release.tag_name} cannot be installed automatically because it has no verifiable installer asset."
+            )
+            return False
+        return True
+
+    def _prompt_for_update(self, release: GitHubReleaseInfo) -> None:
+        message = [
+            "A new version is available.",
+            "",
+            f"Current version: {APP_VERSION}",
+            f"Latest release: {release.tag_name}",
+        ]
+        if release.asset_name:
+            message.append(f"Asset: {release.asset_name}")
+        message.append("")
+        can_install = not auto_install_unsupported_reason() and release.installer_is_verifiable()
+        if can_install:
+            message.append("Download and install it now?")
+            message.append("The app closes while the installer runs and reopens afterwards.")
+            message.append("")
+            message.append("Yes: install now    No: open the release page    Cancel: not now")
+            answer = self.messagebox.askyesnocancel(APP_NAME, "\n".join(message))
+            if answer is None:
+                return
+            if answer:
+                self.start_update_install(release, manual=True)
+            else:
+                self.open_latest_release()
+            return
+        message.append("Open the GitHub release page now?")
+        if self.messagebox.askyesno(APP_NAME, "\n".join(message)):
+            self.open_latest_release()
+
+    def download_and_install_update(self) -> None:
+        release = self._latest_release_info
+        if release is None or compare_version_tags(release.tag_name, APP_VERSION) <= 0:
+            self.messagebox.showinfo(APP_NAME, "No newer release has been found yet. Run an update check first.")
+            return
+        reason = auto_install_unsupported_reason()
+        if reason:
+            self.messagebox.showinfo(APP_NAME, f"{reason}\n\nThe release page will be opened instead.")
+            self.open_latest_release()
+            return
+        if not release.installer_is_verifiable():
+            self.messagebox.showwarning(
+                APP_NAME,
+                "This release does not publish a verifiable installer, so it will not be installed automatically.\n\n"
+                "The release page will be opened instead.",
+            )
+            self.open_latest_release()
+            return
+        self.start_update_install(release, manual=True)
+
+    def start_update_install(self, release: GitHubReleaseInfo, manual: bool) -> None:
+        if self._update_install_in_progress:
+            if manual:
+                self._append_log("An update installation is already in progress.")
+            return
+        self._update_install_in_progress = True
+        self.update_status_var.set(f"Downloading update {release.tag_name}...")
+        self._append_log(f"Downloading update {release.tag_name} ({release.asset_name}).")
+        thread = threading.Thread(
+            target=self._update_install_worker,
+            args=(release, manual),
+            daemon=True,
+            name="NishizumiPaintsUpdateInstall",
+        )
+        thread.start()
+
+    def _update_install_worker(self, release: GitHubReleaseInfo, manual: bool) -> None:
+        last_percent = -1
+
+        def report(downloaded: int, total: int) -> None:
+            nonlocal last_percent
+            if total <= 0:
+                return
+            percent = int(downloaded * 100 / total)
+            if percent == last_percent or percent % 5:
+                return
+            last_percent = percent
+            self.root.after(0, lambda: self.update_status_var.set(f"Downloading update {release.tag_name}: {percent}%"))
+
+        try:
+            clean_update_workspace()
+            installer = download_release_installer(release, progress_cb=report)
+            clean_update_workspace(keep=installer)
+            error = None
+        except Exception as exc:
+            installer = None
+            error = str(exc)
+        self.root.after(0, lambda: self._finish_update_install(release, installer, error, manual))
+
+    def _finish_update_install(
+        self,
+        release: GitHubReleaseInfo,
+        installer: Path | None,
+        error: str | None,
+        manual: bool,
+    ) -> None:
+        self._update_install_in_progress = False
+        if error or installer is None:
+            self.update_status_var.set(f"Update {release.tag_name}: download failed")
+            self._append_log(f"Update download failed: {error}")
+            if manual:
+                self.messagebox.showerror(
+                    APP_NAME,
+                    f"Could not download the update.\n\n{error}\n\nYou can still install it manually from the release page.",
+                )
+            return
+        self._append_log(f"Update {release.tag_name} verified against the published SHA-256 digest.")
+        self.update_status_var.set(f"Installing update {release.tag_name}...")
+        try:
+            start_update_installer(installer)
+        except Exception as exc:
+            self.update_status_var.set(f"Update {release.tag_name}: install failed")
+            self._append_log(f"Could not start the update installer: {exc}")
+            self.messagebox.showerror(APP_NAME, f"Could not start the update installer.\n\n{exc}")
+            return
+        self._append_log("The installer is running. The app will close and reopen on the new version.")
+        self.request_exit_for_update()
+
+    def request_exit_for_update(self) -> None:
+        """Close the app fully so the installer can replace the files it has open.
+
+        This deliberately bypasses on_close(), which would only hide to the tray and
+        leave the running .exe locked.
+        """
+        try:
+            self.exit_app()
+        except Exception as exc:
+            self._append_log(f"Forcing shutdown for the update after an error: {exc}")
+            try:
+                self.root.destroy()
+            except Exception:
+                pass
+
     def open_latest_release(self) -> None:
         target_url = GITHUB_RELEASES_PAGE_LATEST
         if self._latest_release_info is not None:
@@ -25195,6 +25591,7 @@ class DownloaderUI:
             show_activity_log=bool(self.show_activity_var.get()),
             show_tp_monitor=bool(self.show_tp_monitor_var.get()),
             check_updates_automatically=bool(self.check_updates_var.get()),
+            auto_install_updates=bool(self.auto_install_updates_var.get()),
             download_workers_mode=mode,
             manual_download_workers=manual_workers,
             manual_manifest_workers=manual_manifest_workers,

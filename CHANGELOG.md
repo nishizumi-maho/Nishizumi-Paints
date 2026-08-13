@@ -2,6 +2,22 @@
 
 All notable user-facing changes to Nishizumi Paints are documented here.
 
+## [7.3.2] - 2026-08-13
+
+### Added
+
+- Added in-app updates. When a newer release is found, Nishizumi Paints can download the installer itself, verify it, run it silently and reopen on the new version, instead of only pointing you at the GitHub release page.
+- Added an **Install updates automatically** preference (off by default) on the General tab. With it off, the update notice now offers *install now*, *open the release page*, or *not now*; with it on, a verified update is installed without asking.
+- Added an **Install update** button next to **Check updates**.
+
+### Security
+
+- A downloaded installer is only executed after its SHA-256 matches the digest published with the release, the download URL and every redirect hop stay on GitHub's own release hosts over HTTPS, the asset filename is a plain `.exe`, and the size stays under 400 MB. If any check fails the file is deleted and the release page is opened instead.
+
+### Notes
+
+- Automatic installation requires the packaged Windows `.exe`. Source checkouts and the headless service still only report that an update exists.
+
 ## [7.3.1] - 2026-08-12
 
 ### Fixed
