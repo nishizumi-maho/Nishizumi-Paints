@@ -91,6 +91,12 @@ Advanced mode exposes the full tab set:
 
 You can switch between Easy mode and Advanced mode at any time from inside the app.
 
+### Window size and scrolling
+
+Every tab is a scrollable page. A tab that fits the window looks and behaves exactly like a fixed one, and panels that stretch to the bottom of the window still stretch. A tab that does not fit shows a scrollbar, so no option is ever cut off below the window. The mouse wheel scrolls the tab under the pointer, `Shift` and the wheel scroll sideways, and lists with their own scrollbar keep the wheel while the pointer is over them.
+
+The window opens at 1440x760, or smaller when the screen cannot fit that, and can be resized down to 960x560.
+
 ## Architecture references
 
 For code-oriented documentation, also read:

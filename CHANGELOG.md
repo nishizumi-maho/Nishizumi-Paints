@@ -2,6 +2,17 @@
 
 All notable user-facing changes to Nishizumi Paints are documented here.
 
+## [7.3.3] - 2026-08-13
+
+### Fixed
+
+- Fixed options being cut off below the bottom of the window. Every tab now scrolls when its content does not fit, so the settings added in the last releases stay reachable on smaller windows and screens. A scrollbar only appears while a tab really is too big, and the mouse wheel scrolls the tab under the pointer.
+- The window now opens at a size that fits the screen instead of always asking for 1440x760, and it can be resized down to 960x560 (was 1220x620), because nothing is lost off-screen anymore.
+
+### Changed
+
+- The Session driver list asks for 12 rows instead of 18. It still grows to fill the tab, so nothing changes on a normal window; it only means the list gives room back before the Session tab starts scrolling.
+
 ## [7.3.2] - 2026-08-13
 
 ### Added

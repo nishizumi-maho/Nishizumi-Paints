@@ -1,5 +1,13 @@
 # Troubleshooting
 
+## Some options are cut off at the bottom of the window
+
+They are not cut off anymore. Every tab scrolls when its content is taller than the window, so scroll the tab down with the scrollbar on its right side or with the mouse wheel.
+
+If the wheel does not move the page, the pointer is over a list that scrolls on its own, such as the driver table, the activity log, or the collection list. Move the pointer over an empty part of the tab and the page scrolls again.
+
+Making the window bigger, or maximizing it, removes the scrollbar as soon as everything fits.
+
 ## My paint does not show in the iRacing UI 3D car viewer
 
 Open `General > iRacing UI car previews` and read the status line first. The most common causes are:

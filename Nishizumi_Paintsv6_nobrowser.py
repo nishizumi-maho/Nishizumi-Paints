@@ -43,7 +43,7 @@ from requests.adapters import HTTPAdapter
 # Browserless copy: Trading Paints browser automation is intentionally disabled.
 sync_playwright = None
 APP_NAME = "Nishizumi Paints"
-APP_VERSION = "7.3.2"
+APP_VERSION = "7.3.3"
 APP_REGISTRY_NAME = "NishizumiPaints"
 APP_CONFIG_DIRNAME = "NishizumiPaints"
 APP_TOOLTIP = f"{APP_NAME} {APP_VERSION}"
@@ -169,6 +169,11 @@ REPLAY_PACK_IDLE_SCAN_SECONDS = 30.0
 REPLAY_PACK_FULL_SCAN_SECONDS = 120.0
 RANDOM_POOL_SUMMARY_REFRESH_SECONDS = 60.0
 LOG_HISTORY_LIMIT = 2000
+WINDOW_PREFERRED_SIZE = (1440, 760)
+WINDOW_MIN_SIZE = (960, 560)
+WINDOW_SCREEN_MARGIN = (40, 80)
+WINDOW_ABSOLUTE_MIN_SIZE = (640, 400)
+PAGE_SCROLL_TOLERANCE_PX = 1
 LOG_QUEUE_LIMIT = 5000
 LOG_RENDER_BATCH_SIZE = 300
 LOG_HIDDEN_DRAIN_BATCH_SIZE = 1000
@@ -846,6 +851,66 @@ def normalize_ui_mode_preference(value: str | None) -> str:
     if mode in {"easy", "basic", "simple"} or mode.startswith("easy_") or mode.endswith("_easy"):
         return "easy"
     return "advanced"
+
+
+def preferred_window_size(screen_width: object, screen_height: object) -> tuple[int, int]:
+    """Largest comfortable main window that still fits on the current screen."""
+    try:
+        available_width = int(screen_width) - WINDOW_SCREEN_MARGIN[0]
+        available_height = int(screen_height) - WINDOW_SCREEN_MARGIN[1]
+    except (TypeError, ValueError):
+        return WINDOW_PREFERRED_SIZE
+    width = min(WINDOW_PREFERRED_SIZE[0], available_width) if available_width > 0 else WINDOW_PREFERRED_SIZE[0]
+    height = min(WINDOW_PREFERRED_SIZE[1], available_height) if available_height > 0 else WINDOW_PREFERRED_SIZE[1]
+    return max(width, WINDOW_ABSOLUTE_MIN_SIZE[0]), max(height, WINDOW_ABSOLUTE_MIN_SIZE[1])
+
+
+def scrollable_page_geometry(
+    view_width: object,
+    view_height: object,
+    content_width: object,
+    content_height: object,
+) -> tuple[int, int, bool, bool]:
+    """Size a scrollable page inside its viewport and say which scrollbars it needs.
+
+    The page always fills the viewport, so a page that fits keeps expanding exactly
+    like an unscrolled one. Only the extra size beyond the viewport is scrolled.
+    """
+    def _to_int(value: object, fallback: int = 1) -> int:
+        try:
+            return max(int(value), 1)
+        except (TypeError, ValueError):
+            return fallback
+
+    view_width = _to_int(view_width)
+    view_height = _to_int(view_height)
+    content_width = _to_int(content_width)
+    content_height = _to_int(content_height)
+    needs_horizontal = content_width > view_width + PAGE_SCROLL_TOLERANCE_PX
+    needs_vertical = content_height > view_height + PAGE_SCROLL_TOLERANCE_PX
+    return max(view_width, content_width), max(view_height, content_height), needs_horizontal, needs_vertical
+
+
+def mousewheel_scroll_steps(delta: object, number: object = 0) -> int:
+    """Turn a Tk mouse wheel event into scroll units, positive meaning downwards."""
+    try:
+        number = int(number)
+    except (TypeError, ValueError):
+        number = 0
+    if number == 4:
+        return -1
+    if number == 5:
+        return 1
+    try:
+        delta = int(delta)
+    except (TypeError, ValueError):
+        return 0
+    if delta == 0:
+        return 0
+    if abs(delta) < 120:
+        # macOS and precision wheels report small deltas instead of 120 per notch.
+        return -1 if delta > 0 else 1
+    return -int(delta / 120)
 
 
 def normalize_tp_showroom_source(value: object) -> str:
@@ -22118,13 +22183,15 @@ class DownloaderUI:
         self.showroom_tab = None
         self.logs_tab = None
         self._advanced_tabs: tuple[object, ...] = ()
+        self._page_scroll_states: dict[str, dict[str, object]] = {}
         self.easy_log_text = None
         self.easy_log_frame = None
         self.easy_ai_roster_member_id_entry = None
         self.root = tk.Tk()
         self.root.title(APP_NAME)
-        self.root.geometry("1440x760")
-        self.root.minsize(1220, 620)
+        window_width, window_height = preferred_window_size(self.root.winfo_screenwidth(), self.root.winfo_screenheight())
+        self.root.geometry(f"{window_width}x{window_height}")
+        self.root.minsize(min(WINDOW_MIN_SIZE[0], window_width), min(WINDOW_MIN_SIZE[1], window_height))
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self._apply_window_icon()
         self.tray_icon = WindowsTrayIcon(
@@ -22340,6 +22407,195 @@ class DownloaderUI:
                 self.root.iconphoto(True, self._window_icon_image)
         except Exception:
             pass
+
+    def _add_scrollable_tab(self, notebook, title: str, *, padding: int = 10) -> tuple[object, object]:
+        """Add a notebook tab whose content scrolls when it does not fit the window.
+
+        Returns the tab frame the notebook knows about and the page frame the tab
+        content must be built inside.
+        """
+        tk = self.tk
+        ttk = self.ttk
+        tab = ttk.Frame(notebook)
+        tab.columnconfigure(0, weight=1)
+        tab.rowconfigure(0, weight=1)
+        canvas = tk.Canvas(tab, borderwidth=0, highlightthickness=0, takefocus=0)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        try:
+            background = ttk.Style().lookup("TFrame", "background")
+            if background:
+                canvas.configure(background=background)
+        except Exception:
+            pass
+        vertical_bar = ttk.Scrollbar(tab, orient="vertical", command=canvas.yview)
+        horizontal_bar = ttk.Scrollbar(tab, orient="horizontal", command=canvas.xview)
+        canvas.configure(yscrollcommand=vertical_bar.set, xscrollcommand=horizontal_bar.set)
+        page = ttk.Frame(canvas, padding=padding)
+        window = canvas.create_window(0, 0, window=page, anchor="nw")
+        state: dict[str, object] = {
+            "canvas": canvas,
+            "page": page,
+            "window": window,
+            "vertical_bar": vertical_bar,
+            "horizontal_bar": horizontal_bar,
+            "vertical_shown": False,
+            "horizontal_shown": False,
+            "sync_pending": False,
+        }
+        self._page_scroll_states[str(canvas)] = state
+        canvas.bind("<Configure>", lambda _event, s=state: self._request_page_scroll_sync(s))
+        page.bind("<Configure>", lambda _event, s=state: self._request_page_scroll_sync(s))
+        notebook.add(tab, text=title)
+        self._request_page_scroll_sync(state)
+        return tab, page
+
+    def _request_page_scroll_sync(self, state: dict[str, object]) -> None:
+        if state.get("sync_pending"):
+            return
+        state["sync_pending"] = True
+        try:
+            self.root.after_idle(lambda: self._sync_page_scroll(state))
+        except Exception:
+            state["sync_pending"] = False
+
+    def _sync_page_scroll(self, state: dict[str, object]) -> None:
+        state["sync_pending"] = False
+        canvas = state["canvas"]
+        page = state["page"]
+        try:
+            if not canvas.winfo_exists() or not page.winfo_exists():
+                return
+            if not canvas.winfo_ismapped():
+                # A hidden tab has no usable size yet; showing it fires <Configure>.
+                return
+            content_width = page.winfo_reqwidth()
+            content_height = page.winfo_reqheight()
+            state["measured"] = (content_width, content_height)
+            width, height, needs_horizontal, needs_vertical = scrollable_page_geometry(
+                canvas.winfo_width(),
+                canvas.winfo_height(),
+                content_width,
+                content_height,
+            )
+            canvas.itemconfigure(state["window"], width=width, height=height)
+            canvas.configure(scrollregion=(0, 0, width, height))
+            if needs_vertical != state["vertical_shown"]:
+                state["vertical_shown"] = needs_vertical
+                if needs_vertical:
+                    state["vertical_bar"].grid(row=0, column=1, sticky="ns")
+                else:
+                    state["vertical_bar"].grid_remove()
+                    canvas.yview_moveto(0.0)
+            if needs_horizontal != state["horizontal_shown"]:
+                state["horizontal_shown"] = needs_horizontal
+                if needs_horizontal:
+                    state["horizontal_bar"].grid(row=1, column=0, sticky="ew")
+                else:
+                    state["horizontal_bar"].grid_remove()
+                    canvas.xview_moveto(0.0)
+        except Exception:
+            pass
+
+    def _refresh_page_scroll_regions(self) -> None:
+        """Re-measure pages whose content grew or shrank inside their pinned size.
+
+        Options are shown and hidden while the app runs, and that changes what a page
+        asks for without changing the size it was given, so no <Configure> arrives.
+        """
+        for state in list(self._page_scroll_states.values()):
+            page = state["page"]
+            try:
+                if not page.winfo_exists():
+                    continue
+                measured = (page.winfo_reqwidth(), page.winfo_reqheight())
+            except Exception:
+                continue
+            if measured != state.get("measured"):
+                self._request_page_scroll_sync(state)
+
+    def _bind_page_scroll_events(self) -> None:
+        root = self.root
+        for sequence, handler in (
+            ("<MouseWheel>", self._on_page_mousewheel),
+            ("<Button-4>", self._on_page_mousewheel),
+            ("<Button-5>", self._on_page_mousewheel),
+            ("<Shift-MouseWheel>", self._on_page_shift_mousewheel),
+        ):
+            try:
+                root.bind_all(sequence, handler, add="+")
+            except Exception:
+                pass
+
+    def _on_page_mousewheel(self, event):
+        return self._handle_page_wheel(event, "y")
+
+    def _on_page_shift_mousewheel(self, event):
+        return self._handle_page_wheel(event, "x")
+
+    def _handle_page_wheel(self, event, axis: str):
+        if not self._page_scroll_states:
+            return None
+        steps = mousewheel_scroll_steps(getattr(event, "delta", 0), getattr(event, "num", 0))
+        if not steps:
+            return None
+        try:
+            # On Windows the wheel event is delivered to the focused widget, so the
+            # page under the pointer has to be looked up by position.
+            widget = self.root.winfo_containing(event.x_root, event.y_root)
+        except Exception:
+            widget = None
+        while widget is not None:
+            state = self._page_scroll_states.get(str(widget))
+            if state is not None:
+                return self._scroll_page(state, steps, axis)
+            if self._widget_scrolls_itself(widget, axis):
+                return self._forward_wheel_to_widget(widget, steps, axis)
+            widget = getattr(widget, "master", None)
+        return None
+
+    def _scroll_page(self, state: dict[str, object], steps: int, axis: str):
+        shown = state["vertical_shown"] if axis == "y" else state["horizontal_shown"]
+        if not shown:
+            return None
+        canvas = state["canvas"]
+        try:
+            if axis == "y":
+                canvas.yview_scroll(steps, "units")
+            else:
+                canvas.xview_scroll(steps, "units")
+        except Exception:
+            return None
+        return "break"
+
+    def _widget_scrolls_itself(self, widget, axis: str) -> bool:
+        view = getattr(widget, "yview" if axis == "y" else "xview", None)
+        if not callable(view):
+            return False
+        try:
+            first, last = (float(value) for value in view())
+        except Exception:
+            return False
+        return 0.0 < (last - first) < 0.999
+
+    def _forward_wheel_to_widget(self, widget, steps: int, axis: str):
+        # Tk scrolls the widget under the pointer by itself everywhere except Windows,
+        # where the wheel follows the keyboard focus instead.
+        try:
+            if self.root.tk.call("tk", "windowingsystem") != "win32":
+                return None
+            if self.root.focus_get() is widget:
+                return None
+        except Exception:
+            return None
+        try:
+            if axis == "y":
+                widget.yview_scroll(steps, "units")
+            else:
+                widget.xview_scroll(steps, "units")
+        except Exception:
+            return None
+        return "break"
+
     def _build_ui(self) -> None:
         ttk = self.ttk
         root = self.root
@@ -22360,22 +22616,18 @@ class DownloaderUI:
         notebook = ttk.Notebook(outer)
         notebook.grid(row=1, column=0, sticky="nsew", pady=(10, 8))
         self.main_notebook = notebook
-        easy_tab = ttk.Frame(notebook, padding=10)
-        session_tab = ttk.Frame(notebook, padding=10)
-        general_tab = ttk.Frame(notebook, padding=10)
-        ai_tab = ttk.Frame(notebook, padding=10)
-        random_tab = ttk.Frame(notebook, padding=10)
-        showroom_tab = ttk.Frame(notebook, padding=10)
-        experimental_tab = ttk.Frame(notebook, padding=10)
-        logs_tab = ttk.Frame(notebook, padding=10)
-        notebook.add(easy_tab, text="Easy")
-        notebook.add(session_tab, text="Session")
-        notebook.add(general_tab, text="General")
-        notebook.add(ai_tab, text="AI")
-        notebook.add(random_tab, text="Random")
-        notebook.add(showroom_tab, text="Showroom")
+        self._bind_page_scroll_events()
+        # Every page is scrollable, so options that do not fit the window stay reachable
+        # instead of being cut off below its bottom edge.
+        easy_tab, easy_page = self._add_scrollable_tab(notebook, "Easy")
+        session_tab, session_page = self._add_scrollable_tab(notebook, "Session")
+        general_tab, general_page = self._add_scrollable_tab(notebook, "General")
+        ai_tab, ai_page = self._add_scrollable_tab(notebook, "AI")
+        random_tab, random_page = self._add_scrollable_tab(notebook, "Random")
+        showroom_tab, showroom_page = self._add_scrollable_tab(notebook, "Showroom")
         # Experimental tab is intentionally kept in the codebase but hidden from the notebook for now.
-        notebook.add(logs_tab, text="Logs")
+        experimental_page = ttk.Frame(notebook, padding=10)
+        logs_tab, logs_page = self._add_scrollable_tab(notebook, "Logs")
         notebook.select(general_tab)
         self.easy_tab = easy_tab
         self.session_tab = session_tab
@@ -22386,20 +22638,22 @@ class DownloaderUI:
         self.logs_tab = logs_tab
         self._advanced_tabs = (session_tab, general_tab, ai_tab, random_tab, showroom_tab, logs_tab)
 
-        session_tab.columnconfigure(0, weight=1)
-        session_tab.rowconfigure(1, weight=1)
-        session_info = ttk.LabelFrame(session_tab, text="Current session", padding=10)
+        session_page.columnconfigure(0, weight=1)
+        session_page.rowconfigure(1, weight=1)
+        session_info = ttk.LabelFrame(session_page, text="Current session", padding=10)
         session_info.grid(row=0, column=0, sticky="ew")
         session_info.columnconfigure(0, weight=1)
         ttk.Label(session_info, textvariable=self.session_summary_var, justify="left").grid(row=0, column=0, sticky="w")
         ttk.Label(session_info, textvariable=self.session_status_summary_var, justify="left", foreground="#555555").grid(row=1, column=0, sticky="w", pady=(4, 0))
         ttk.Button(session_info, text="Force refresh current car/team", command=self.force_refresh_current_car_team).grid(row=0, column=1, rowspan=2, sticky="e", padx=(12, 0))
 
-        driver_list_frame = ttk.LabelFrame(session_tab, text="Drivers in session", padding=8)
+        driver_list_frame = ttk.LabelFrame(session_page, text="Drivers in session", padding=8)
         driver_list_frame.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
         driver_list_frame.columnconfigure(0, weight=1)
         driver_list_frame.rowconfigure(0, weight=1)
-        self.session_tree = ttk.Treeview(driver_list_frame, columns=("car", "suit", "helmet", "id", "num", "ir", "lic", "sr", "name", "swap", "refresh"), show="headings", height=18, selectmode="extended")
+        # The list still grows to fill the tab; the smaller request is how far it may
+        # shrink on a small window before the page starts scrolling instead.
+        self.session_tree = ttk.Treeview(driver_list_frame, columns=("car", "suit", "helmet", "id", "num", "ir", "lic", "sr", "name", "swap", "refresh"), show="headings", height=12, selectmode="extended")
         self.session_tree.heading("car", text="Car", command=lambda: self.on_session_heading_clicked("car"))
         self.session_tree.heading("suit", text="Suit", command=lambda: self.on_session_heading_clicked("suit"))
         self.session_tree.heading("helmet", text="Helmet", command=lambda: self.on_session_heading_clicked("helmet"))
@@ -22447,7 +22701,7 @@ class DownloaderUI:
         }.items():
             self.session_tree.tag_configure(tag_name, foreground=color)
 
-        driver_actions = ttk.LabelFrame(session_tab, text="Driver fixed paints", padding=8)
+        driver_actions = ttk.LabelFrame(session_page, text="Driver fixed paints", padding=8)
         driver_actions.grid(row=2, column=0, sticky="ew", pady=(10, 0))
         driver_actions.columnconfigure(0, weight=1)
         ttk.Label(driver_actions, textvariable=self.session_driver_action_summary_var, foreground="#555555").grid(row=0, column=0, sticky="w")
@@ -22475,8 +22729,8 @@ class DownloaderUI:
                 self.session_driver_action_buttons.append(button)
                 self.session_driver_action_buttons_by_kind[(kind, action_key)] = button
 
-        general_tab.columnconfigure(0, weight=1)
-        general_actions = ttk.LabelFrame(general_tab, text="Actions", padding=10)
+        general_page.columnconfigure(0, weight=1)
+        general_actions = ttk.LabelFrame(general_page, text="Actions", padding=10)
         general_actions.grid(row=0, column=0, sticky="w")
         ttk.Button(general_actions, text="Clear downloaded", command=self.clear_downloaded_now).pack(side="left")
         ttk.Button(general_actions, text="Refresh paints", command=self.redownload_now).pack(side="left", padx=(8, 0))
@@ -22485,7 +22739,7 @@ class DownloaderUI:
         ttk.Button(general_actions, text="Check updates", command=self.check_updates_now).pack(side="left", padx=(8, 0))
         ttk.Button(general_actions, text="Install update", command=self.download_and_install_update).pack(side="left", padx=(8, 0))
 
-        general_settings = ttk.Frame(general_tab)
+        general_settings = ttk.Frame(general_page)
         general_settings.grid(row=1, column=0, sticky="ew", pady=(10, 0))
         general_settings.columnconfigure(0, weight=1)
         general_settings.columnconfigure(1, weight=0)
@@ -22625,7 +22879,7 @@ class DownloaderUI:
         ).grid(row=10, column=0, columnspan=2, sticky="w", pady=(8, 0))
         ttk.Label(perf, text="Safe = one online car lane at a time. Session Total = one car lane per active car group. Manual = cap the concurrent car lanes yourself. The retry option keeps timed-out online paints in one last online recovery pass before the app falls back to the local pool.", foreground="#666666", wraplength=320, justify="left").grid(row=11, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
-        ui_previews = ttk.LabelFrame(general_tab, text="iRacing UI car previews", padding=10)
+        ui_previews = ttk.LabelFrame(general_page, text="iRacing UI car previews", padding=10)
         ui_previews.grid(row=2, column=0, sticky="ew", pady=(10, 0))
         ui_previews.columnconfigure(0, weight=1)
         ttk.Checkbutton(
@@ -22677,9 +22931,9 @@ class DownloaderUI:
             justify="left",
         ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
-        ai_tab.columnconfigure(0, weight=0)
-        ai_tab.columnconfigure(1, weight=1)
-        ai_sync = ttk.LabelFrame(ai_tab, text="AI sync", padding=10)
+        ai_page.columnconfigure(0, weight=0)
+        ai_page.columnconfigure(1, weight=1)
+        ai_sync = ttk.LabelFrame(ai_page, text="AI sync", padding=10)
         ai_sync.grid(row=0, column=0, sticky="nw", padx=(0, 6))
         ttk.Checkbutton(ai_sync, text="Sync TP AI rosters", variable=self.sync_ai_rosters_var, command=self.on_setting_changed).pack(anchor="w")
         ttk.Label(ai_sync, text="Keeps Trading Paints AI rosters ready for copy and import actions.", foreground="#555555", justify="left", wraplength=300).pack(anchor="w", pady=(6, 0))
@@ -22693,7 +22947,7 @@ class DownloaderUI:
         self.ai_roster_member_id_entry.bind("<FocusOut>", lambda _e: self._refresh_ai_roster_member_id_summary())
         ttk.Button(ai_member_row, text="OK", command=self.save_ai_roster_member_id).pack(side="left", padx=(8, 0))
         ttk.Label(ai_sync, textvariable=self.ai_roster_member_id_summary_var, foreground="#555555", justify="left", wraplength=300).pack(anchor="w", pady=(6, 0))
-        ai_collection_random = ttk.LabelFrame(ai_tab, text="TP collection roster random fallback", padding=10)
+        ai_collection_random = ttk.LabelFrame(ai_page, text="TP collection roster random fallback", padding=10)
         ai_collection_random.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(10, 0))
         ttk.Label(
             ai_collection_random,
@@ -22720,22 +22974,22 @@ class DownloaderUI:
             variable=self.ai_collection_skip_random_suits_var,
             command=self.on_setting_changed,
         ).pack(anchor="w", pady=(4, 0))
-        ai_actions = ttk.LabelFrame(ai_tab, text="AI actions", padding=10)
+        ai_actions = ttk.LabelFrame(ai_page, text="AI actions", padding=10)
         ai_actions.grid(row=0, column=1, rowspan=2, sticky="nsew", padx=(6, 0))
         ttk.Button(ai_actions, text="Sync AI rosters", command=self.sync_ai_rosters_now).pack(fill="x")
         ttk.Button(ai_actions, text="Randomize active AI roster", command=self.randomize_active_ai_roster).pack(fill="x", pady=(6, 0))
         ttk.Button(ai_actions, text="Clone active AI roster", command=self.clone_active_ai_roster).pack(fill="x", pady=(6, 0))
         ttk.Button(ai_actions, text="Copy my car to AI", command=self.copy_my_current_car_to_ai).pack(fill="x", pady=(6, 0))
         ttk.Button(ai_actions, text="Copy session cars to AI", command=self.copy_session_cars_to_ai).pack(fill="x", pady=(6, 0))
-        ai_folders = ttk.LabelFrame(ai_tab, text="Folders", padding=10)
+        ai_folders = ttk.LabelFrame(ai_page, text="Folders", padding=10)
         ai_folders.grid(row=1, column=0, sticky="ew", pady=(10, 0), padx=(0, 6))
         ai_folder_row = ttk.Frame(ai_folders)
         ai_folder_row.pack(fill="x")
         ttk.Button(ai_folder_row, text="AI rosters", command=self.open_ai_rosters_folder).pack(side="left")
         ttk.Button(ai_folder_row, text="AI livery folder", command=self.open_ai_livery_folder).pack(side="left", padx=(8, 0))
 
-        random_tab.columnconfigure(0, weight=1)
-        random_top = ttk.LabelFrame(random_tab, text="Step 1 • Who should get fallback paints?", padding=10)
+        random_page.columnconfigure(0, weight=1)
+        random_top = ttk.LabelFrame(random_page, text="Step 1 • Who should get fallback paints?", padding=10)
         random_top.grid(row=0, column=0, sticky="ew")
         ttk.Label(
             random_top,
@@ -22792,14 +23046,14 @@ class DownloaderUI:
             command=self.on_setting_changed,
         ).pack(anchor="w", pady=(4, 0))
 
-        self.source_pref_frame = ttk.LabelFrame(random_tab, text="Step 2 • Preferred source", padding=10)
+        self.source_pref_frame = ttk.LabelFrame(random_page, text="Step 2 • Preferred source", padding=10)
         self.source_pref_frame.grid(row=1, column=0, sticky="ew", pady=(10, 0))
         source_row = ttk.Frame(self.source_pref_frame)
         source_row.pack(anchor="w")
         ttk.Radiobutton(source_row, text="Local", value="Local", variable=self.tp_fallback_mode_var, command=self.on_tp_fallback_mode_changed).pack(side="left")
         ttk.Radiobutton(source_row, text="Online", value="Online", variable=self.tp_fallback_mode_var, command=self.on_tp_fallback_mode_changed).pack(side="left", padx=(12, 0))
 
-        self.online_mode_frame = ttk.LabelFrame(random_tab, text="Step 3 • Public showroom", padding=10)
+        self.online_mode_frame = ttk.LabelFrame(random_page, text="Step 3 • Public showroom", padding=10)
         self.online_mode_frame.grid(row=2, column=0, sticky="ew", pady=(10, 0))
         self.online_mode_frame.columnconfigure(0, weight=2)
         self.online_mode_frame.columnconfigure(1, weight=1)
@@ -22917,9 +23171,9 @@ class DownloaderUI:
         ttk.Button(collection_pool_actions, text="Clean cache...", command=self.clean_tp_collection_pool_now).pack(side="left", padx=(8, 0))
         ttk.Label(collection_pool_box, textvariable=self.tp_collection_pool_summary_var, justify="left", foreground="#555555", wraplength=430).grid(row=6, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
-        showroom_tab.columnconfigure(0, weight=1)
-        showroom_tab.rowconfigure(1, weight=1)
-        showroom_download_box = ttk.LabelFrame(showroom_tab, text="Download public car paints to RandomPool", padding=10)
+        showroom_page.columnconfigure(0, weight=1)
+        showroom_page.rowconfigure(1, weight=1)
+        showroom_download_box = ttk.LabelFrame(showroom_page, text="Download public car paints to RandomPool", padding=10)
         showroom_download_box.grid(row=0, column=0, sticky="ew")
         showroom_download_box.columnconfigure(0, weight=1)
         ttk.Label(
@@ -23022,8 +23276,8 @@ class DownloaderUI:
         ttk.Button(showroom_actions, text="Open showroom", command=self.open_tp_showroom).pack(side="left", padx=(8, 0))
         ttk.Label(showroom_download_box, textvariable=self.showroom_download_status_var, justify="left", foreground="#555555", wraplength=920).grid(row=5, column=0, sticky="w", pady=(10, 0))
 
-        experimental_tab.columnconfigure(0, weight=1)
-        experimental_top = ttk.LabelFrame(experimental_tab, text="Experimental extras", padding=10)
+        experimental_page.columnconfigure(0, weight=1)
+        experimental_top = ttk.LabelFrame(experimental_page, text="Experimental extras", padding=10)
         experimental_top.grid(row=0, column=0, sticky="ew")
         ttk.Label(
             experimental_top,
@@ -23077,16 +23331,16 @@ class DownloaderUI:
             wraplength=920,
         ).pack(anchor="w", pady=(4, 0))
 
-        logs_tab.columnconfigure(0, weight=1)
-        logs_tab.rowconfigure(4, weight=1)
-        logs_toolbar = ttk.LabelFrame(logs_tab, text="Log options", padding=10)
+        logs_page.columnconfigure(0, weight=1)
+        logs_page.rowconfigure(4, weight=1)
+        logs_toolbar = ttk.LabelFrame(logs_page, text="Log options", padding=10)
         logs_toolbar.grid(row=0, column=0, sticky="ew")
         ttk.Checkbutton(logs_toolbar, text="Show activity", variable=self.show_activity_var, command=self.on_setting_changed).pack(side="left")
         ttk.Checkbutton(logs_toolbar, text="Verbose logs", variable=self.verbose_var, command=self.on_setting_changed).pack(side="left", padx=(12, 0))
         ttk.Checkbutton(logs_toolbar, text="Show TP monitor", variable=self.show_tp_monitor_var, command=self.on_setting_changed).pack(side="left", padx=(12, 0))
         ttk.Button(logs_toolbar, text="Export log", command=self.export_log).pack(side="right")
         ttk.Button(logs_toolbar, text="Reset app settings", command=self.reset_program_config).pack(side="right", padx=(0, 8))
-        mapping_tools = ttk.LabelFrame(logs_tab, text="Automatic car identification", padding=10)
+        mapping_tools = ttk.LabelFrame(logs_page, text="Automatic car identification", padding=10)
         mapping_tools.grid(row=1, column=0, sticky="ew", pady=(10, 0))
         mapping_tools.columnconfigure(0, weight=1)
         ttk.Label(mapping_tools, textvariable=self.tp_mapping_status_var, justify="left", font=("Segoe UI", 9, "bold"), foreground="#0b63b6", wraplength=980).grid(row=0, column=0, sticky="w")
@@ -23096,15 +23350,15 @@ class DownloaderUI:
         mapping_actions.grid(row=3, column=0, sticky="ew", pady=(10, 0))
         ttk.Button(mapping_actions, text="Refresh catalog now", command=self.scan_tp_showroom_mappings_now).pack(side="left")
         ttk.Button(mapping_actions, text="Open Trading Paints templates", command=self.open_bundled_tp_showroom_mapping).pack(side="left", padx=(8, 0))
-        ttk.Label(logs_tab, text="Reset app settings deletes the saved settings file and restarts the app with defaults.", foreground="#b00020", justify="left").grid(row=2, column=0, sticky="w", pady=(8, 0))
-        self.monitor_frame = ttk.LabelFrame(logs_tab, text="TP worker monitor", padding=8)
+        ttk.Label(logs_page, text="Reset app settings deletes the saved settings file and restarts the app with defaults.", foreground="#b00020", justify="left").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        self.monitor_frame = ttk.LabelFrame(logs_page, text="TP worker monitor", padding=8)
         self.monitor_frame.grid(row=3, column=0, sticky="ew", pady=(10, 0))
         self.monitor_frame.columnconfigure(0, weight=1)
         ttk.Label(self.monitor_frame, textvariable=self.tp_monitor_summary_var, justify="left").grid(row=0, column=0, sticky="w")
         ttk.Label(self.monitor_frame, textvariable=self.tp_monitor_detail_var, justify="left").grid(row=1, column=0, sticky="w", pady=(4, 0))
         ttk.Label(self.monitor_frame, textvariable=self.tp_monitor_save_var, justify="left").grid(row=2, column=0, sticky="w", pady=(4, 0))
         ttk.Button(self.monitor_frame, text="Reset TP monitor", command=self.reset_tp_monitor).grid(row=0, column=1, rowspan=3, sticky="ns", padx=(12, 0))
-        self.log_frame = ttk.LabelFrame(logs_tab, text="Activity", padding=8)
+        self.log_frame = ttk.LabelFrame(logs_page, text="Activity", padding=8)
         self.log_frame.grid(row=4, column=0, sticky="nsew", pady=(10, 0))
         self.log_frame.columnconfigure(0, weight=1)
         self.log_frame.rowconfigure(0, weight=1)
@@ -23115,11 +23369,11 @@ class DownloaderUI:
         self._log_widget_line_count = 1
         self.log_text.configure(state="disabled")
 
-        easy_tab.columnconfigure(1, weight=1)
-        easy_tab.rowconfigure(0, weight=1)
-        easy_left = ttk.Frame(easy_tab)
+        easy_page.columnconfigure(1, weight=1)
+        easy_page.rowconfigure(0, weight=1)
+        easy_left = ttk.Frame(easy_page)
         easy_left.grid(row=0, column=0, sticky="nsw", padx=(0, 10))
-        easy_right = ttk.Frame(easy_tab)
+        easy_right = ttk.Frame(easy_page)
         easy_right.grid(row=0, column=1, sticky="nsew")
         easy_right.columnconfigure(0, weight=1)
         easy_right.rowconfigure(1, weight=1)
@@ -25102,6 +25356,7 @@ class DownloaderUI:
                     self.service.start()
         self._refresh_monitor_ui()
         self._refresh_random_pool_summary()
+        self._refresh_page_scroll_regions()
         if self._headless_controller_mode:
             self._refresh_headless_iracing_ui_preview_status()
         else:
