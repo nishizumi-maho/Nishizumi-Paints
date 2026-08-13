@@ -1,0 +1,151 @@
+name: Release installer
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag_suffix:
+        description: 'Pre-release suffix, for example "beta.1". Leave empty for a final release tag.'
+        required: false
+        default: 'beta.1'
+      prerelease:
+        description: 'Publish as a pre-release. The in-app updater only offers full releases, so a pre-release is opt-in.'
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-installer
+  cancel-in-progress: false
+
+jobs:
+  windows-installer:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Resolve version and tag
+        id: release
+        shell: pwsh
+        env:
+          TAG_SUFFIX: ${{ inputs.tag_suffix }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $match = Select-String -Path 'Nishizumi_Paintsv6_nobrowser.py' -Pattern '^APP_VERSION = "([^"]+)"' | Select-Object -First 1
+          if (-not $match) { throw 'APP_VERSION was not found in Nishizumi_Paintsv6_nobrowser.py.' }
+          $version = $match.Matches[0].Groups[1].Value
+          if ($version -notmatch '^\d+\.\d+(\.\d+)*$') { throw "APP_VERSION '$version' is not a plain version number." }
+          $suffix = "$env:TAG_SUFFIX".Trim()
+          if ($suffix -and $suffix -notmatch '^[A-Za-z0-9][A-Za-z0-9.\-]*$') { throw "Tag suffix '$suffix' is not a valid tag fragment." }
+          $tag = if ($suffix) { "v$version-$suffix" } else { "v$version" }
+          $installer = "NishizumiPaints-Setup-$version.exe"
+          Write-Host "Version $version, tag $tag, installer $installer"
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "installer=$installer" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install pyinstaller
+
+      - name: Syntax check
+        run: python -m py_compile .\Nishizumi_Paintsv6_nobrowser.py
+
+      - name: Unit tests
+        run: python -m unittest discover -s tests
+
+      - name: Build the app
+        run: >
+          python -m PyInstaller --noconfirm --clean --onedir --windowed
+          --name NishizumiPaints
+          --icon assets/icons/nishizumi_paints_icon.ico
+          --add-data "assets/icons/nishizumi_paints_icon.png;assets/icons"
+          --add-data "assets/icons/nishizumi_paints_icon.ico;assets/icons"
+          --hidden-import irsdk
+          Nishizumi_Paintsv6_nobrowser.py
+
+      - name: Build the installer
+        shell: pwsh
+        env:
+          APP_VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not (Test-Path 'dist\NishizumiPaints\NishizumiPaints.exe')) { throw 'PyInstaller did not produce dist\NishizumiPaints\NishizumiPaints.exe.' }
+          $searchRoots = @("$env:ProgramFiles\Inno Setup*", "${env:ProgramFiles(x86)}\Inno Setup*")
+          $iscc = Get-ChildItem -Path $searchRoots -Filter 'ISCC.exe' -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $iscc) {
+            Write-Host 'Inno Setup was not on the image, installing it.'
+            choco install innosetup --no-progress -y
+            $iscc = Get-ChildItem -Path $searchRoots -Filter 'ISCC.exe' -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          }
+          if (-not $iscc) { throw 'The Inno Setup compiler was not found.' }
+          Write-Host "Inno compiler: $($iscc.FullName)"
+          & $iscc.FullName "/DAppVersion=$env:APP_VERSION" "/DAppVersionInfo=$env:APP_VERSION.0" 'installer\NishizumiPaints.iss'
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed with exit code $LASTEXITCODE." }
+
+      - name: Write the release notes
+        id: notes
+        shell: pwsh
+        env:
+          APP_VERSION: ${{ steps.release.outputs.version }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          INSTALLER_NAME: ${{ steps.release.outputs.installer }}
+          IS_PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installerPath = Join-Path 'installer\output' $env:INSTALLER_NAME
+          if (-not (Test-Path $installerPath)) { throw "The installer was not found at $installerPath." }
+          $digest = (Get-FileHash -Algorithm SHA256 -Path $installerPath).Hash.ToLower()
+          $size = [math]::Round((Get-Item $installerPath).Length / 1MB, 1)
+          Write-Host "SHA-256 $digest ($size MB)"
+          $lines = New-Object System.Collections.Generic.List[string]
+          if ($env:IS_PRERELEASE -eq 'true') {
+            $lines.Add("**Beta build of $env:APP_VERSION.** It is published as a pre-release, so the in-app updater does not offer it: download and run the installer below to try it. It installs over an existing installation and keeps your settings, catalog cache, and paints.")
+            $lines.Add('')
+          }
+          $notesFile = "docs/release-notes/$env:APP_VERSION.md"
+          if (Test-Path $notesFile) {
+            $lines.Add((Get-Content -Path $notesFile -Raw))
+          } else {
+            $lines.Add("Nishizumi Paints $env:APP_VERSION. See CHANGELOG.md for what changed.")
+          }
+          $lines.Add('')
+          $lines.Add('## SHA-256')
+          $lines.Add('')
+          $lines.Add('The app verifies this digest before it runs a downloaded installer.')
+          $lines.Add('')
+          $lines.Add('```')
+          $lines.Add("$digest  $env:INSTALLER_NAME")
+          $lines.Add('```')
+          Set-Content -Path 'release-notes.md' -Value $lines -Encoding utf8
+          "digest=$digest" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Publish the release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          INSTALLER_NAME: ${{ steps.release.outputs.installer }}
+          IS_PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installerPath = Join-Path 'installer\output' $env:INSTALLER_NAME
+          $arguments = @('release', 'create', $env:RELEASE_TAG, $installerPath,
+            '--title', "Nishizumi Paints $env:RELEASE_TAG",
+            '--notes-file', 'release-notes.md',
+            '--target', $env:GITHUB_SHA)
+          if ($env:IS_PRERELEASE -eq 'true') { $arguments += '--prerelease' }
+          & gh @arguments
+          if ($LASTEXITCODE -ne 0) { throw "Publishing the release failed with exit code $LASTEXITCODE." }
+          Write-Host "Published $env:RELEASE_TAG"
