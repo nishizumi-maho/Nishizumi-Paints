@@ -29,6 +29,8 @@ Car identification is automatic: the app combines the iRacing SDK, Trading Paint
 
 Upgrades use the same app ID and install path, so a newer installer can be run over an existing installation.
 
+From 7.3.2 the installed app can update itself: when a newer release is found it offers to download and install it, and the **Install updates automatically** preference on the General tab does it without asking. The downloaded installer is only executed after its SHA-256 matches the digest published with the release and the download stayed on GitHub's release hosts; otherwise the release page is opened instead. Automatic installation needs the packaged `.exe` — source checkouts only report that an update exists.
+
 ## What's new in 7.3
 
 - The iRacing UI 3D car viewer (`My Content > Cars`) now always shows your own paints. Your Trading Paints car, custom number, spec, decal, helmet, and suit files are kept in the iRacing paint folder at all times instead of only during a live session.
