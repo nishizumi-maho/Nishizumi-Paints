@@ -347,11 +347,14 @@ If the probe times out, the app falls back to the pages already confirmed.
 
 The app does not ship or require a showroom mapping seed.
 
-It loads the live Trading Paints template catalog:
+It builds the catalog from two live pages:
 
-- `https://www.tradingpaints.com/cartemplates`
+- `https://www.tradingpaints.com/cartemplates` - vehicle name and exact `Documents/iRacing/paint/...` directory
+- `https://www.tradingpaints.com/showroom` - vehicle MID and category, read from the `/showroom/{Category}/{mid}/{slug}` make links
 
-Each record exposes the Trading Paints vehicle MID, vehicle name, and exact `Documents/iRacing/paint/...` directory. The catalog is cached in memory for six hours and refreshed immediately when an unknown directory is requested.
+The template page used to carry the MID in a `car_{mid}` element id. It no longer does, so the two pages are joined on the vehicle name. Several iRacing directories can share one showroom MID, because Trading Paints groups vehicle variants under a single make; a template that matches no make, or more than one equally specific make, is left out of the catalog.
+
+The catalog is cached in memory for six hours, refreshed immediately when an unknown directory is requested, and persisted to `%APPDATA%\NishizumiPaints\.nishizumi_tp_car_identity.json` so a page-layout change or an outage degrades to the last known-good catalog for up to 30 days.
 
 The iRacing SDK contributes the live car name, iRacing car ID, and `CarPath`. When iRacing exposes a directory alias not listed directly in the catalog, the app can bind that alias to a unique Trading Paints vehicle-name match.
 

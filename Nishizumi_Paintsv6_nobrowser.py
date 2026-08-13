@@ -43,7 +43,7 @@ from requests.adapters import HTTPAdapter
 # Browserless copy: Trading Paints browser automation is intentionally disabled.
 sync_playwright = None
 APP_NAME = "Nishizumi Paints"
-APP_VERSION = "7.3.0"
+APP_VERSION = "7.3.1"
 APP_REGISTRY_NAME = "NishizumiPaints"
 APP_CONFIG_DIRNAME = "NishizumiPaints"
 APP_TOOLTIP = f"{APP_NAME} {APP_VERSION}"
@@ -94,9 +94,13 @@ PAINT_HISTORY_LIMIT_PER_TARGET = 12
 PAINT_HISTORY_GLOBAL_LIMIT = 3000
 TP_RECENT_SCHEMES_HISTORY_LIMIT = 256
 TP_CAR_TEMPLATES_URL = "https://www.tradingpaints.com/cartemplates"
+TP_SHOWROOM_INDEX_URL = "https://www.tradingpaints.com/showroom"
 TP_CAR_IDENTITY_CACHE_TTL_SECONDS = 6 * 60 * 60
 TP_CAR_IDENTITY_RETRY_SECONDS = 60.0
 TP_CAR_IDENTITY_MIN_EXPECTED_ENTRIES = 50
+TP_CAR_IDENTITY_CACHE_FILENAME = ".nishizumi_tp_car_identity.json"
+TP_CAR_IDENTITY_DISK_CACHE_VERSION = 1
+TP_CAR_IDENTITY_DISK_CACHE_MAX_AGE_SECONDS = 30 * 24 * 60 * 60
 TP_SHOWROOM_STARTUP_SCAN_DELAY_MS = 3500
 TP_LOGIN_STATUS_FILENAME = ".nishizumi_tp_login_status.json"
 TP_ORIGINAL_SCHEME_CACHE_FILENAME = ".nishizumi_tp_original_scheme_cache.json"
@@ -5519,12 +5523,30 @@ def _tp_mapping_normalize_text(value: str) -> str:
     return " ".join(text.split())
 
 
-_TP_CAR_TEMPLATE_ENTRY_RE = re.compile(
-    r'<div\s+id=["\']car_(?P<mid>\d+)["\'][^>]*>'
-    r'.*?<h3[^>]*>(?P<name>.*?)</h3>'
-    r'.*?<span[^>]*>\s*Documents/iRacing/paint/(?P<directory>.*?)\s*</span>',
-    flags=re.IGNORECASE | re.DOTALL,
+# Trading Paints dropped the vehicle MID from the template page, so the catalog
+# is rebuilt from two pages: the template list supplies the iRacing paint
+# directory, and the showroom link index supplies the MID and the category.
+_TP_CAR_TEMPLATE_BLOCK_SPLIT_RE = re.compile(r'(?=<div\s+id=["\']car["\'])', flags=re.IGNORECASE)
+_TP_CAR_TEMPLATE_BLOCK_START_RE = re.compile(r'<div\s+id=["\']car["\']', flags=re.IGNORECASE)
+_TP_CAR_TEMPLATE_NAME_RE = re.compile(r'<h3[^>]*>(?P<name>.*?)</h3>', flags=re.IGNORECASE | re.DOTALL)
+# The path cell nests <span> tags inconsistently, so everything up to the end of
+# the cell is captured and flattened instead of matching a fixed tag shape.
+_TP_CAR_TEMPLATE_PATH_RE = re.compile(
+    r'akkurat-mono[^>]*>(?P<path>.*?)</div>', flags=re.IGNORECASE | re.DOTALL
 )
+_TP_CAR_TEMPLATE_DIRECTORY_RE = re.compile(
+    r'Documents/iRacing/paint/(?P<directory>.+)$', flags=re.IGNORECASE
+)
+_TP_SHOWROOM_MAKE_LINK_RE = re.compile(
+    r'/showroom/(?P<category>[A-Za-z]+)/(?P<mid>\d+)/(?P<slug>[^"\'?#\s<]+)'
+)
+# /showroom paths that look like a make link but are not one.
+_TP_SHOWROOM_NON_MAKE_SEGMENTS = {"hof", "potw", "view", "filter", "upload", "search"}
+_TP_NONWINGED_RE = re.compile(r'non[\s\-]*winged', flags=re.IGNORECASE)
+_TP_IDENTITY_MATCH_STOPWORDS = {"legacy"}
+# Surface words Trading Paints puts on a grouped make ("Modifieds - Asphalt")
+# that never appear in the iRacing template name or directory.
+_TP_MAKE_OPTIONAL_QUALIFIERS = {"asphalt"}
 _TP_CAR_IDENTITY_CACHE_LOCK = threading.RLock()
 _TP_CAR_IDENTITY_CACHE_DOC: dict[str, Any] | None = None
 _TP_CAR_IDENTITY_CACHE_AT = 0.0
@@ -5559,14 +5581,129 @@ def _tp_identity_name_key(value: object) -> str:
     return "".join(tokens)
 
 
-def _parse_tp_car_templates_html(page_html: str) -> list[dict[str, Any]]:
-    entries: list[dict[str, Any]] = []
-    for match in _TP_CAR_TEMPLATE_ENTRY_RE.finditer(str(page_html or "")):
+def _tp_flatten_template_path(value: object) -> str:
+    """Flatten the nested <span> soup into a plain ``Documents/iRacing/paint/dir``."""
+    return re.sub(r"\s*/\s*", "/", _tp_clean_html_text(value))
+
+
+def _parse_tp_car_template_rows(page_html: str) -> list[tuple[str, str]]:
+    """Read ``(vehicle name, iRacing paint directory)`` out of the template page."""
+    rows: list[tuple[str, str]] = []
+    for block in _TP_CAR_TEMPLATE_BLOCK_SPLIT_RE.split(str(page_html or "")):
+        if not _TP_CAR_TEMPLATE_BLOCK_START_RE.match(block):
+            continue
+        name_match = _TP_CAR_TEMPLATE_NAME_RE.search(block)
+        path_match = _TP_CAR_TEMPLATE_PATH_RE.search(block)
+        if not name_match or not path_match:
+            continue
+        name = _tp_clean_html_text(name_match.group("name"))
+        directory_match = _TP_CAR_TEMPLATE_DIRECTORY_RE.search(
+            _tp_flatten_template_path(path_match.group("path"))
+        )
+        if not name or not directory_match:
+            continue
+        directory = canonicalize_car_directory(directory_match.group("directory"))
+        if directory:
+            rows.append((name, directory))
+    return rows
+
+
+def _parse_tp_showroom_make_index(page_html: str) -> dict[int, dict[str, str]]:
+    """Read ``mid -> {category, name}`` from the ``/showroom`` make links."""
+    index: dict[int, dict[str, str]] = {}
+    for match in _TP_SHOWROOM_MAKE_LINK_RE.finditer(str(page_html or "")):
+        category = match.group("category")
+        if category.lower() in _TP_SHOWROOM_NON_MAKE_SEGMENTS:
+            continue
         mid = _to_int_or_none(match.group("mid")) or 0
-        name = _tp_clean_html_text(match.group("name"))
-        raw_directory = _tp_clean_html_text(match.group("directory"))
-        directory = canonicalize_car_directory(raw_directory)
-        if mid <= 0 or not name or not directory:
+        if mid <= 0:
+            continue
+        name = _tp_clean_html_text(urllib.parse.unquote(match.group("slug")).replace("-", " "))
+        if name:
+            index[mid] = {"category": category, "name": name}
+    return index
+
+
+def _tp_identity_match_tokens(value: object) -> set[str]:
+    """Token set used to match a template name against a showroom make name."""
+    text = _TP_NONWINGED_RE.sub("nonwinged", str(value or ""))
+    tokens: set[str] = set()
+    for word in _tp_mapping_normalize_text(text).split():
+        if word in _TP_IDENTITY_MATCH_STOPWORDS:
+            continue
+        if len(word) > 3 and word.endswith("s"):
+            word = word[:-1]
+        tokens.add(word)
+    return tokens
+
+
+def _tp_directory_tokens(directory: object) -> set[str]:
+    flat = str(directory or "").replace("\\", "/")
+    return {part for part in flat.split("/") if part}
+
+
+def _select_tp_make_for_template(
+    name: str,
+    directory: str,
+    make_index: dict[int, dict[str, str]],
+    claimed_mids: set[int],
+) -> int:
+    """Pick the showroom make for a template that has no exact name match.
+
+    Trading Paints groups several iRacing directories under one make (a single
+    "Dirt Sprint Cars" make covers ``dirtsprint\\winged\\305``, ``\\360`` and
+    ``\\410``). The directory segments join the name tokens so a variant can be
+    told apart, and the *most specific* make wins: scoring by overlap instead
+    would send ``dirtmicrosprint\\winged`` to the broader "Dirt Sprint Cars".
+    A tie is left unresolved rather than guessed.
+    """
+    haystack = _tp_identity_match_tokens(name) | _tp_directory_tokens(directory)
+    for drop_qualifiers in (False, True):
+        best: list[int] = []
+        best_size = -1
+        for mid in sorted(make_index):
+            if mid in claimed_mids:
+                continue
+            tokens = _tp_identity_match_tokens(make_index[mid].get("name"))
+            if drop_qualifiers:
+                tokens = tokens - _TP_MAKE_OPTIONAL_QUALIFIERS
+            if not tokens or not tokens <= haystack:
+                continue
+            if len(tokens) > best_size:
+                best, best_size = [mid], len(tokens)
+            elif len(tokens) == best_size:
+                best.append(mid)
+        if len(best) == 1:
+            return best[0]
+    return 0
+
+
+def _match_tp_template_rows_to_makes(
+    rows: Iterable[tuple[str, str]],
+    make_index: dict[int, dict[str, str]] | None = None,
+) -> list[dict[str, Any]]:
+    """Give every template row the showroom MID and category of its vehicle."""
+    rows = list(rows)
+    index = dict(make_index or {})
+    exact: dict[str, int] = {}
+    for mid in sorted(index):
+        key = _tp_identity_name_key(index[mid].get("name"))
+        if key:
+            exact.setdefault(key, mid)
+    claimed_mids = {
+        exact[_tp_identity_name_key(name)]
+        for name, _directory in rows
+        if _tp_identity_name_key(name) in exact
+    }
+    entries: list[dict[str, Any]] = []
+    for name, directory in rows:
+        mid = exact.get(_tp_identity_name_key(name), 0)
+        if mid <= 0:
+            mid = _select_tp_make_for_template(name, directory, index, claimed_mids)
+        if mid <= 0:
+            logging.debug(
+                "No Trading Paints showroom make matched the template %r (%s).", name, directory
+            )
             continue
         entries.append(
             {
@@ -5575,12 +5712,19 @@ def _parse_tp_car_templates_html(page_html: str) -> list[dict[str, Any]]:
                 "iracing_name": name,
                 "directory": directory,
                 "slug": _tp_vehicle_slug(name, mid),
-                "category": "Road",
+                "category": str(index.get(mid, {}).get("category") or "Road"),
                 "is_superspeedway_variant": False,
                 "source": "trading_paints_cartemplates",
             }
         )
     return entries
+
+
+def _parse_tp_car_templates_html(
+    page_html: str,
+    make_index: dict[int, dict[str, str]] | None = None,
+) -> list[dict[str, Any]]:
+    return _match_tp_template_rows_to_makes(_parse_tp_car_template_rows(page_html), make_index)
 
 
 def _build_tp_car_identity_doc(entries: Iterable[dict[str, Any]]) -> dict[str, Any]:
@@ -5635,10 +5779,10 @@ def _build_tp_car_identity_doc(entries: Iterable[dict[str, Any]]) -> dict[str, A
     }
 
 
-def _fetch_tp_car_identity_doc(timeout: float = 25.0) -> dict[str, Any]:
+def _fetch_tp_page(url: str, timeout: float) -> str:
     session = get_thread_http_session()
     response = session.get(
-        TP_CAR_TEMPLATES_URL,
+        url,
         timeout=(10, max(10.0, float(timeout))),
         headers={
             "Accept": "text/html,application/xhtml+xml",
@@ -5647,12 +5791,79 @@ def _fetch_tp_car_identity_doc(timeout: float = 25.0) -> dict[str, Any]:
         },
     )
     response.raise_for_status()
-    entries = _parse_tp_car_templates_html(response.text)
+    return response.text
+
+
+def _fetch_tp_car_identity_doc(timeout: float = 25.0) -> dict[str, Any]:
+    make_index = _parse_tp_showroom_make_index(_fetch_tp_page(TP_SHOWROOM_INDEX_URL, timeout))
+    if not make_index:
+        raise RuntimeError(
+            "Trading Paints showroom returned no vehicle links, so no car ID could be resolved."
+        )
+    rows = _parse_tp_car_template_rows(_fetch_tp_page(TP_CAR_TEMPLATES_URL, timeout))
+    entries = _match_tp_template_rows_to_makes(rows, make_index)
+    unmatched = len(rows) - len(entries)
+    if unmatched > 0:
+        logging.info(
+            "Trading Paints car catalog: %d of %d vehicles could not be matched to a showroom ID.",
+            unmatched,
+            len(rows),
+        )
     if len(entries) < TP_CAR_IDENTITY_MIN_EXPECTED_ENTRIES:
         raise RuntimeError(
             f"Trading Paints car template catalog returned only {len(entries)} usable entries."
         )
     return _build_tp_car_identity_doc(entries)
+
+
+def default_tp_car_identity_cache_path() -> Path:
+    appdata = os.getenv("APPDATA")
+    if appdata:
+        return Path(appdata) / APP_CONFIG_DIRNAME / TP_CAR_IDENTITY_CACHE_FILENAME
+    return Path.home() / f".{APP_CONFIG_DIRNAME.lower()}_{TP_CAR_IDENTITY_CACHE_FILENAME}"
+
+
+def save_tp_car_identity_cache(doc: dict[str, Any], path: Path | None = None) -> None:
+    """Persist the built catalog so a Trading Paints layout change degrades softly."""
+    cars = (doc or {}).get("cars") or {}
+    if not cars:
+        return
+    resolved = Path(path) if path is not None else default_tp_car_identity_cache_path()
+    payload = {
+        "version": TP_CAR_IDENTITY_DISK_CACHE_VERSION,
+        "saved_at": time.time(),
+        "doc": doc,
+    }
+    try:
+        resolved.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = resolved.with_name(resolved.name + ".tmp")
+        temp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        os.replace(temp_path, resolved)
+    except Exception:
+        logging.debug("Could not persist the Trading Paints car catalog cache", exc_info=True)
+
+
+def load_tp_car_identity_cache(path: Path | None = None) -> dict[str, Any] | None:
+    """Return the last catalog written to disk, or ``None`` when it is unusable."""
+    resolved = Path(path) if path is not None else default_tp_car_identity_cache_path()
+    try:
+        if not resolved.is_file():
+            return None
+        payload = json.loads(resolved.read_text(encoding="utf-8"))
+    except Exception:
+        logging.debug("Could not read the Trading Paints car catalog cache", exc_info=True)
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if int(payload.get("version") or 0) != TP_CAR_IDENTITY_DISK_CACHE_VERSION:
+        return None
+    saved_at = float(payload.get("saved_at") or 0.0)
+    if saved_at > 0 and time.time() - saved_at > TP_CAR_IDENTITY_DISK_CACHE_MAX_AGE_SECONDS:
+        return None
+    doc = payload.get("doc")
+    if not isinstance(doc, dict) or not isinstance(doc.get("cars"), dict) or not doc["cars"]:
+        return None
+    return doc
 
 
 def _load_tp_showroom_mapping(
@@ -5695,6 +5906,15 @@ def _load_tp_showroom_mapping(
                     exc,
                 )
                 return _TP_CAR_IDENTITY_CACHE_DOC
+            cached = load_tp_car_identity_cache()
+            if cached is not None:
+                logging.warning(
+                    "Trading Paints automatic car catalog refresh failed; using the catalog saved on disk: %s",
+                    exc,
+                )
+                _TP_CAR_IDENTITY_CACHE_DOC = cached
+                _TP_CAR_IDENTITY_CACHE_AT = time.monotonic()
+                return cached
             logging.warning("Trading Paints automatic car catalog is unavailable: %s", exc)
             return {
                 "schema_version": 2,
@@ -5705,6 +5925,7 @@ def _load_tp_showroom_mapping(
         _TP_CAR_IDENTITY_CACHE_DOC = refreshed
         _TP_CAR_IDENTITY_CACHE_AT = time.monotonic()
         _TP_CAR_IDENTITY_LAST_ERROR = ""
+        save_tp_car_identity_cache(refreshed)
         return refreshed
 
 
@@ -5729,6 +5950,7 @@ def tp_car_identity_catalog_status() -> dict[str, Any]:
         "last_error": error,
         "manifest_observed_directories": observed_count,
         "source": TP_CAR_TEMPLATES_URL,
+        "make_index_source": TP_SHOWROOM_INDEX_URL,
     }
 
 
@@ -19427,7 +19649,9 @@ def _install_iracing_ui_preview_file(cache_path: Path, destination: Path) -> boo
         os.replace(temp_path, destination)
         return True
     except Exception as exc:  # noqa: BLE001
-        logging.debug("Could not install iRacing UI preview file %s -> %s: %s", cache_path, destination, exc)
+        logging.warning(
+            "Could not install the iRacing UI preview file %s: %s", destination, exc
+        )
         try:
             destination.with_name(destination.name + ".nptmp").unlink(missing_ok=True)
         except Exception:
@@ -21779,7 +22003,9 @@ class DownloaderUI:
         self.tp_monitor_save_var = tk.StringVar(value="Save stage stats will appear here too.")
         self.tp_mapping_status_var = tk.StringVar(value="Automatic car identification: waiting for the Trading Paints catalog.")
         self.tp_mapping_hint_var = tk.StringVar(value="The app resolves iRacing paint directories from the live Trading Paints template catalog and validates directories observed in manifests.")
-        self.tp_mapping_file_var = tk.StringVar(value=f"Source: {TP_CAR_TEMPLATES_URL}")
+        self.tp_mapping_file_var = tk.StringVar(
+            value=f"Sources: {TP_CAR_TEMPLATES_URL} + {TP_SHOWROOM_INDEX_URL}"
+        )
         self._update_check_in_progress = False
         self._latest_release_info: GitHubReleaseInfo | None = None
         self._last_notified_update_tag: str | None = None
@@ -25624,7 +25850,10 @@ class DownloaderUI:
         mapped_count = int(result.get("mapped_count") or 0)
         status = tp_car_identity_catalog_status()
         observed_count = int(status.get("manifest_observed_directories") or 0)
-        self.tp_mapping_file_var.set(f"Live source: {TP_CAR_TEMPLATES_URL}")
+        self.tp_mapping_file_var.set(
+            f"Live sources: {status.get('source') or TP_CAR_TEMPLATES_URL}"
+            f" + {status.get('make_index_source') or TP_SHOWROOM_INDEX_URL}"
+        )
         self.tp_mapping_status_var.set(f"Automatic car identification ready: {mapped_count} Trading Paints car directories loaded.")
         self.tp_mapping_hint_var.set(
             f"Manifest-validated directories this run: {observed_count}. Catalog refreshes automatically every 6 hours and immediately when an unknown car appears."
@@ -25648,8 +25877,9 @@ class DownloaderUI:
             self.messagebox.showinfo(
                 APP_NAME,
                 "Car identification is automatic now.\n\n"
-                "Nishizumi Paints reads the live Trading Paints template catalog and combines it with "
-                "the iRacing SDK and observed manifests. There is no JSON or manual review step.",
+                "Nishizumi Paints reads the live Trading Paints template catalog and showroom vehicle "
+                "index, and combines them with the iRacing SDK and observed manifests. There is no JSON "
+                "or manual review step.",
                 parent=self.root,
             )
         except Exception:
