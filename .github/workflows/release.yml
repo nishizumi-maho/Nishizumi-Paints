@@ -4,14 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       tag_suffix:
-        description: 'Pre-release suffix, for example "beta.1". Leave empty for a final release tag.'
+        description: 'Pre-release suffix such as "beta.1" or "rc.1". A suffix publishes a pre-release, which the in-app updater never offers. Leave empty to publish the final v<version> release.'
         required: false
-        default: 'beta.1'
-      prerelease:
-        description: 'Publish as a pre-release. The in-app updater only offers full releases, so a pre-release is opt-in.'
-        type: boolean
-        required: false
-        default: true
+        default: ''
 
 permissions:
   contents: write
@@ -46,11 +41,15 @@ jobs:
           if ($version -notmatch '^\d+\.\d+(\.\d+)*$') { throw "APP_VERSION '$version' is not a plain version number." }
           $suffix = "$env:TAG_SUFFIX".Trim()
           if ($suffix -and $suffix -notmatch '^[A-Za-z0-9][A-Za-z0-9.\-]*$') { throw "Tag suffix '$suffix' is not a valid tag fragment." }
+          # A suffixed tag is always a pre-release, a plain version tag is always final,
+          # so the two can never disagree.
           $tag = if ($suffix) { "v$version-$suffix" } else { "v$version" }
+          $prerelease = if ($suffix) { 'true' } else { 'false' }
           $installer = "NishizumiPaints-Setup-$version.exe"
-          Write-Host "Version $version, tag $tag, installer $installer"
+          Write-Host "Version $version, tag $tag, pre-release $prerelease, installer $installer"
           "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "prerelease=$prerelease" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "installer=$installer" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
       - name: Install dependencies
@@ -101,7 +100,7 @@ jobs:
           APP_VERSION: ${{ steps.release.outputs.version }}
           RELEASE_TAG: ${{ steps.release.outputs.tag }}
           INSTALLER_NAME: ${{ steps.release.outputs.installer }}
-          IS_PRERELEASE: ${{ inputs.prerelease }}
+          IS_PRERELEASE: ${{ steps.release.outputs.prerelease }}
         run: |
           $ErrorActionPreference = 'Stop'
           $installerPath = Join-Path 'installer\output' $env:INSTALLER_NAME
@@ -137,7 +136,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ steps.release.outputs.tag }}
           INSTALLER_NAME: ${{ steps.release.outputs.installer }}
-          IS_PRERELEASE: ${{ inputs.prerelease }}
+          IS_PRERELEASE: ${{ steps.release.outputs.prerelease }}
         run: |
           $ErrorActionPreference = 'Stop'
           $installerPath = Join-Path 'installer\output' $env:INSTALLER_NAME
