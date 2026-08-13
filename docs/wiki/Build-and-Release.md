@@ -54,6 +54,25 @@ The current build packages:
 
 Car identity is not bundled. It is loaded automatically from the live Trading Paints template catalog.
 
+## Building and publishing from GitHub
+
+The `Release installer` workflow (`.github/workflows/release.yml`) does the same build on a `windows-latest` runner and publishes the result. Start it from `Actions > Release installer > Run workflow`, on the branch the release should be cut from.
+
+Two inputs:
+
+| Input | Meaning |
+| --- | --- |
+| `tag_suffix` | Appended to the version tag. `beta.1` publishes `v<version>-beta.1`. Leave it empty for a final `v<version>` tag. |
+| `prerelease` | On by default. The app asks GitHub for the *latest* release, and GitHub never answers with a pre-release, so a pre-release is never offered by the in-app updater. It is opt-in: people download and run it themselves. |
+
+The run reads `APP_VERSION` from the script, so the version is never typed twice. It then compiles the app, checks the syntax, runs the unit tests, compiles the installer with the same Inno Setup script used locally, and publishes the release with:
+
+- the installer from `installer/output/` as the only asset
+- `docs/release-notes/<version>.md` as the release body, with a beta banner in front when the run is a pre-release
+- the installer's SHA-256 appended in the format the in-app updater parses, so a full release can be installed from inside the app
+
+A run fails instead of publishing when `APP_VERSION` is not a plain version number, when the tag suffix is not a valid tag fragment, when PyInstaller or Inno Setup produce nothing, or when the tag already exists.
+
 ## Ignored local output
 
 Generated artifacts and local scratch areas are intentionally ignored:

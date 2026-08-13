@@ -1,9 +1,9 @@
 #ifndef AppVersion
-#define AppVersion "7.3.2"
+#define AppVersion "7.3.3"
 #endif
 
 #ifndef AppVersionInfo
-#define AppVersionInfo "7.3.2.0"
+#define AppVersionInfo "7.3.3.0"
 #endif
 
 #define AppName "Nishizumi Paints"

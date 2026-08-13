@@ -33,6 +33,7 @@ From 7.3.2 the installed app can update itself: when a newer release is found it
 
 ## What's new in 7.3
 
+- Every tab scrolls when its content does not fit the window, so the options added along the 7.3 releases stay reachable on smaller windows and screens. The window also opens at a size that fits the screen and can be resized down to 960x560.
 - The iRacing UI 3D car viewer (`My Content > Cars`) now always shows your own paints. Your Trading Paints car, custom number, spec, decal, helmet, and suit files are kept in the iRacing paint folder at all times instead of only during a live session.
 - Preview files are mirrored locally, so they are restored right after every session cleanup and keep working with no internet connection.
 - Your iRacing customer ID is detected automatically from the live session, the Trading Paints member ID, the AI roster member ID, a confirmed Trading Paints login, or the value remembered from a previous run, with a manual override available.

@@ -140,3 +140,16 @@ Important classes near the bottom of the file include:
 - `DownloaderUI`
 
 If the question is about user interaction, status updates, widgets, the tray menu, or background service state, you will end up in this section.
+
+## Scrollable tab pages
+
+Tabs are built by `DownloaderUI._add_scrollable_tab`, which returns the frame the notebook shows and the page frame the tab content is built inside. The supporting pieces are:
+
+- `preferred_window_size` — the window size chosen for the current screen
+- `scrollable_page_geometry` — how big a page is inside its viewport and which scrollbars it needs
+- `mousewheel_scroll_steps` — Tk wheel events translated into scroll units
+- `DownloaderUI._sync_page_scroll` — applies the geometry and shows or hides the scrollbars
+- `DownloaderUI._refresh_page_scroll_regions` — re-measures pages whose content appeared or disappeared, called from `_poll_service`
+- `DownloaderUI._handle_page_wheel` — routes the wheel to the page under the pointer, unless an inner list can scroll itself
+
+A page always fills its viewport, so widgets that stretch keep stretching; only the size beyond the viewport is scrolled.
