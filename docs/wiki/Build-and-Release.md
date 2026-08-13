@@ -58,12 +58,14 @@ Car identity is not bundled. It is loaded automatically from the live Trading Pa
 
 The `Release installer` workflow (`.github/workflows/release.yml`) does the same build on a `windows-latest` runner and publishes the result. Start it from `Actions > Release installer > Run workflow`, on the branch the release should be cut from.
 
-Two inputs:
+One input, `tag_suffix`, which decides both the tag and the kind of release:
 
-| Input | Meaning |
+| `tag_suffix` | Result |
 | --- | --- |
-| `tag_suffix` | Appended to the version tag. `beta.1` publishes `v<version>-beta.1`. Leave it empty for a final `v<version>` tag. |
-| `prerelease` | On by default. The app asks GitHub for the *latest* release, and GitHub never answers with a pre-release, so a pre-release is never offered by the in-app updater. It is opt-in: people download and run it themselves. |
+| empty | `v<version>`, published as a normal release. The in-app updater offers it. |
+| `beta.1`, `rc.1`, ... | `v<version>-<suffix>`, published as a pre-release. The app asks GitHub for the *latest* release and GitHub never answers with a pre-release, so it is never offered by the updater: people download and run it themselves. |
+
+The suffix alone decides, so a beta tag can never be published as a final release, or the other way round. Note that a `workflow_dispatch` input sent as an empty string falls back to its declared default, which is why the default here is empty rather than a suffix.
 
 The run reads `APP_VERSION` from the script, so the version is never typed twice. It then compiles the app, checks the syntax, runs the unit tests, compiles the installer with the same Inno Setup script used locally, and publishes the release with:
 
