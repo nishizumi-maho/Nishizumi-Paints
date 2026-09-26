@@ -7,6 +7,11 @@ on:
         description: 'Pre-release suffix such as "beta.1" or "rc.1". A suffix publishes a pre-release, which the in-app updater never offers. Leave empty to publish the final v<version> release.'
         required: false
         default: ''
+      draft:
+        description: 'Create the release as a draft. A draft is hidden from the in-app updater and gets its tag only when it is published from the Releases page.'
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: write
@@ -137,6 +142,7 @@ jobs:
           RELEASE_TAG: ${{ steps.release.outputs.tag }}
           INSTALLER_NAME: ${{ steps.release.outputs.installer }}
           IS_PRERELEASE: ${{ steps.release.outputs.prerelease }}
+          IS_DRAFT: ${{ inputs.draft }}
         run: |
           $ErrorActionPreference = 'Stop'
           $installerPath = Join-Path 'installer\output' $env:INSTALLER_NAME
@@ -145,6 +151,7 @@ jobs:
             '--notes-file', 'release-notes.md',
             '--target', $env:GITHUB_SHA)
           if ($env:IS_PRERELEASE -eq 'true') { $arguments += '--prerelease' }
+          if ($env:IS_DRAFT -eq 'true') { $arguments += '--draft' }
           & gh @arguments
           if ($LASTEXITCODE -ne 0) { throw "Publishing the release failed with exit code $LASTEXITCODE." }
-          Write-Host "Published $env:RELEASE_TAG"
+          Write-Host $(if ($env:IS_DRAFT -eq 'true') { "Created draft $env:RELEASE_TAG" } else { "Published $env:RELEASE_TAG" })

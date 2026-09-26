@@ -2,6 +2,20 @@
 
 All notable user-facing changes to Nishizumi Paints are documented here.
 
+## [7.3.4] - 2026-09-26
+
+### Fixed
+
+- Fixed every paint in a Practice session being deleted and downloaded again each time a driver joined. A driver joining while paints were still downloading cancelled the whole pass, removed the paints already saved, and restarted from zero for everyone; on a busy server this could repeat several times in a row. Now a driver joining or leaving never interrupts the running pass: it finishes, and then only the new driver's paints are fetched. The pass is still cancelled when the session itself or its Trading Paints context changes, or when the session ends.
+- A fixed paint applied from the Session tab is no longer rejected because a driver joined between opening the menu and applying it.
+- Fixed a crash in the legacy showroom helmet and suit sync when it was cancelled while waiting for the Trading Paints request cooldown.
+
+### Changed
+
+- When one of the two Trading Paints manifest hosts cannot be reached (for example a TLS handshake failure), the app now goes straight to the other host instead of retrying the broken one for every driver, and tries the working host first for the next 10 minutes. The manifest stage of a 55-driver session was spending about 15 seconds on this before the first paint could start downloading.
+- The public showroom online fallback is much faster. Showroom list pages are kept for 15 minutes for the whole app instead of for one pass, and the lists a pass needs are fetched in parallel before it starts instead of one at a time. A driver who joins a running session now gets their random car, helmet, and suit in about 1.5 seconds instead of about 13, and a field of 8 drivers needing all three went from about 63 seconds to about 28.
+- iRacing texture reloads are now grouped per car for one second instead of 0.2 seconds, so a car whose paint, spec, helmet, and suit arrive a moment apart is reloaded once instead of up to four times. Each reload is a small hitch in the sim.
+
 ## [7.3.3] - 2026-08-13
 
 ### Fixed
