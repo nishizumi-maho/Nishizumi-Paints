@@ -150,6 +150,7 @@ AI_ROSTER_META_FILENAME = ".nishizumi_ai_roster.json"
 AI_ROSTER_OPTIONAL_UNAVAILABLE_SUFFIX = ".unavailable"
 AI_ROSTER_OPTIONAL_UNAVAILABLE_TTL_SECONDS = 24 * 60 * 60
 AI_LOCAL_ROSTER_SUFFIX = " (local)"
+AI_RANDOM_ROSTER_SUFFIX = " (random)"
 AI_GENERIC_RANDOM_ROSTER_NAME = "Nishizumi Random AI - Current"
 AI_GENERIC_RANDOM_ROSTER_FOLDER_FALLBACK = "Nishizumi_Random_AI_Current"
 REPLAY_PACK_INDEX_FILENAME = ".nishizumi_replay_packs.json"
@@ -15663,6 +15664,122 @@ def clone_active_ai_roster_to_local(session: Session | None, ai_rosters_dir: Pat
     else:
         message += "."
     return True, message
+def randomize_active_ai_roster_from_pool(
+    session: Session | None,
+    ai_rosters_dir: Path,
+    random_pool_dir: Path,
+    ai_livery_root: Path,
+    *,
+    seed: str | None = None,
+) -> tuple[bool, str]:
+    if session is None:
+        return False, "No current iRacing session is active."
+    if not session.ai_roster_name and not session.ai_roster_id:
+        return False, "The current session does not report an active AI roster."
+    source_dir = _find_active_ai_roster_dir(session, ai_rosters_dir)
+    if source_dir is None:
+        return False, "The active Trading Paints AI roster has not been synced locally yet."
+    try:
+        _payload, source_drivers = _read_ai_roster_payload(source_dir)
+    except Exception as exc:
+        return False, f"Could not read the active AI roster: {exc}"
+    base_name = (session.ai_roster_name or source_dir.name).strip() or (source_dir.name or "AI Roster")
+    if base_name.endswith(AI_RANDOM_ROSTER_SUFFIX):
+        # Randomizing the randomized roster again rebuilds it instead of stacking suffixes.
+        base_name = base_name[: -len(AI_RANDOM_ROSTER_SUFFIX)].strip() or base_name
+    random_name = f"{base_name}{AI_RANDOM_ROSTER_SUFFIX}"
+    target_dir = ai_rosters_dir / _safe_ai_roster_folder_name(random_name, f"AI_Roster_{session.ai_roster_id or 'local'}{AI_RANDOM_ROSTER_SUFFIX}")
+    seed_base = seed if seed is not None else uuid.uuid4().hex
+    used_car_ids: set[str] = set()
+    used_accessory_ids: dict[str, set[str]] = {"helmet": set(), "suit": set()}
+
+    # Pick every paint before touching the disk, so an empty RandomPool leaves an
+    # earlier randomized roster in place.
+    drivers: list[dict] = []
+    copies: list[tuple[Path, str]] = []
+    random_cars = 0
+    random_accessories = 0
+    for index, source_driver in enumerate(source_drivers):
+        driver = dict(source_driver)
+        row = index + 1
+        directory = str(driver.get('carPath') or '').replace("\\", " ").strip()
+        seed_text = f"{seed_base}|{row}|{directory}"
+        entry: RandomPoolEntry | None = None
+        if directory:
+            entry, _favorite = _choose_random_pool_entry(directory, random_pool_dir, ai_livery_root, used_car_ids, seed_text)
+            if entry is None:
+                # More drivers than distinct paints: allow repeats rather than leave cars unpainted.
+                entry, _favorite = _choose_random_pool_entry(directory, random_pool_dir, ai_livery_root, set(), seed_text + "|repeat")
+        if entry is not None and entry.car_file is not None:
+            car_name = f"car_{row}.tga"
+            copies.append((entry.car_file, car_name))
+            if entry.spec_file is not None:
+                copies.append((entry.spec_file, _ai_roster_spec_filename(car_name)))
+            driver["carTgaName"] = car_name
+            random_cars += 1
+        else:
+            car_name = Path(str(driver.get('carTgaName') or '').strip()).name
+            if car_name and (source_dir / car_name).exists():
+                copies.append((source_dir / car_name, car_name))
+                spec_name = _ai_roster_spec_filename(car_name)
+                if (source_dir / spec_name).exists():
+                    copies.append((source_dir / spec_name, spec_name))
+            else:
+                driver["carTgaName"] = None
+        for kind in ("helmet", "suit"):
+            field = f"{kind}TgaName"
+            source_path = entry.helmet_file if (entry is not None and kind == "helmet") else (entry.suit_file if entry is not None else None)
+            if source_path is None or not source_path.exists():
+                source_path, _source_id = _choose_random_accessory_pool_source(kind, random_pool_dir, ai_livery_root, used_accessory_ids[kind], f"{seed_text}|{kind}")
+                if source_path is None:
+                    source_path, _source_id = _choose_random_accessory_pool_source(kind, random_pool_dir, ai_livery_root, set(), f"{seed_text}|{kind}|repeat")
+            if source_path is not None:
+                dest_name = f"{kind}_{row}.tga"
+                copies.append((source_path, dest_name))
+                driver[field] = dest_name
+                random_accessories += 1
+                continue
+            original_name = Path(str(driver.get(field) or '').strip()).name
+            if original_name and (source_dir / original_name).exists():
+                copies.append((source_dir / original_name, original_name))
+            else:
+                driver[field] = None
+        drivers.append(_normalize_ai_driver_entry(driver))
+    if random_cars <= 0 and random_accessories <= 0:
+        return False, (
+            f"RandomPool has no paints for the cars in AI roster '{base_name}'. "
+            "Download some from the Showroom tab or copy session cars to AI first."
+        )
+
+    # Build next to the target and swap it in, because the target may be the
+    # roster we just read from.
+    staging_dir = ai_rosters_dir / f"{target_dir.name}.building"
+    try:
+        _reset_generated_ai_roster_dir(ai_rosters_dir, staging_dir)
+        for source_path, dest_name in copies:
+            dest = safe_join_under(staging_dir, Path(dest_name).name)
+            shutil.copy2(source_path, dest)
+        _write_ai_roster_files(
+            staging_dir,
+            {"drivers": drivers},
+            drivers,
+            AIWebRosterItem(roster_id="", name=random_name, roster_file=""),
+            is_local=True,
+            source_roster_id=session.ai_roster_id,
+            source_name=session.ai_roster_name or base_name,
+        )
+        if target_dir.exists():
+            _reset_generated_ai_roster_dir(ai_rosters_dir, target_dir)
+            target_dir.rmdir()
+        staging_dir.rename(target_dir)
+    except Exception as exc:  # noqa: BLE001
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        return False, f"Could not create randomized AI roster '{random_name}': {exc}"
+    return True, (
+        f"Created randomized AI roster '{random_name}' with {len(drivers)} driver(s): "
+        f"{random_cars} random car paint(s) and {random_accessories} random helmet/suit file(s) from RandomPool. "
+        "Select it in iRacing and recreate the AI race to see the new paints."
+    )
 def _extract_ai_cache_numeric_id(filename: str) -> int | None:
     match = re.search(r"_(\d+)(?:_ss)?\.(?:tga|mip)$", filename, re.IGNORECASE)
     if not match:
