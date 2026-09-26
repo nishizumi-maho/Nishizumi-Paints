@@ -2592,6 +2592,19 @@ def _session_user_map(session: Session | None) -> dict[tuple[str, int, str], Ses
     return {user.effective_target_key(): user for user in session.users}
 
 
+def _session_has_unprocessed_team_driver_swap(
+    previous_session: Session | None,
+    current_user_map: dict[tuple[str, int, str], SessionUser],
+) -> bool:
+    previous_user_map = _session_user_map(previous_session)
+    return any(
+        key[0] == "team"
+        and key in previous_user_map
+        and int(previous_user_map[key].user_id) != int(user.user_id)
+        for key, user in current_user_map.items()
+    )
+
+
 def _session_row_key(row: SessionDriverSnapshot) -> tuple[str, int, str]:
     return (str(row.target_kind or 'user'), int(row.target_id), str(row.directory or '').lower())
 
@@ -21727,7 +21740,13 @@ class DownloaderService:
                 retry_target_refresh_key: tuple[str, int, str] | None = None
                 retry_attempt_number = 0
                 retry_total_attempts = 0
-                if not forced_refresh:
+                # A swap that has not been processed yet goes first. Claiming a retry
+                # now would replace the swapped team in this pass after its paints
+                # were cleared, leaving that car unpainted until its own retry.
+                if not forced_refresh and not _session_has_unprocessed_team_driver_swap(
+                    last_processed_session if last_session == session.session_id else None,
+                    current_user_map,
+                ):
                     retry_claim = self._claim_due_team_driver_swap_retry(current_user_map)
                     if retry_claim is not None:
                         retry_target_refresh_key, retry_attempt_number, retry_total_attempts = retry_claim
@@ -21881,7 +21900,11 @@ class DownloaderService:
                             partial_target_refresh_key[2],
                             cleared_count,
                         )
-                    session_to_process = replace(session, users={refresh_user})
+                    # Keep any team whose paints were just cleared for a swap in this pass.
+                    session_to_process = replace(
+                        session,
+                        users={refresh_user} | {current_user_map[key] for key in changed_team_driver_keys},
+                    )
                     session_rows = merge_session_driver_rows(session, previous_rows, [])
                     self._update_runtime_snapshot(
                         current_session,
