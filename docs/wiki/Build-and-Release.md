@@ -67,6 +67,8 @@ One input, `tag_suffix`, which decides both the tag and the kind of release:
 
 The suffix alone decides, so a beta tag can never be published as a final release, or the other way round. Note that a `workflow_dispatch` input sent as an empty string falls back to its declared default, which is why the default here is empty rather than a suffix.
 
+A second input, `draft` (off by default), creates the same release as a draft instead of publishing it. A draft has the installer, the notes, and the SHA-256 attached, but it is hidden from the in-app updater and its tag is only created when someone presses **Publish release** on the Releases page. Use it to check a release before people can get it.
+
 The run reads `APP_VERSION` from the script, so the version is never typed twice. It then compiles the app, checks the syntax, runs the unit tests, compiles the installer with the same Inno Setup script used locally, and publishes the release with:
 
 - the installer from `installer/output/` as the only asset

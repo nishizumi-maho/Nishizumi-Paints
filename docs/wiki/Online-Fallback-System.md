@@ -51,6 +51,14 @@ Accessories use fixed Trading Paints driver categories:
 
 That means the app does not need a per-car mapping just to find public helmet and suit pools.
 
+## Showroom list cache
+
+Each Trading Paints showroom list page (`showroom.php`) takes a few seconds to answer, and every fallback pick needs one for its pool and source (Trending, Newest, Most favorited, Most raced).
+
+- When a fallback pass starts, the app works out which pools the pass needs (each car model that is missing paints, plus helmets and suits) and fetches the first page of each pool for every enabled source in parallel. The log line `Trading Paints public showroom lists ready: N list(s) for M pool(s) in X s` marks the end of that step.
+- Fetched pages are kept for 15 minutes for the whole app, not only for one pass. A driver who joins a running session is covered from pages already in memory, so their fallback usually takes about a second instead of one showroom request per item.
+- Empty or failed answers are never cached, and the usual duplicate and recent-history rules still apply on top of the cached pages. When the cached pages run out of unused paints, the app samples another page as before.
+
 ## Lane modes
 
 The lane settings in the General tab control how many car groups can be processed online at the same time.

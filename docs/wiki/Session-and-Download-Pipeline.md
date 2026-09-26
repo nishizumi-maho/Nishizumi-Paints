@@ -34,6 +34,8 @@ For each session user, the app attempts to resolve normal Trading Paints assets 
 
 This stage decides which normal TP files already exist for the session before fallback even starts.
 
+The session-aware lookup has two Trading Paints hosts. When one of them cannot be reached at all (TLS handshake failure, DNS, refused connection, connect timeout), the app moves straight to the other host instead of spending its retries, and tries the working host first for the next 10 minutes. HTTP errors and slow answers still get the normal retries.
+
 Manifest directories are recorded as runtime validation. Their `<carid>` fields are paint asset IDs and are not used as vehicle MIDs.
 
 For Team sessions, team assets are preferred per item. If the team has no car, helmet, or suit for the active car, the matching General-tab option can retarget the current in-car driver's personal asset for that same item to the team file path.
@@ -41,6 +43,12 @@ For Team sessions, team assets are preferred per item. If the team has no car, h
 The app also starts an experimental preload pass for Team sessions. It caches personal car, suit, and helmet files for team drivers exposed by the iRacing session data, then reuses that cache before making a fresh fallback download.
 
 The session fingerprint includes the active driver's iRacing ID. In Team sessions, a driver swap in the same team car is first treated as a candidate, then confirmed on a follow-up read before the app clears and reapplies that team's files. Confirmed swaps also schedule short refresh retries at 5, 12, and 20 seconds so late Trading Paints or iRacing updates can still be picked up. When that happens, the log records the old and new driver and the Session tab updates the last-swap column.
+
+### Drivers joining or leaving
+
+A driver joining or leaving does not restart the pipeline. If the roster changes while a pass is running, the pass finishes for the drivers it started with, and the next pass fetches only the drivers that joined (`Session roster changed inside the same session ...: +N target(s)`). Paints already applied stay in place.
+
+The running pass is cancelled only when the session itself changes (a new session or subsession ID) or when its Trading Paints context changes (team racing, time of day, series, league, custom numbers, track, superspeedway), or when the session ends.
 
 ## 4. Download stage
 
@@ -67,7 +75,7 @@ After download, the app:
 
 ## 6. Texture reload
 
-Once files are in place, the app uses the iRacing SDK texture reload path. It can debounce or delay reloads if the SDK says reload is not currently safe.
+Once files are in place, the app uses the iRacing SDK texture reload path, one car at a time. Reloads are debounced per car for one second, so a car whose paint, spec, helmet, and suit land a moment apart is reloaded once instead of once per file. Reloads can also be delayed if the SDK says reload is not currently safe.
 
 ## 7. Fallback resolution
 

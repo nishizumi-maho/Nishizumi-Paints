@@ -43,7 +43,7 @@ from requests.adapters import HTTPAdapter
 # Browserless copy: Trading Paints browser automation is intentionally disabled.
 sync_playwright = None
 APP_NAME = "Nishizumi Paints"
-APP_VERSION = "7.3.3"
+APP_VERSION = "7.3.4"
 APP_REGISTRY_NAME = "NishizumiPaints"
 APP_CONFIG_DIRNAME = "NishizumiPaints"
 APP_TOOLTIP = f"{APP_NAME} {APP_VERSION}"
@@ -138,6 +138,9 @@ TRADING_PAINTS_FETCH_CONTEXT_URLS = (
     "https://dl.tradingpaints.com/fetch.php",
     "https://fetch.tradingpaints.gg/fetch.php",
 )
+# How long a manifest host that failed to connect (TLS, DNS, refused, connect timeout)
+# is tried last instead of first, so a broken host does not cost every driver its retries.
+TRADING_PAINTS_FETCH_HOST_DOWN_SECONDS = 600.0
 TRADING_PAINTS_COLLECTION_POOL_URL = "https://www.tradingpaints.com/js/myCollections.php?id={collection_id}"
 TRADING_PAINTS_COLLECTIONS_URL = "https://fetch.tradingpaints.gg/collections.php?user={member_id}"
 TRADING_PAINTS_SHOWROOM_COMPRESSED_URL = "https://showroom-assets.tradingpaints.gg/compressed/{asset_id}.tga.bz2"
@@ -164,6 +167,7 @@ IRACING_UI_PREVIEW_DOWNLOAD_WORKERS = 4
 IRACING_APP_INI_FILENAME = "app.ini"
 SDK_UNCHANGED_FORCE_REFRESH_SECONDS = 1.5
 SESSION_CANCEL_POLL_SECONDS = 0.75
+TEXTURE_RELOAD_DEBOUNCE_SECONDS = 1.0
 REPLAY_PACK_ACTIVE_SCAN_SECONDS = 2.5
 REPLAY_PACK_IDLE_SCAN_SECONDS = 30.0
 REPLAY_PACK_FULL_SCAN_SECONDS = 120.0
@@ -1909,7 +1913,13 @@ class Session:
     ai_roster_name: str = ""
     ai_drivers: tuple[dict, ...] = ()
     def fingerprint(self) -> tuple[SessionId, tuple[tuple[str, int, str, int], ...], tuple[bool, str, int, int, bool, str, str, bool]]:
-        normalized_users = tuple(
+        return (self.session_id, self.roster_fingerprint(), self.context_fingerprint())
+    def identity_fingerprint(self) -> tuple[SessionId, tuple[bool, str, int, int, bool, str, str, bool]]:
+        # Same session and same Trading Paints context, whoever is in it. A driver
+        # joining or leaving keeps this stable, so work already done stays valid.
+        return (self.session_id, self.context_fingerprint())
+    def roster_fingerprint(self) -> tuple[tuple[str, int, str, int], ...]:
+        return tuple(
             sorted(
                 (
                     u.effective_target_key()[0],
@@ -1920,7 +1930,8 @@ class Session:
                 for u in self.users
             )
         )
-        context_bits = (
+    def context_fingerprint(self) -> tuple[bool, str, int, int, bool, str, str, bool]:
+        return (
             self.team_racing,
             (self.event_time_raw or "10:00 am").strip().lower(),
             int(self.series_id),
@@ -1930,7 +1941,6 @@ class Session:
             normalize_directory(self.track_config_name),
             bool(self.is_superspeedway_track),
         )
-        return (self.session_id, normalized_users, context_bits)
     def local_preserve_targets(self) -> set[tuple[bool, int]]:
         targets: set[tuple[bool, int]] = set()
         if self.local_user_id is not None and self.local_user_id > 0:
@@ -1950,16 +1960,8 @@ class Session:
             "numbers": "True" if self.load_num_textures else "False",
         }
 
-def session_cancel_fingerprint(session: Session) -> tuple[SessionId, tuple[tuple[str, int, str, int], ...], tuple[bool, str, int, int, bool, str, str, bool]]:
-    return session.fingerprint()
-
-def session_pipeline_fingerprint(session: Session) -> tuple[SessionId, tuple[tuple[str, int, str, int], ...], tuple[bool, str, int, int, bool, str, str, bool]]:
-    session_id, users, context_bits = session.fingerprint()
-    stable_users = tuple(
-        (kind, target_id, directory, 0 if kind == "team" else source_user_id)
-        for kind, target_id, directory, source_user_id in users
-    )
-    return (session_id, stable_users, context_bits)
+def session_identity_fingerprint(session: Session) -> tuple[SessionId, tuple[bool, str, int, int, bool, str, str, bool]]:
+    return session.identity_fingerprint()
 @dataclass(frozen=True)
 class DownloadId:
     user_id: int
@@ -2170,7 +2172,7 @@ class ThroughputMonitorSnapshot:
 
 @dataclass(frozen=True)
 class PendingDriverOverrideApply:
-    session_fingerprint: tuple[SessionId, tuple[tuple[str, int, str, int], ...], tuple[bool, str, int, int, bool, str, str, bool]]
+    session_fingerprint: tuple[SessionId, tuple[bool, str, int, int, bool, str, str, bool]]
     entry: dict[str, object]
 
 @dataclass(frozen=True)
@@ -2864,6 +2866,36 @@ class TransferBatchMonitor:
                 effective_parallelism=effective_parallelism,
             )
 _THREAD_LOCAL = threading.local()
+_TP_FETCH_URL_DOWN_UNTIL: dict[str, float] = {}
+_TP_FETCH_URL_DOWN_LOCK = threading.Lock()
+
+
+def tp_fetch_context_urls() -> list[str]:
+    """Manifest hosts in the order to try them, hosts that recently failed to connect last."""
+    now = time.monotonic()
+    with _TP_FETCH_URL_DOWN_LOCK:
+        down = {url for url, until in _TP_FETCH_URL_DOWN_UNTIL.items() if until > now}
+    return [url for url in TRADING_PAINTS_FETCH_CONTEXT_URLS if url not in down] + [
+        url for url in TRADING_PAINTS_FETCH_CONTEXT_URLS if url in down
+    ]
+
+
+def _note_tp_fetch_url_result(url: str, exc: BaseException | None) -> bool:
+    """Record how a manifest host answered. Returns True when the host could not be reached at all."""
+    unreachable = isinstance(exc, requests.ConnectionError)
+    with _TP_FETCH_URL_DOWN_LOCK:
+        if exc is None:
+            _TP_FETCH_URL_DOWN_UNTIL.pop(url, None)
+        elif unreachable:
+            if _TP_FETCH_URL_DOWN_UNTIL.get(url, 0.0) <= time.monotonic():
+                logging.info(
+                    "Trading Paints manifest host %s could not be reached (%s); using the other host first for %.0f minutes.",
+                    urllib.parse.urlsplit(url).netloc,
+                    type(exc).__name__,
+                    TRADING_PAINTS_FETCH_HOST_DOWN_SECONDS / 60.0,
+                )
+            _TP_FETCH_URL_DOWN_UNTIL[url] = time.monotonic() + TRADING_PAINTS_FETCH_HOST_DOWN_SECONDS
+    return unreachable
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -6647,6 +6679,14 @@ def _tp_showroom_mapping_entry_for_name(name: object, mapping_path: Path | None 
     return str(directory_key), entry
 
 
+TP_SHOWROOM_PAGE_CACHE_SECONDS = 900.0
+TP_SHOWROOM_PREFETCH_WORKERS = 8
+# showroom.php takes seconds per page, and every driver that joins needs the same lists,
+# so pages are kept for the whole session instead of for one fallback pass.
+_TP_SHOWROOM_PAGE_CACHE: dict[tuple[int, str, int], tuple[float, list[dict]]] = {}
+_TP_SHOWROOM_PAGE_CACHE_LOCK = threading.Lock()
+
+
 def _tp_fetch_showroom_page_batch_http(
     *,
     mid: int,
@@ -6659,6 +6699,12 @@ def _tp_fetch_showroom_page_batch_http(
     start_url = f"https://www.tradingpaints.com/showroom/{category}/{mid}/{slug}"
     pos = max(0, int(page_index)) * TP_SHOWROOM_FETCH_PAGE_SIZE
     showroom_params = tp_showroom_params_for_source(showroom_source)
+    cache_key = (int(mid), showroom_params, pos)
+    now = time.monotonic()
+    with _TP_SHOWROOM_PAGE_CACHE_LOCK:
+        cached = _TP_SHOWROOM_PAGE_CACHE.get(cache_key)
+    if cached is not None and now - cached[0] < TP_SHOWROOM_PAGE_CACHE_SECONDS:
+        return [dict(item) for item in cached[1]]
     showroom_url = f"https://www.tradingpaints.com/js/showroom.php?mid={mid}&{showroom_params}&pos={pos}&ts={int(time.time()*1000)}"
     headers = {
         "X-Requested-With": "XMLHttpRequest",
@@ -6678,7 +6724,37 @@ def _tp_fetch_showroom_page_batch_http(
     parsed = ((payload.get("output") or {}).get("cars") or []) if isinstance(payload, dict) else []
     if not isinstance(parsed, list):
         return []
-    return [item for item in parsed if isinstance(item, dict)]
+    cars = [item for item in parsed if isinstance(item, dict)]
+    if cars:
+        with _TP_SHOWROOM_PAGE_CACHE_LOCK:
+            for key in [key for key, (fetched_at, _) in _TP_SHOWROOM_PAGE_CACHE.items() if now - fetched_at >= TP_SHOWROOM_PAGE_CACHE_SECONDS]:
+                _TP_SHOWROOM_PAGE_CACHE.pop(key, None)
+            _TP_SHOWROOM_PAGE_CACHE[cache_key] = (now, [dict(item) for item in cars])
+    return cars
+
+
+def prefetch_tp_showroom_first_pages(
+    pools: Iterable[tuple[int, str, str]],
+    showroom_sources: object,
+    cancel_event: threading.Event | None = None,
+) -> int:
+    """Fetch the first page of every (pool, source) in parallel, so the per-driver picks hit the cache."""
+    jobs = [
+        (int(mid), str(category), str(slug), source)
+        for mid, category, slug in sorted(set(pools))
+        for source in tp_showroom_sources_list(showroom_sources)
+    ]
+    if not jobs or _cancel_requested(cancel_event):
+        return 0
+
+    def _fetch(job: tuple[int, str, str, str]) -> bool:
+        if _cancel_requested(cancel_event):
+            return False
+        mid, category, slug, source = job
+        return bool(_tp_fetch_showroom_page_batch_http(mid=mid, category=category, slug=slug, page_index=0, showroom_source=source))
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(TP_SHOWROOM_PREFETCH_WORKERS, len(jobs))) as executor:
+        return sum(1 for ok in executor.map(_fetch, jobs) if ok)
 
 
 def _detect_tp_showroom_total_pages_http(
@@ -8689,7 +8765,7 @@ def fetch_tp_team_all_paint_files(
             batch_targets.append(target)
         payload = _tp_team_bulk_payload(target_team_id, batch_rows)
         batch_items: list[DownloadFile] = []
-        for endpoint in TRADING_PAINTS_FETCH_CONTEXT_URLS:
+        for endpoint in tp_fetch_context_urls():
             attempts += 1
             for attempt in range(1, max(1, int(retries)) + 1):
                 if _cancel_requested(cancel_event):
@@ -11325,6 +11401,10 @@ def choose_and_sync_showroom_driver_accessory(
     profile_dir.mkdir(parents=True, exist_ok=True)
     local_member_id = int(manifest_member_id)
     captured_original_scheme_id = str(original_scheme_id or "").strip()
+    # Accessories never capture the original scheme's link or title; the cancelled
+    # cooldown result below still reports them.
+    captured_original_scheme_link = ""
+    captured_original_scheme_title = ""
     effective_exclude_scheme_ids = {
         str(item).strip()
         for item in (exclude_scheme_ids or set())
@@ -14065,43 +14145,84 @@ def apply_tp_showroom_fallbacks_public(
         logs.append(f"Public showroom {normalized_kind} fallback could not cover {label}; using the local random pool backup if available.")
         return False
 
+    def _fallback_needs(user: SessionUser) -> tuple[str, bool, bool, bool]:
+        """(skip reason, need car, need helmet, need suit) for one session target."""
+        if disable_random_in_team_events and session_user_uses_team_target(user):
+            return "team", False, False, False
+        if user.is_ai:
+            car_enabled_for_user = bool(enable_ai)
+            helmet_enabled_for_user = bool(random_helmets_ai)
+            suit_enabled_for_user = bool(random_suits_ai)
+        else:
+            car_enabled_for_user = bool(enable_real_drivers)
+            helmet_enabled_for_user = bool(random_helmets_real_drivers)
+            suit_enabled_for_user = bool(random_suits_real_drivers)
+        if not (car_enabled_for_user or helmet_enabled_for_user or suit_enabled_for_user):
+            return "disabled", False, False, False
+        is_local_target = session_user_is_local_target(session, user)
+        if disable_random_for_local_user and is_local_target:
+            return "local", False, False, False
+        if is_local_target and not sync_my_livery_from_server:
+            return "disabled", False, False, False
+        target_is_team = session_user_uses_team_target(user)
+        target_id = int(user.team_id) if target_is_team else int(user.user_id)
+        target_key = (target_is_team, target_id, user.directory.lower())
+        accessory_target_key = (target_is_team, target_id)
+        need_car = car_enabled_for_user and target_key not in existing_car_targets
+        need_helmet = bool(random_helmets) and helmet_enabled_for_user and accessory_target_key not in existing_helmet_targets
+        need_suit = bool(random_suits) and suit_enabled_for_user and accessory_target_key not in existing_suit_targets
+        return "", need_car, need_helmet, need_suit
+
+    ordered_users = sorted(session.users, key=lambda u: (u.is_ai, u.directory.lower(), u.user_id, u.team_id or 0))
+    prefetch_pools: set[tuple[int, str, str]] = set()
+    for user in ordered_users:
+        reason, need_car, need_helmet, need_suit = _fallback_needs(user)
+        if reason:
+            continue
+        if need_car:
+            mapping = _tp_showroom_mapping_entry_for_directory(str(user.directory or "").strip(), mapping_path)
+            if mapping is not None:
+                entry = mapping[1]
+                mid = int(entry.get("mid") or 0)
+                if mid > 0:
+                    prefetch_pools.add((
+                        mid,
+                        str(entry.get("category") or "Road").strip() or "Road",
+                        str(entry.get("slug") or f"car-{mid}").strip() or f"car-{mid}",
+                    ))
+        if need_helmet:
+            prefetch_pools.add((118, "Driver", "Helmets"))
+        if need_suit:
+            prefetch_pools.add((119, "Driver", "Suits"))
+    if prefetch_pools:
+        prefetch_started = time.monotonic()
+        prefetched = prefetch_tp_showroom_first_pages(prefetch_pools, showroom_sources_text, cancel_event=cancel_event)
+        logging.info(
+            "Trading Paints public showroom lists ready: %s list(s) for %s pool(s) in %.1fs.",
+            prefetched,
+            len(prefetch_pools),
+            time.monotonic() - prefetch_started,
+        )
+
     try:
-        for user in sorted(session.users, key=lambda u: (u.is_ai, u.directory.lower(), u.user_id, u.team_id or 0)):
+        for user in ordered_users:
             if _cancel_requested(cancel_event):
                 logs.append("Trading Paints public showroom fallback cancelled because the iRacing session changed or ended.")
                 break
-            if disable_random_in_team_events and session_user_uses_team_target(user):
-                skipped_team_event_targets += 1
-                continue
             if user.is_ai:
                 matched_ai_users += 1
-                car_enabled_for_user = bool(enable_ai)
-                helmet_enabled_for_user = bool(random_helmets_ai)
-                suit_enabled_for_user = bool(random_suits_ai)
-                if not (car_enabled_for_user or helmet_enabled_for_user or suit_enabled_for_user):
-                    continue
-            else:
-                car_enabled_for_user = bool(enable_real_drivers)
-                helmet_enabled_for_user = bool(random_helmets_real_drivers)
-                suit_enabled_for_user = bool(random_suits_real_drivers)
-                if not (car_enabled_for_user or helmet_enabled_for_user or suit_enabled_for_user):
-                    continue
-            is_local_target = session_user_is_local_target(session, user)
-            if disable_random_for_local_user and is_local_target:
+            skip_reason, need_car, need_helmet, need_suit = _fallback_needs(user)
+            if skip_reason == "team":
+                skipped_team_event_targets += 1
+                continue
+            if skip_reason == "local":
                 skipped_local_targets += 1
                 continue
-            if is_local_target and not sync_my_livery_from_server:
+            if skip_reason or not (need_car or need_helmet or need_suit):
                 continue
 
             target_is_team = session_user_uses_team_target(user)
             target_id = int(user.team_id) if target_is_team else int(user.user_id)
-            target_key = (target_is_team, target_id, user.directory.lower())
-            accessory_target_key = (target_is_team, target_id)
-            need_car = car_enabled_for_user and target_key not in existing_car_targets
-            need_helmet = bool(random_helmets) and helmet_enabled_for_user and accessory_target_key not in existing_helmet_targets
-            need_suit = bool(random_suits) and suit_enabled_for_user and accessory_target_key not in existing_suit_targets
-            if not (need_car or need_helmet or need_suit):
-                continue
 
             summary.attempted_targets += 1
             label = user.display_name or (f"AI {target_id}" if user.is_ai else f"user {target_id}")
@@ -15907,7 +16028,8 @@ def fetch_context_files(
     if payload is None:
         raise RuntimeError("Trading Paints context is unavailable for this session.")
     last_exc: Exception | None = None
-    for url in TRADING_PAINTS_FETCH_CONTEXT_URLS:
+    urls = tp_fetch_context_urls()
+    for url_index, url in enumerate(urls):
         for attempt in range(1, retries + 1):
             if _cancel_requested(cancel_event):
                 return []
@@ -15916,6 +16038,7 @@ def fetch_context_files(
                 resp = http.post(url, data=payload, timeout=30)
                 resp.raise_for_status()
                 root = ET.fromstring(resp.text)
+                _note_tp_fetch_url_result(url, None)
                 files: list[DownloadFile] = []
                 for car in root.findall(".//Car"):
                     if not _matches_context_manifest_entry(user, car):
@@ -15974,7 +16097,8 @@ def fetch_context_files(
                 return []
             except (requests.RequestException, ET.ParseError, RuntimeError) as exc:
                 last_exc = exc
-                if attempt >= retries:
+                unreachable = _note_tp_fetch_url_result(url, exc)
+                if attempt >= retries or (unreachable and url_index + 1 < len(urls)):
                     break
                 delay = compute_retry_delay(retry_backoff_seconds, attempt)
                 logging.debug(
@@ -18253,7 +18377,9 @@ def process_session(
     )
     wanted_items = _dedupe_download_items(wanted_items)
     progress_statuses = build_session_stage_statuses(session, wanted_items, sync_my_livery_from_server)
-    reload_debouncer = TextureReloadDebouncer(reload_reader, session, debounce_seconds=0.2) if auto_refresh_paints else None
+    # A car's paint, spec, helmet and suit land a few hundred ms apart; waiting a second
+    # reloads each car once instead of once per file, and every reload is a hitch in the sim.
+    reload_debouncer = TextureReloadDebouncer(reload_reader, session, debounce_seconds=TEXTURE_RELOAD_DEBOUNCE_SECONDS) if auto_refresh_paints else None
 
     def _emit_progress_rows(saved_items: list[SavedFile] | None = None) -> None:
         if progress_callback is None:
@@ -18949,7 +19075,7 @@ def read_session_from_sdk(reader: IracingSdkReader) -> tuple[SdkPollState, Sessi
     return SdkPollState.SESSION, session
 def start_session_cancel_monitor(
     *,
-    expected_fingerprint: tuple[SessionId, tuple[tuple[str, int, str, int], ...], tuple[bool, str, int, int, bool, str, str, bool]],
+    expected_fingerprint: tuple[SessionId, tuple[bool, str, int, int, bool, str, str, bool]],
     cancel_event: threading.Event,
     stop_event: threading.Event,
     reader: IracingSdkReader | None = None,
@@ -19004,9 +19130,11 @@ def start_session_cancel_monitor(
                     cancel_event.set()
                     logging.info("Cancelling active paint pipeline because the iRacing session ended or became invalid.")
                     break
-                if observed_session is not None and session_pipeline_fingerprint(observed_session) != expected_fingerprint:
+                # Drivers joining or leaving do not cancel: the paints already fetched stay
+                # valid, and the service loop fetches only the new drivers once this pass ends.
+                if observed_session is not None and session_identity_fingerprint(observed_session) != expected_fingerprint:
                     cancel_event.set()
-                    logging.info("Cancelling active paint pipeline because the iRacing session identity, roster, or context changed while processing.")
+                    logging.info("Cancelling active paint pipeline because the iRacing session identity or context changed while processing.")
                     break
                 stop_event.wait(max(0.25, float(poll_seconds)))
         finally:
@@ -20440,7 +20568,7 @@ class DownloaderService:
         if normalized is None:
             return
         request = PendingDriverOverrideApply(
-            session_fingerprint=session_cancel_fingerprint(session),
+            session_fingerprint=session_identity_fingerprint(session),
             entry=normalized,
         )
         request_key = _driver_paint_override_key(
@@ -20461,7 +20589,7 @@ class DownloaderService:
         updated.append(request)
         self._pending_driver_override_applies = updated
     def _drop_pending_driver_override_apply_locked(self, session: Session, user_id: int, kind: str, directory: str = "") -> bool:
-        session_fingerprint = session_cancel_fingerprint(session)
+        session_fingerprint = session_identity_fingerprint(session)
         request_key = _driver_paint_override_key(user_id, kind, directory)
         if not request_key:
             return False
@@ -20488,7 +20616,7 @@ class DownloaderService:
     ) -> bool:
         if session is None:
             return False
-        session_fingerprint = session_cancel_fingerprint(session)
+        session_fingerprint = session_identity_fingerprint(session)
         with self._lock:
             pending = [
                 request
@@ -20586,7 +20714,7 @@ class DownloaderService:
         incoming_saved = list(incremental_saved or [])
         with self._lock:
             runtime_session = self._runtime_snapshot.current_session
-            same_session = runtime_session is not None and session_cancel_fingerprint(runtime_session) == session_cancel_fingerprint(current_session)
+            same_session = runtime_session is not None and session_identity_fingerprint(runtime_session) == session_identity_fingerprint(current_session)
             saved_base = list(self._runtime_snapshot.last_saved) if same_session else list(base_saved or [])
             merged_saved = merge_saved_files(saved_base, incoming_saved)
             runtime_rows = list(self._runtime_snapshot.session_rows) if same_session else []
@@ -20664,7 +20792,7 @@ class DownloaderService:
             return False
         with self._lock:
             current_session = self._runtime_snapshot.current_session
-            if current_session is None or session_cancel_fingerprint(current_session) != session_cancel_fingerprint(session):
+            if current_session is None or session_identity_fingerprint(current_session) != session_identity_fingerprint(session):
                 return False
             last_saved = merge_saved_files(list(self._runtime_snapshot.last_saved), list(saved_items))
             statuses = _session_statuses_from_rows(list(self._runtime_snapshot.session_rows))
@@ -20690,7 +20818,7 @@ class DownloaderService:
     def drop_manual_saved_paint_preserve(self, session: Session, user_id: int, kind: str, directory: str = "") -> bool:
         with self._lock:
             current_session = self._runtime_snapshot.current_session
-            if current_session is None or session_cancel_fingerprint(current_session) != session_cancel_fingerprint(session):
+            if current_session is None or session_identity_fingerprint(current_session) != session_identity_fingerprint(session):
                 return False
             self._drop_pending_driver_override_apply_locked(current_session, user_id, kind, directory)
             changed = False
@@ -20739,7 +20867,7 @@ class DownloaderService:
     ) -> tuple[list[SavedFile], list[SessionDriverSnapshot]]:
         with self._lock:
             current_session = self._runtime_snapshot.current_session
-            if current_session is None or session_cancel_fingerprint(current_session) != session_cancel_fingerprint(session):
+            if current_session is None or session_identity_fingerprint(current_session) != session_identity_fingerprint(session):
                 return processed_saved, processed_rows
             manual_items = [
                 item
@@ -21750,7 +21878,7 @@ class DownloaderService:
                 else:
                     session_cancel_event = threading.Event()
                     session_cancel_monitor = start_session_cancel_monitor(
-                        expected_fingerprint=session_pipeline_fingerprint(session),
+                        expected_fingerprint=session_identity_fingerprint(session),
                         cancel_event=session_cancel_event,
                         stop_event=self._stop_event,
                         reader=sdk_reader,
@@ -23891,7 +24019,7 @@ class DownloaderUI:
         return snapshot, contexts
     def _driver_action_key(self, session: Session, user: SessionUser, kind: str) -> tuple[object, int, str, str]:
         return (
-            session_cancel_fingerprint(session),
+            session_identity_fingerprint(session),
             int(user.user_id),
             _driver_paint_override_kind(kind),
             canonicalize_car_directory(user.directory).lower(),
