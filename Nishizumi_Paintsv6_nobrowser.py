@@ -5984,16 +5984,30 @@ def _parse_tp_showroom_make_index(page_html: str) -> dict[int, dict[str, str]]:
     return index
 
 
-def _tp_identity_match_tokens(value: object) -> set[str]:
-    """Token set used to match a template name against a showroom make name."""
+def _tp_identity_match_tokens(value: object, *, include_initialisms: bool = True) -> set[str]:
+    """Token set used to match a template name against a showroom make name.
+
+    Adjacent-word initialisms are included so a showroom can use an acronym
+    (such as ``GN``) while a newly added iRacing template spells the words out.
+    This keeps the catalog join data-driven as both upstream catalogues evolve.
+    """
     text = _TP_NONWINGED_RE.sub("nonwinged", str(value or ""))
-    tokens: set[str] = set()
+    words: list[str] = []
     for word in _tp_mapping_normalize_text(text).split():
         if word in _TP_IDENTITY_MATCH_STOPWORDS:
             continue
         if len(word) > 3 and word.endswith("s"):
             word = word[:-1]
+        words.append(word)
+    tokens: set[str] = set()
+    for word in words:
         tokens.add(word)
+    if include_initialisms:
+        for start in range(len(words)):
+            for length in range(2, min(4, len(words) - start) + 1):
+                phrase = words[start:start + length]
+                if all(word.isalpha() for word in phrase):
+                    tokens.add("".join(word[0] for word in phrase))
     return tokens
 
 
@@ -6017,14 +6031,14 @@ def _select_tp_make_for_template(
     would send ``dirtmicrosprint\\winged`` to the broader "Dirt Sprint Cars".
     A tie is left unresolved rather than guessed.
     """
-    haystack = _tp_identity_match_tokens(name) | _tp_directory_tokens(directory)
+    haystack = _tp_identity_match_tokens(name, include_initialisms=False) | _tp_directory_tokens(directory)
     for drop_qualifiers in (False, True):
         best: list[int] = []
         best_size = -1
         for mid in sorted(make_index):
             if mid in claimed_mids:
                 continue
-            tokens = _tp_identity_match_tokens(make_index[mid].get("name"))
+            tokens = _tp_identity_match_tokens(make_index[mid].get("name"), include_initialisms=False)
             if drop_qualifiers:
                 tokens = tokens - _TP_MAKE_OPTIONAL_QUALIFIERS
             if not tokens or not tokens <= haystack:
@@ -6035,6 +6049,43 @@ def _select_tp_make_for_template(
                 best.append(mid)
         if len(best) == 1:
             return best[0]
+
+    # A few showroom entries deliberately group several historic cars under a
+    # descriptive family name.  Those names are not token subsets of each
+    # individual template (for example ARCA Menards Gen 4 GN Gen 4 Cup versus
+    # Gen 4 Grand National).  Make a conservative second pass: select only a
+    # unique candidate with at least two shared identity tokens.  Requiring a
+    # unique best overlap retains the previous "do not guess" behaviour for
+    # generic names while allowing new grouped vehicles to be discovered on the
+    # next automatic catalog refresh.
+    name_tokens = _tp_identity_match_tokens(name)
+    directory_tokens = _tp_directory_tokens(directory)
+    token_frequency = Counter(
+        token
+        for entry in make_index.values()
+        for token in _tp_identity_match_tokens(entry.get("name"))
+    )
+    best = []
+    best_score = 0.0
+    for mid in sorted(make_index):
+        if mid in claimed_mids:
+            continue
+        make_tokens = _tp_identity_match_tokens(make_index[mid].get("name"))
+        shared_name_tokens = name_tokens & make_tokens
+        # The display name is considerably more reliable than generic
+        # directory segments such as ``chevy``.  Weight name tokens by their
+        # rarity in the live showroom index, so a distinguishing word such as
+        # "Menards" breaks a tie with a broadly named Chevrolet entry.
+        score = sum(1.0 / token_frequency[token] for token in shared_name_tokens)
+        score += len(directory_tokens & make_tokens) / 100.0
+        if len(shared_name_tokens) < 2:
+            continue
+        if score > best_score:
+            best, best_score = [mid], score
+        elif score == best_score:
+            best.append(mid)
+    if len(best) == 1:
+        return best[0]
     return 0
 
 
@@ -8310,7 +8361,9 @@ def fetch_tp_team_paint_files(
     )
     found: list[DownloadFile] = []
     attempts = 0
-    for endpoint in TRADING_PAINTS_FETCH_CONTEXT_URLS:
+    manifest_urls = tp_fetch_context_urls()
+    for endpoint_index, endpoint in enumerate(manifest_urls):
+        host_unreachable = False
         for payload in payloads:
             if _cancel_requested(cancel_event):
                 return _dedupe_tp_team_download_items(found), logs
@@ -8323,13 +8376,18 @@ def fetch_tp_team_paint_files(
                     http = get_thread_http_session()
                     resp = http.post(endpoint, data=payload, timeout=30)
                     resp.raise_for_status()
+                    _note_tp_fetch_url_result(endpoint, None)
                     items = _parse_tp_team_fetch_manifest(resp.text, target)
                     if items:
                         found.extend(items)
                         write(f"Team manifest matched {len(items)} file(s) via {endpoint}; list={list_value}.")
                     break
                 except (requests.RequestException, ET.ParseError) as exc:
-                    if attempt >= max(1, int(retries)):
+                    unreachable = _note_tp_fetch_url_result(endpoint, exc)
+                    host_unreachable = host_unreachable or unreachable
+                    if attempt >= max(1, int(retries)) or (
+                        unreachable and endpoint_index + 1 < len(manifest_urls)
+                    ):
                         write(f"Team manifest attempt failed via {endpoint}; list={list_value}; error={exc}")
                         break
                     delay = compute_retry_delay(retry_backoff_seconds, attempt)
@@ -8337,6 +8395,8 @@ def fetch_tp_team_paint_files(
                         cancel_event.wait(delay)
                     else:
                         time.sleep(delay)
+            if host_unreachable:
+                break
     deduped = _dedupe_tp_team_download_items(found)
     write(f"Team manifest scan completed: {len(deduped)} unique team asset(s) after {attempts} payload attempt(s).")
     return deduped, logs
@@ -8779,7 +8839,8 @@ def fetch_tp_team_all_paint_files(
             batch_targets.append(target)
         payload = _tp_team_bulk_payload(target_team_id, batch_rows)
         batch_items: list[DownloadFile] = []
-        for endpoint in tp_fetch_context_urls():
+        manifest_urls = tp_fetch_context_urls()
+        for endpoint_index, endpoint in enumerate(manifest_urls):
             attempts += 1
             for attempt in range(1, max(1, int(retries)) + 1):
                 if _cancel_requested(cancel_event):
@@ -8788,12 +8849,16 @@ def fetch_tp_team_all_paint_files(
                     http = get_thread_http_session()
                     resp = http.post(endpoint, data=payload, timeout=25)
                     resp.raise_for_status()
+                    _note_tp_fetch_url_result(endpoint, None)
                     root = ET.fromstring(resp.text)
                     for target in batch_targets:
                         batch_items.extend(_parse_tp_team_fetch_manifest_root(root, target))
                     break
                 except (requests.RequestException, ET.ParseError) as exc:
-                    if attempt >= max(1, int(retries)):
+                    unreachable = _note_tp_fetch_url_result(endpoint, exc)
+                    if attempt >= max(1, int(retries)) or (
+                        unreachable and endpoint_index + 1 < len(manifest_urls)
+                    ):
                         logging.debug("Team all-paints manifest batch failed via %s; batch=%s; error=%s", endpoint, batch_index, exc)
                         break
                     delay = compute_retry_delay(retry_backoff_seconds, attempt)

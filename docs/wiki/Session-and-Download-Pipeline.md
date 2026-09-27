@@ -34,7 +34,7 @@ For each session user, the app attempts to resolve normal Trading Paints assets 
 
 This stage decides which normal TP files already exist for the session before fallback even starts.
 
-The session-aware lookup has two Trading Paints hosts. When one of them cannot be reached at all (TLS handshake failure, DNS, refused connection, connect timeout), the app moves straight to the other host instead of spending its retries, and tries the working host first for the next 10 minutes. HTTP errors and slow answers still get the normal retries.
+Every Trading Paints manifest lookup shares the same two-host failover pool: regular live-session drivers, Team paint lookups, and Team all-paints scans. When one host cannot be reached at all (TLS handshake failure, DNS, refused connection, or connect timeout), the app moves straight to the other host instead of spending its retries, and tries the working host first for the next 10 minutes. HTTP errors and slow answers still get the normal retries.
 
 Manifest directories are recorded as runtime validation. Their `<carid>` fields are paint asset IDs and are not used as vehicle MIDs.
 

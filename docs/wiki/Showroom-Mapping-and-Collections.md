@@ -13,7 +13,7 @@ The app combines:
 
 The template page publishes the vehicle name and the exact `Documents/iRacing/paint/...` directory. The showroom page publishes the vehicle MID and its Oval, Road, or Driver category. The two are joined on the vehicle name to produce the bridge used by public showroom downloads.
 
-Trading Paints groups several iRacing directories under one showroom vehicle (one `Dirt Sprint Cars` vehicle covers the 305, 360, and 410 templates). When a template name has no exact match, the directory segments are used to pick the most specific vehicle that fits, and an ambiguous match is dropped instead of guessed. A dropped template only loses public showroom features for that car; downloads still work, because they use the paint directory reported by iRacing and Trading Paints.
+Trading Paints groups several iRacing directories under one showroom vehicle (one `Dirt Sprint Cars` vehicle covers the 305, 360, and 410 templates). When a template name has no exact match, the directory segments are used to pick the most specific vehicle that fits. The catalog compares complete words and generated initialisms, so it can automatically bridge future upstream naming differences such as an abbreviated showroom family name and a fully spelled-out iRacing template name. It only accepts a partial match when it has a unique, meaningful token overlap; an ambiguous match is still dropped instead of guessed. A dropped template only loses public showroom features for that car; downloads still work, because they use the paint directory reported by iRacing and Trading Paints.
 
 ## New cars
 
