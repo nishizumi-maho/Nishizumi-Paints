@@ -78,7 +78,7 @@ class ManifestHostFallbackTests(unittest.TestCase):
     def _fetch(self):
         return APP.fetch_context_files(self.session, self.user, retries=3, retry_backoff_seconds=5.0)
 
-    def test_an_unreachable_host_is_not_retried_while_another_host_is_left(self):
+    def test_general_session_manifest_uses_the_healthy_alternative_after_tls_failure(self):
         http = _HttpSession({BROKEN: requests.exceptions.SSLError("handshake failure")})
         self._use(http)
         started = time.monotonic()
@@ -117,6 +117,13 @@ class ManifestHostFallbackTests(unittest.TestCase):
         with self.assertRaises(requests.exceptions.ConnectionError):
             self._fetch()
         self.assertEqual(http.calls, [BROKEN, HEALTHY, HEALTHY, HEALTHY])
+
+    def test_team_manifest_uses_the_healthy_alternative_after_tls_failure(self):
+        http = _HttpSession({BROKEN: requests.exceptions.SSLError("handshake failure")})
+        self._use(http)
+        target = APP.TPTeamPaintTarget(0, "Ferrari 296 GT3", (CAR,), 264, "Ferrari-296-GT3")
+        APP.fetch_tp_team_paint_files(target, request_member_id=42, retries=3, retry_backoff_seconds=0.0)
+        self.assertEqual(http.calls[:2], [BROKEN, HEALTHY])
 
 
 class _ReloadSdk:

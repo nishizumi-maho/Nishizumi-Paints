@@ -140,6 +140,26 @@ class TradingPaintsCarIdentityTests(unittest.TestCase):
             166,
         )
 
+    def test_grouped_historic_make_matches_each_template_variant(self):
+        # The current Trading Paints catalog groups these three template names
+        # below one showroom make.  The template spelling and the showroom
+        # spelling differ, so the automatic matching must not leave them out.
+        index = {
+            258: {"category": "Oval", "name": "ARCA Menards Gen 4 GN Gen 4 Cup"},
+            294: {"category": "Oval", "name": "ARCA Chevrolet SS"},
+            297: {"category": "Oval", "name": "Gen 4 Chevrolet Monte Carlo 2003"},
+        }
+        rows = [
+            ("ARCA Menards Chevrolet Impala", "stockcars2\\chevy"),
+            ("Gen 4 Grand National", "stockcars2\\chevy\\national"),
+            ("[Legacy] Gen 4 Cup", "stockcars2\\chevy\\gen4cup"),
+        ]
+        entries = APP._match_tp_template_rows_to_makes(rows, index)
+        self.assertEqual([entry["mid"] for entry in entries], [258, 258, 258])
+
+    def test_identity_tokens_generate_initialisms_without_a_vehicle_specific_rule(self):
+        self.assertIn("arc", APP._tp_identity_match_tokens("Astral Racing Championship"))
+
     def test_template_without_any_matching_make_is_dropped(self):
         page = """
         <div id="car"><a href="/a.zip"><h3><span>Totally Unknown Car</span></h3>
