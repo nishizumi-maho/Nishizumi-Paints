@@ -2,6 +2,29 @@
 
 All notable user-facing changes to Nishizumi Paints are documented here.
 
+## [7.3.5] - 2026-10-10 (experimental)
+
+Published as the experimental pre-release `v7.3.5-experimental.1`. The in-app updater does not offer pre-releases, so it has to be installed by hand.
+
+### Fixed
+
+- Fixed the startup mode selector (normal window or console only) coming back even after choosing a mode with **Remember this choice** ticked. When the app was already running, for example in the tray after starting with Windows, opening it again showed the selector before noticing the running copy, and that running copy then wrote its older settings back over the choice the next time any setting was saved, including settings it saves by itself. The choice is now saved on its own without touching other settings, and a running copy never writes an older startup mode back.
+- Opening the app while it is already running now brings the running copy forward straight away instead of showing the startup selector again. Holding `Shift` while opening it still shows the selector.
+- Starting with Windows never stops at the startup selector: it uses the saved mode, or the normal window when none is saved.
+- `settings.json` is now replaced in one step when it is saved, and a read that happens while another copy of the app is saving is tried again, so a running copy and a new launch can no longer see a half-written file and fall back to default settings.
+- After an update installs, the app reopens in the mode it was running in instead of stopping at the startup selector.
+
+### Added
+
+- The console-only (headless) mode now checks for updates on its own, like the window does: shortly after starting and then every 6 hours, following **Check for updates automatically**. A failed check, for example while the network is still coming up after sign-in, is retried after 15 minutes.
+- A new version is announced in the console and with a Windows notification. Clicking the notification downloads the installer, verifies its SHA-256 digest, installs it, and starts the console mode again on the new version. With **Install updates automatically** on, the headless service does all of that by itself.
+- The headless control server accepts `check_updates` and `install_update`, and its `status` answer reports `update_state`, `update_message`, `latest_release_tag`, and `update_available`.
+
+### Changed
+
+- **Remember this choice** in the startup selector is now ticked by default.
+- A window attached to a running headless service leaves updates to that service: installing an update from the window hands it to the service and closes the window, and the window also closes if the service shuts down to install an update, instead of starting a second downloader that would hold the installer up.
+
 ## [7.3.4] - 2026-09-26
 
 ### Fixed
