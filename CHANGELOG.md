@@ -2,9 +2,9 @@
 
 All notable user-facing changes to Nishizumi Paints are documented here.
 
-## [7.3.5] - 2026-10-10 (experimental)
+## [7.3.5] - 2026-10-10
 
-Published as the experimental pre-release `v7.3.5-experimental.1`. The in-app updater does not offer pre-releases, so it has to be installed by hand.
+First published as the experimental pre-release `v7.3.5-experimental.1`; the final release is the same code. A copy of 7.3.4 or older running console-only cannot check for updates, so it has to be updated once from the normal window or with the installer.
 
 ### Fixed
 
