@@ -63,7 +63,7 @@ One input, `tag_suffix`, which decides both the tag and the kind of release:
 | `tag_suffix` | Result |
 | --- | --- |
 | empty | `v<version>`, published as a normal release. The in-app updater offers it. |
-| `beta.1`, `rc.1`, ... | `v<version>-<suffix>`, published as a pre-release. The app asks GitHub for the *latest* release and GitHub never answers with a pre-release, so it is never offered by the updater: people download and run it themselves. |
+| `experimental.1`, `beta.1`, `rc.1`, ... | `v<version>-<suffix>`, published as a pre-release. The app asks GitHub for the *latest* release and GitHub never answers with a pre-release, so it is never offered by the updater: people download and run it themselves. The banner at the top of the notes names the kind of build from the suffix: experimental, release candidate, alpha, or beta. |
 
 The suffix alone decides, so a beta tag can never be published as a final release, or the other way round. Note that a `workflow_dispatch` input sent as an empty string falls back to its declared default, which is why the default here is empty rather than a suffix.
 
@@ -72,7 +72,7 @@ A second input, `draft` (off by default), creates the same release as a draft in
 The run reads `APP_VERSION` from the script, so the version is never typed twice. It then compiles the app, checks the syntax, runs the unit tests, compiles the installer with the same Inno Setup script used locally, and publishes the release with:
 
 - the installer from `installer/output/` as the only asset
-- `docs/release-notes/<version>.md` as the release body, with a beta banner in front when the run is a pre-release
+- `docs/release-notes/<version>.md` as the release body, with a pre-release banner in front when the run is a pre-release
 - the installer's SHA-256 appended in the format the in-app updater parses, so a full release can be installed from inside the app
 
 A run fails instead of publishing when `APP_VERSION` is not a plain version number, when the tag suffix is not a valid tag fragment, when PyInstaller or Inno Setup produce nothing, or when the tag already exists.

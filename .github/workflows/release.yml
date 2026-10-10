@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       tag_suffix:
-        description: 'Pre-release suffix such as "beta.1" or "rc.1". A suffix publishes a pre-release, which the in-app updater never offers. Leave empty to publish the final v<version> release.'
+        description: 'Pre-release suffix such as "experimental.1", "beta.1", or "rc.1". A suffix publishes a pre-release, which the in-app updater never offers. Leave empty to publish the final v<version> release.'
         required: false
         default: ''
       draft:
@@ -106,6 +106,7 @@ jobs:
           RELEASE_TAG: ${{ steps.release.outputs.tag }}
           INSTALLER_NAME: ${{ steps.release.outputs.installer }}
           IS_PRERELEASE: ${{ steps.release.outputs.prerelease }}
+          TAG_SUFFIX: ${{ inputs.tag_suffix }}
         run: |
           $ErrorActionPreference = 'Stop'
           $installerPath = Join-Path 'installer\output' $env:INSTALLER_NAME
@@ -115,7 +116,14 @@ jobs:
           Write-Host "SHA-256 $digest ($size MB)"
           $lines = New-Object System.Collections.Generic.List[string]
           if ($env:IS_PRERELEASE -eq 'true') {
-            $lines.Add("**Beta build of $env:APP_VERSION.** It is published as a pre-release, so the in-app updater does not offer it: download and run the installer below to try it. It installs over an existing installation and keeps your settings, catalog cache, and paints.")
+            # The suffix names the kind of pre-release: experimental.1, rc.1, alpha.1, or beta.1.
+            $kind = switch -Regex ("$env:TAG_SUFFIX") {
+              '^experimental' { 'Experimental build'; break }
+              '^rc' { 'Release candidate'; break }
+              '^alpha' { 'Alpha build'; break }
+              default { 'Beta build' }
+            }
+            $lines.Add("**$kind of $env:APP_VERSION.** It is published as a pre-release, so the in-app updater does not offer it: download and run the installer below to try it. It installs over an existing installation and keeps your settings, catalog cache, and paints.")
             $lines.Add('')
           }
           $notesFile = "docs/release-notes/$env:APP_VERSION.md"

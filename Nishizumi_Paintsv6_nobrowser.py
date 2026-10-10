@@ -35,7 +35,7 @@ from dataclasses import asdict, dataclass, field, replace
 from difflib import SequenceMatcher
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Sequence
 import requests
 import yaml
 from requests.adapters import HTTPAdapter
@@ -43,7 +43,7 @@ from requests.adapters import HTTPAdapter
 # Browserless copy: Trading Paints browser automation is intentionally disabled.
 sync_playwright = None
 APP_NAME = "Nishizumi Paints"
-APP_VERSION = "7.3.4"
+APP_VERSION = "7.3.5"
 APP_REGISTRY_NAME = "NishizumiPaints"
 APP_CONFIG_DIRNAME = "NishizumiPaints"
 APP_TOOLTIP = f"{APP_NAME} {APP_VERSION}"
@@ -123,6 +123,10 @@ GITHUB_RELEASES_API_LATEST = f"https://api.github.com/repos/{GITHUB_RELEASE_OWNE
 GITHUB_RELEASES_PAGE_LATEST = f"https://github.com/{GITHUB_RELEASE_OWNER}/{GITHUB_RELEASE_REPO}/releases/latest"
 GITHUB_API_VERSION = "2022-11-28"
 GITHUB_UPDATE_CHECK_INTERVAL_SECONDS = 6 * 60 * 60
+# The headless service checks a little after it starts, so a sign-in launch does not
+# race the network coming up, and retries sooner than the normal interval after a failure.
+HEADLESS_UPDATE_FIRST_CHECK_DELAY_SECONDS = 20.0
+HEADLESS_UPDATE_RETRY_SECONDS = 15 * 60
 # Installer downloads are only ever fetched from GitHub's own release hosts, and only
 # after the published SHA-256 digest matches, because the file is executed afterwards.
 GITHUB_RELEASE_ASSET_HOSTS = (
@@ -190,6 +194,10 @@ INSTANCE_MUTEX_NAME = r"Local\NishizumiPaintsSingleInstance"
 HEADLESS_CONTROL_HOST = "127.0.0.1"
 HEADLESS_CONTROL_PORT = 45892
 HEADLESS_CONTROL_CONNECT_TIMEOUT = 1.5
+# settings.json is shared by every running copy of the app, so it is replaced in one
+# step and a read that lands in the middle of a replace is tried again.
+CONFIG_IO_ATTEMPTS = 10
+CONFIG_IO_RETRY_SECONDS = 0.05
 _tp_scheme_request_gate_lock = threading.Lock()
 _tp_scheme_request_gate_next_at = 0.0
 
@@ -1041,7 +1049,8 @@ def show_launch_mode_dialog(saved_mode: str = "ask") -> tuple[str, bool] | None:
     except Exception:
         pass
     mode_var = tk.StringVar(value="gui" if saved_mode == "ask" else saved_mode)
-    remember_var = tk.BooleanVar(value=False)
+    # Remembering is the usual intent; Shift brings the selector back whenever needed.
+    remember_var = tk.BooleanVar(value=True)
     frame = ttk.Frame(root, padding=14)
     frame.grid(sticky="nsew")
     root.columnconfigure(0, weight=1)
@@ -1155,6 +1164,16 @@ def ensure_console_window() -> bool:
         return True
     except Exception:
         return False
+
+
+def set_console_title(title: str) -> None:
+    if sys.platform != "win32" or not _get_console_window_handle():
+        return
+    try:
+        import ctypes
+        ctypes.windll.kernel32.SetConsoleTitleW(str(title))
+    except Exception:
+        pass
 
 
 def show_console_window() -> None:
@@ -1489,32 +1508,47 @@ def download_release_installer(
     return target
 
 
-def build_update_launcher_script(installer_path: Path, app_exe: Path, log_path: Path) -> str:
+def build_update_launcher_script(
+    installer_path: Path,
+    app_exe: Path,
+    log_path: Path,
+    relaunch_args: Sequence[str] = (),
+) -> str:
     """Batch wrapper that installs the update and relaunches the app afterwards.
 
     The app has to exit before the installer can replace its own files, so the install
-    is handed to a detached script rather than run in-process.
+    is handed to a detached script rather than run in-process. ``relaunch_args`` reopens
+    the app in the mode it was running in (``--gui`` or ``--nogui``), so an update never
+    stops at the startup mode selector.
     """
     parts = {"installer": Path(installer_path), "app": Path(app_exe), "log": Path(log_path)}
     for label, value in parts.items():
         text = str(value)
         if '"' in text or "%" in text or "\n" in text or "\r" in text:
             raise RuntimeError(f"Refusing to build an update script for an unsafe {label} path: {text!r}")
+    for argument in relaunch_args:
+        if not re.fullmatch(r"--[a-z][a-z0-9-]*", str(argument)):
+            raise RuntimeError(f"Refusing to build an update script with an unsafe relaunch argument: {argument!r}")
     arguments = " ".join(UPDATE_INSTALLER_SILENT_ARGS)
+    relaunch = "".join(f" {argument}" for argument in relaunch_args)
     return "\r\n".join(
         [
             "@echo off",
             "setlocal",
             f'"{parts["installer"]}" {arguments} /LOG="{parts["log"]}"',
             'if errorlevel 1 exit /b %errorlevel%',
-            f'start "" "{parts["app"]}"',
+            f'start "" "{parts["app"]}"{relaunch}',
             "exit /b 0",
             "",
         ]
     )
 
 
-def start_update_installer(installer_path: Path, app_exe: Path | None = None) -> Path:
+def start_update_installer(
+    installer_path: Path,
+    app_exe: Path | None = None,
+    relaunch_args: Sequence[str] = (),
+) -> Path:
     """Spawn the detached installer script and return the script path."""
     reason = auto_install_unsupported_reason()
     if reason:
@@ -1526,7 +1560,7 @@ def start_update_installer(installer_path: Path, app_exe: Path | None = None) ->
     directory = installer.parent
     script_path = directory / "run_update.cmd"
     log_path = directory / "install.log"
-    script_path.write_text(build_update_launcher_script(installer, target_exe, log_path), encoding="ascii")
+    script_path.write_text(build_update_launcher_script(installer, target_exe, log_path, relaunch_args), encoding="ascii")
     creationflags = 0
     if sys.platform == "win32":
         creationflags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
@@ -1656,10 +1690,12 @@ class HeadlessControlServer:
         request_shutdown: Callable[[], None],
         host: str = HEADLESS_CONTROL_HOST,
         port: int = HEADLESS_CONTROL_PORT,
+        update_manager: "HeadlessUpdateManager | None" = None,
     ) -> None:
         self._service = service
         self._config_store = config_store
         self._request_shutdown = request_shutdown
+        self._update_manager = update_manager
         self.host = host
         self.port = port
         self._sock = None
@@ -1730,7 +1766,7 @@ class HeadlessControlServer:
             snapshot = self._service.get_runtime_snapshot()
             current_session = snapshot.current_session.session_id.folder_name() if snapshot.current_session is not None else ""
             preview_status = self._service.get_ui_preview_status()
-            return {
+            response = {
                 "ok": True,
                 "mode": "headless",
                 "service_running": self._service.is_running(),
@@ -1743,13 +1779,28 @@ class HeadlessControlServer:
                 "ui_preview_member_id": int(preview_status.member_id),
                 "ui_preview_cars": int(preview_status.car_directories),
             }
+            if self._update_manager is not None:
+                response.update(self._update_manager.status())
+            return response
         if command == "sync_ui_previews":
             self._service.request_ui_preview_sync()
             return {"ok": True, "requested": True}
         if command == "reload_config":
             config = self._config_store.load()
             self._service.update_config(config)
+            if self._update_manager is not None:
+                self._update_manager.config_changed()
             return {"ok": True, "reloaded": True}
+        if command == "check_updates":
+            if self._update_manager is None:
+                return {"ok": False, "error": "This service does not check for updates."}
+            self._update_manager.request_check()
+            return {"ok": True, "requested": True}
+        if command == "install_update":
+            if self._update_manager is None:
+                return {"ok": False, "error": "This service does not install updates."}
+            started, message = self._update_manager.install_available_update()
+            return {"ok": started, "started": started, "message": message, "error": "" if started else message}
         if command == "stop":
             threading.Thread(target=self._request_shutdown, name="NishizumiPaintsHeadlessShutdown", daemon=True).start()
             return {"ok": True, "stopping": True}
@@ -19725,12 +19776,65 @@ class ConfigStore:
         if appdata:
             return Path(appdata) / APP_CONFIG_DIRNAME / "settings.json"
         return Path.home() / f".{APP_CONFIG_DIRNAME.lower()}_settings.json"
-    def load(self) -> AppConfig:
-        if not self.path.exists():
-            return apply_installer_autostart_default(AppConfig())
+    def _read_raw(self) -> dict | None:
+        """The saved settings, or None when there is no readable settings file.
+
+        Another copy of the app may be replacing the file at the same moment, so a
+        read that fails is tried again briefly before it counts as unreadable.
+        """
+        for attempt in range(CONFIG_IO_ATTEMPTS):
+            if not self.path.exists():
+                return None
+            try:
+                raw = json.loads(self.path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                if attempt + 1 < CONFIG_IO_ATTEMPTS:
+                    time.sleep(CONFIG_IO_RETRY_SECONDS)
+                continue
+            return raw if isinstance(raw, dict) else None
+        return None
+    def _write_raw(self, raw: dict) -> None:
+        """Replace settings.json in one step, so no reader ever sees half a file."""
+        text = json.dumps(raw, indent=2)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = self.path.with_name(f"{self.path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
         try:
-            raw = json.loads(self.path.read_text(encoding="utf-8"))
-        except Exception:
+            with temp_path.open("w", encoding="utf-8") as handle:
+                handle.write(text)
+                handle.flush()
+                try:
+                    os.fsync(handle.fileno())
+                except OSError:
+                    pass
+            for attempt in range(CONFIG_IO_ATTEMPTS):
+                try:
+                    os.replace(temp_path, self.path)
+                    return
+                except PermissionError:
+                    # Windows refuses the replace while another process is reading the file.
+                    if attempt + 1 < CONFIG_IO_ATTEMPTS:
+                        time.sleep(CONFIG_IO_RETRY_SECONDS)
+            self.path.write_text(text, encoding="utf-8")
+        finally:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+    def load_launch_mode_preference(self) -> str:
+        raw = self._read_raw() or {}
+        return normalize_launch_mode_preference(raw.get("launch_mode_preference", "ask"))
+    def save_launch_mode_preference(self, mode: str) -> None:
+        """Store the startup mode without touching any other setting."""
+        raw = self._read_raw()
+        if raw is None:
+            if self.path.exists():
+                raise RuntimeError(f"{self.path} could not be read, so the startup mode was not saved over it.")
+            raw = {}
+        raw["launch_mode_preference"] = normalize_launch_mode_preference(mode)
+        self._write_raw(raw)
+    def load(self) -> AppConfig:
+        raw = self._read_raw()
+        if raw is None:
             return apply_installer_autostart_default(AppConfig())
         config = AppConfig()
         for key, value in raw.items():
@@ -19926,7 +20030,7 @@ class ConfigStore:
         safe.iracing_documents_dir = normalize_optional_path(getattr(safe, "iracing_documents_dir", ""))
         if safe.iracing_documents_dir == str(default_iracing_documents_dir()):
             safe.iracing_documents_dir = ""
-        self.path.write_text(json.dumps(asdict(safe), indent=2), encoding="utf-8")
+        self._write_raw(asdict(safe))
 class BoundedLogQueue:
     def __init__(self, maxlen: int = LOG_QUEUE_LIMIT) -> None:
         self._items: deque[str] = deque(maxlen=max(1, int(maxlen)))
@@ -22226,9 +22330,15 @@ class DownloaderService:
             close_sdk_reader(sdk_reader)
             self._set_status("Stopped")
 class WindowsTrayIcon:
-    def __init__(self, on_restore: Callable[[], None], on_exit: Callable[[], None] | None = None) -> None:
+    def __init__(
+        self,
+        on_restore: Callable[[], None],
+        on_exit: Callable[[], None] | None = None,
+        tooltip: str = APP_TOOLTIP,
+    ) -> None:
         self.on_restore = on_restore
         self.on_exit = on_exit
+        self._on_notification_click: Callable[[], None] | None = None
         self._thread: threading.Thread | None = None
         self._ready = threading.Event()
         self._visible = False
@@ -22236,7 +22346,7 @@ class WindowsTrayIcon:
         self._hwnd = None
         self._wndproc = None
         self._class_name = f"NishizumiPaintsTrayWindow_{id(self)}"
-        self._tooltip = APP_TOOLTIP
+        self._tooltip = str(tooltip)[:120]
         self._stop_requested = False
         self._icon_handle = None
         self._ctypes = None
@@ -22254,13 +22364,28 @@ class WindowsTrayIcon:
         self._thread.start()
         self._ready.wait(timeout=2.0)
         return self._started
-    def show(self, tooltip: str = APP_TOOLTIP) -> bool:
-        self._tooltip = tooltip[:120]
+    def show(self, tooltip: str | None = None) -> bool:
+        if tooltip is not None:
+            self._tooltip = tooltip[:120]
         if not self.start():
             return False
         if self._visible:
             return True
         return self._add_icon()
+    def notify(self, title: str, message: str, on_click: Callable[[], None] | None = None) -> bool:
+        """Show a Windows notification from the tray icon, adding the icon if needed.
+
+        Clicking the notification runs ``on_click``, or restores the app without one.
+        """
+        if not self.show():
+            return False
+        self._on_notification_click = on_click
+        nid = self._make_nid()
+        nid.uFlags |= 0x00000010  # NIF_INFO
+        nid.szInfoTitle = str(title)[:63]
+        nid.szInfo = str(message)[:255]
+        nid.dwInfoFlags = 0x00000001  # NIIF_INFO
+        return bool(self._shell32.Shell_NotifyIconW(0x00000001, self._ctypes.byref(nid)))  # NIM_MODIFY
     def hide(self) -> None:
         if self._started and self._visible:
             self._notify_icon(self._nim_delete())
@@ -22291,6 +22416,7 @@ class WindowsTrayIcon:
         self._wm_trayicon = WM_APP + 1
         self._wm_lbuttondblclk = 0x0203
         self._wm_rbuttonup = 0x0205
+        self._nin_balloonuserclick = 0x0405
         self._menu_open_id = 1001
         self._menu_exit_id = 1002
         class GUID(ctypes.Structure):
@@ -22371,6 +22497,14 @@ class WindowsTrayIcon:
                 return 0
             if msg == self._wm_trayicon and lparam == self._wm_rbuttonup:
                 show_context_menu(hwnd)
+                return 0
+            if msg == self._wm_trayicon and lparam == self._nin_balloonuserclick:
+                callback = self._on_notification_click or self.on_restore
+                self._on_notification_click = None
+                try:
+                    callback()
+                except Exception:
+                    logging.debug("Notification click handler failed", exc_info=True)
                 return 0
             if msg == WM_CLOSE:
                 user32.DestroyWindow(hwnd)
@@ -25672,9 +25806,22 @@ class DownloaderUI:
         threading.Thread(target=_worker, name="NishizumiRandomPoolStats", daemon=True).start()
     def _poll_service(self) -> None:
         if self._headless_controller_mode:
+            previous_update_state = str((self._last_headless_status_response or {}).get("update_state") or "")
             response = send_headless_control_command("status")
+            update_state = str((response or {}).get("update_state") or "")
+            if update_state == "installing" or (
+                not (response and response.get('ok')) and previous_update_state in {"downloading", "installing"}
+            ):
+                # The headless service is closing for an update. This window must close
+                # too, or the installer could not replace the files it has open.
+                self._append_log("The headless service is installing an update. Closing this window so the installer can finish.")
+                self.request_exit_for_update()
+                return
             if response and response.get('ok'):
+                previous_release_tag = (self._last_headless_status_response or {}).get("latest_release_tag")
                 self._last_headless_status_response = response
+                if response.get("latest_release_tag") != previous_release_tag:
+                    self._update_headless_ui(response)
                 session_label = str(response.get('current_session') or '').strip()
                 status_label = str(response.get('service_status') or "Watching").strip() or "Watching"
                 self.status_var.set(f"Headless • {status_label}")
@@ -25721,13 +25868,13 @@ class DownloaderUI:
 
     def _persist_launch_mode_preference(self, mode: str) -> None:
         normalized_mode = normalize_launch_mode_preference(mode)
-        if str(getattr(self.config, "launch_mode_preference", "ask")) == normalized_mode:
-            return
         self.config.launch_mode_preference = normalized_mode
+        if self.config_store.load_launch_mode_preference() == normalized_mode:
+            return
         try:
-            self.config_store.save(self.config)
-        except Exception:
-            logging.debug("Could not persist launch mode preference", exc_info=True)
+            self.config_store.save_launch_mode_preference(normalized_mode)
+        except Exception as exc:
+            logging.warning("Could not save the startup mode: %s", exc)
             return
         self._apply_autostart(self.config.auto_start)
 
@@ -25762,6 +25909,10 @@ class DownloaderUI:
     def _headless_update_notice_text(self) -> str:
         release = self._latest_release_info
         if release is None:
+            # The headless service checks for updates on its own and reports what it found.
+            headless_tag = str((self._last_headless_status_response or {}).get("latest_release_tag") or "").strip()
+            if headless_tag and compare_version_tags(headless_tag, APP_VERSION) > 0:
+                return f" Update available: {headless_tag}."
             return ""
         if compare_version_tags(release.tag_name, APP_VERSION) <= 0:
             return ""
@@ -25769,6 +25920,12 @@ class DownloaderUI:
         if release.asset_name:
             notice += f" Asset: {release.asset_name}."
         return notice
+
+    def _headless_service_handles_updates(self) -> bool:
+        """True when this window only controls a headless service that updates itself."""
+        if not self._headless_controller_mode:
+            return False
+        return "update_state" in (self._last_headless_status_response or {})
 
     def _launch_headless_process(self) -> tuple[bool, str]:
         command = build_self_launch_command("--nogui", "--managed-headless")
@@ -25925,6 +26082,9 @@ class DownloaderUI:
             return False
         if self._update_install_in_progress or self._exiting:
             return False
+        if self._headless_service_handles_updates():
+            # The headless service runs the same automatic install, so only one of them does.
+            return False
         if self._last_auto_installed_tag == release.tag_name:
             return False
         if auto_install_unsupported_reason():
@@ -25989,6 +26149,9 @@ class DownloaderUI:
             if manual:
                 self._append_log("An update installation is already in progress.")
             return
+        if self._headless_service_handles_updates():
+            self._hand_update_install_to_headless(release)
+            return
         self._update_install_in_progress = True
         self.update_status_var.set(f"Downloading update {release.tag_name}...")
         self._append_log(f"Downloading update {release.tag_name} ({release.asset_name}).")
@@ -25999,6 +26162,24 @@ class DownloaderUI:
             name="NishizumiPaintsUpdateInstall",
         )
         thread.start()
+
+    def _hand_update_install_to_headless(self, release: GitHubReleaseInfo) -> None:
+        """Let the running headless service install the update, then close this window.
+
+        The service owns the downloader and starts again in headless mode afterwards.
+        This window has to close as well, or the installer could not replace its files.
+        """
+        response = send_headless_control_command("install_update")
+        if not response or not response.get("ok"):
+            detail = str((response or {}).get("error") or "The headless service could not be reached.")
+            self._append_log(f"Could not hand update {release.tag_name} to the headless service: {detail}")
+            self.messagebox.showerror(APP_NAME, f"Could not install the update.\n\n{detail}", parent=self.root)
+            return
+        self.update_status_var.set(f"Installing update {release.tag_name} from the headless service...")
+        self._append_log(
+            f"The headless service is installing update {release.tag_name} and will start again in headless mode. Closing this window."
+        )
+        self.request_exit_for_update()
 
     def _update_install_worker(self, release: GitHubReleaseInfo, manual: bool) -> None:
         last_percent = -1
@@ -26043,7 +26224,7 @@ class DownloaderUI:
         self._append_log(f"Update {release.tag_name} verified against the published SHA-256 digest.")
         self.update_status_var.set(f"Installing update {release.tag_name}...")
         try:
-            start_update_installer(installer)
+            start_update_installer(installer, relaunch_args=("--gui",))
         except Exception as exc:
             self.update_status_var.set(f"Update {release.tag_name}: install failed")
             self._append_log(f"Could not start the update installer: {exc}")
@@ -26190,7 +26371,9 @@ class DownloaderUI:
             retries=self.config.retries,
             retry_backoff_seconds=self.config.retry_backoff_seconds,
             iracing_documents_dir=self._read_iracing_documents_dir_setting(),
-            launch_mode_preference=normalize_launch_mode_preference(getattr(self.config, "launch_mode_preference", "ask")),
+            # Read from disk, not memory: another launch may have saved a new startup
+            # mode since this window opened, and saving settings must not undo it.
+            launch_mode_preference=self.config_store.load_launch_mode_preference(),
         )
     def _refresh_iracing_documents_dir_controls(self) -> None:
         custom_enabled = bool(getattr(self, "custom_iracing_documents_dir_var", None) and self.custom_iracing_documents_dir_var.get())
@@ -28255,16 +28438,317 @@ class DownloaderUI:
         self.root.destroy()
     def run(self) -> None:
         self.root.mainloop()
-def run_headless(args: argparse.Namespace | None = None) -> int:
+
+
+class HeadlessUpdateManager:
+    """Update checks and installs for the headless service, which has no window to ask from.
+
+    It follows the same two settings as the GUI. "Check for updates automatically"
+    checks GitHub shortly after the service starts and then every few hours.
+    "Install updates automatically" installs a verified installer without asking.
+    Otherwise a newer release is announced in the console and with a Windows
+    notification, and clicking the notification installs it.
+    """
+
+    def __init__(
+        self,
+        config_store: ConfigStore,
+        request_shutdown: Callable[[], None],
+        notifier: WindowsTrayIcon | None = None,
+        *,
+        fetch_release: Callable[[], GitHubReleaseInfo] = fetch_latest_github_release,
+        download_installer: Callable[..., Path] = download_release_installer,
+        start_installer: Callable[..., Path] = start_update_installer,
+        clean_workspace: Callable[..., None] = clean_update_workspace,
+        unsupported_reason: Callable[[], str] = auto_install_unsupported_reason,
+        open_url: Callable[[str], object] = webbrowser.open,
+        first_check_delay: float = HEADLESS_UPDATE_FIRST_CHECK_DELAY_SECONDS,
+        check_interval: float = GITHUB_UPDATE_CHECK_INTERVAL_SECONDS,
+        retry_delay: float = HEADLESS_UPDATE_RETRY_SECONDS,
+    ) -> None:
+        self._config_store = config_store
+        self._request_shutdown = request_shutdown
+        self._notifier = notifier
+        self._fetch_release = fetch_release
+        self._download_installer = download_installer
+        self._start_installer = start_installer
+        self._clean_workspace = clean_workspace
+        self._unsupported_reason = unsupported_reason
+        self._open_url = open_url
+        self._first_check_delay = max(0.0, float(first_check_delay))
+        self._check_interval = max(1.0, float(check_interval))
+        self._retry_delay = max(1.0, float(retry_delay))
+        self._lock = threading.Lock()
+        self._wake = threading.Event()
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._manual_check_requested = False
+        self._checked_once = False
+        self._installing = False
+        self._latest_release: GitHubReleaseInfo | None = None
+        self._state = "idle"
+        self._message = ""
+        self._announced_tag: str | None = None
+        self._auto_install_attempted_tag: str | None = None
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        config = self._load_config()
+        if config.check_updates_automatically:
+            logging.info(
+                "Automatic update checks are on: GitHub is checked shortly after start and every %d hours. %s",
+                max(1, int(round(self._check_interval / 3600.0))),
+                "New versions are installed automatically."
+                if config.auto_install_updates
+                else "New versions are announced here and with a Windows notification.",
+            )
+        else:
+            logging.info("Automatic update checks are off. Turn on 'Check for updates automatically' to hear about new versions here.")
+        self._thread = threading.Thread(target=self._run, name="NishizumiPaintsHeadlessUpdates", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        self._wake.set()
+        thread = self._thread
+        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=2.0)
+        self._thread = None
+
+    def request_check(self) -> None:
+        """Check now, even when automatic checks are off."""
+        with self._lock:
+            self._manual_check_requested = True
+        self._wake.set()
+
+    def config_changed(self) -> None:
+        self._wake.set()
+
+    def status(self) -> dict[str, object]:
+        with self._lock:
+            release = self._latest_release
+            state = self._state
+            message = self._message
+        return {
+            "update_state": state,
+            "update_message": message,
+            "latest_release_tag": release.tag_name if release is not None else "",
+            "update_available": bool(release is not None and compare_version_tags(release.tag_name, APP_VERSION) > 0),
+        }
+
+    def check_now(self, manual: bool = False) -> bool:
+        """Ask GitHub for the latest release and act on it. False when the check failed."""
+        with self._lock:
+            self._checked_once = True
+        self._set_state("checking", "Checking GitHub for updates.")
+        try:
+            release = self._fetch_release()
+        except Exception as exc:
+            self._set_state("failed", f"Update check failed: {exc}")
+            logging.warning("Update check failed: %s", exc)
+            return False
+        with self._lock:
+            self._latest_release = release
+        comparison = compare_version_tags(release.tag_name, APP_VERSION)
+        if comparison == 0:
+            self._set_state("up_to_date", f"Up to date: {APP_VERSION}")
+            logging.info("Update check complete: already on %s.", APP_VERSION)
+            return True
+        if comparison < 0:
+            self._set_state("up_to_date", f"Running newer build: {APP_VERSION}")
+            logging.info("Update check complete: local build %s is newer than the latest release %s.", APP_VERSION, release.tag_name)
+            return True
+        self._set_state("available", f"Update available: {release.tag_name}")
+        if self._should_auto_install(release) and self._reserve_install():
+            logging.warning("Update available: %s (you have %s). Installing it automatically.", release.tag_name, APP_VERSION)
+            try:
+                self._install(release)
+            finally:
+                self._release_install()
+            return True
+        if manual or self._announced_tag != release.tag_name:
+            self._announced_tag = release.tag_name
+            self._announce(release)
+        return True
+
+    def install_available_update(self) -> tuple[bool, str]:
+        """Start installing the newest release in the background."""
+        reason = self._unsupported_reason()
+        if reason:
+            return False, reason
+        if not self._reserve_install():
+            return False, "An update installation is already in progress."
+        thread = threading.Thread(target=self._install_latest_worker, name="NishizumiPaintsHeadlessUpdateInstall", daemon=True)
+        thread.start()
+        return True, "The headless service is downloading and installing the update."
+
+    def _run(self) -> None:
+        next_check_at = time.monotonic() + self._first_check_delay
+        while not self._stop_event.is_set():
+            self._wake.wait(max(0.0, next_check_at - time.monotonic()))
+            self._wake.clear()
+            if self._stop_event.is_set():
+                break
+            with self._lock:
+                manual = self._manual_check_requested
+                self._manual_check_requested = False
+                checked_once = self._checked_once
+            due = time.monotonic() >= next_check_at
+            if not manual and not due and checked_once:
+                # A settings change woke the loop; the next check stays on schedule.
+                continue
+            if not manual and not self._load_config().check_updates_automatically:
+                if due:
+                    next_check_at = time.monotonic() + self._check_interval
+                continue
+            ok = self.check_now(manual=manual)
+            next_check_at = time.monotonic() + (self._check_interval if ok else self._retry_delay)
+
+    def _install_latest_worker(self) -> None:
+        try:
+            with self._lock:
+                release = self._latest_release
+            if release is None or compare_version_tags(release.tag_name, APP_VERSION) <= 0:
+                try:
+                    release = self._fetch_release()
+                except Exception as exc:
+                    self._set_state("failed", f"Update check failed: {exc}")
+                    logging.error("Could not install the update, because the update check failed: %s", exc)
+                    self._notify(f"{APP_NAME} update failed", f"The update check failed: {exc}")
+                    return
+                with self._lock:
+                    self._latest_release = release
+            if compare_version_tags(release.tag_name, APP_VERSION) <= 0:
+                self._set_state("up_to_date", f"Up to date: {APP_VERSION}")
+                logging.info("No newer release to install: already on %s.", APP_VERSION)
+                return
+            self._install(release)
+        finally:
+            self._release_install()
+
+    def _install(self, release: GitHubReleaseInfo) -> bool:
+        """Download, verify, and run the installer. The caller holds the install reservation."""
+        tag = release.tag_name
+        try:
+            reason = self._unsupported_reason()
+            if reason:
+                raise RuntimeError(reason)
+            if not release.installer_is_verifiable():
+                raise RuntimeError("This release does not publish an installer with a SHA-256 digest to verify.")
+            self._auto_install_attempted_tag = tag
+            self._set_state("downloading", f"Downloading update {tag}")
+            logging.info("Downloading update %s (%s).", tag, release.asset_name)
+            self._clean_workspace()
+            installer = self._download_installer(release, progress_cb=self._download_progress_logger(tag))
+            self._clean_workspace(keep=installer)
+            logging.info("Update %s verified against the published SHA-256 digest.", tag)
+            self._set_state("installing", f"Installing update {tag}")
+            self._start_installer(installer, relaunch_args=("--nogui",))
+        except Exception as exc:
+            self._set_state("failed", f"Update {tag} could not be installed: {exc}")
+            logging.error("Update %s could not be installed: %s", tag, exc)
+            self._notify(f"{APP_NAME} update failed", f"Version {tag} could not be installed: {exc}")
+            return False
+        logging.warning("The installer for %s is running. The headless service stops now and starts again on the new version.", tag)
+        self._request_shutdown()
+        return True
+
+    def _should_auto_install(self, release: GitHubReleaseInfo) -> bool:
+        if not self._load_config().auto_install_updates:
+            return False
+        if self._auto_install_attempted_tag == release.tag_name:
+            return False
+        if self._unsupported_reason():
+            return False
+        if not release.installer_is_verifiable():
+            logging.info("Update %s cannot be installed automatically because it has no verifiable installer.", release.tag_name)
+            return False
+        return True
+
+    def _announce(self, release: GitHubReleaseInfo) -> None:
+        tag = release.tag_name
+        logging.warning("Update available: %s (you have %s).", tag, APP_VERSION)
+        if not self._unsupported_reason() and release.installer_is_verifiable():
+            logging.warning(
+                "Click the Windows notification to install it now, or turn on 'Install updates automatically' "
+                "in the app settings so the headless service installs new versions by itself."
+            )
+            body = f"Version {tag} is available (you have {APP_VERSION}). Click here to install it."
+            on_click: Callable[[], None] = self._install_from_notification
+        else:
+            page = release.html_url or GITHUB_RELEASES_PAGE_LATEST
+            logging.warning("Download it from %s", page)
+            body = f"Version {tag} is available (you have {APP_VERSION}). Click here to open the download page."
+            on_click = lambda: self._open_url(page)
+        set_console_title(f"{APP_NAME} Headless - update {tag} available")
+        self._notify(f"{APP_NAME} update available", body, on_click)
+
+    def _install_from_notification(self) -> None:
+        started, message = self.install_available_update()
+        if not started:
+            logging.warning("Could not install the update: %s", message)
+
+    def _notify(self, title: str, message: str, on_click: Callable[[], None] | None = None) -> None:
+        if self._notifier is None:
+            return
+        try:
+            if not self._notifier.notify(title, message, on_click):
+                logging.debug("The Windows notification could not be shown.")
+        except Exception:
+            logging.debug("The Windows notification failed", exc_info=True)
+
+    def _download_progress_logger(self, tag: str) -> Callable[[int, int], None]:
+        last_step = -1
+
+        def report(downloaded: int, total: int) -> None:
+            nonlocal last_step
+            if total <= 0:
+                return
+            step = min(100, int(downloaded * 100 / total)) // 25 * 25
+            if step <= last_step:
+                return
+            last_step = step
+            self._set_state("downloading", f"Downloading update {tag}: {step}%")
+            logging.info("Downloading update %s: %d%%", tag, step)
+
+        return report
+
+    def _reserve_install(self) -> bool:
+        with self._lock:
+            if self._installing:
+                return False
+            self._installing = True
+            return True
+
+    def _release_install(self) -> None:
+        with self._lock:
+            self._installing = False
+
+    def _set_state(self, state: str, message: str) -> None:
+        with self._lock:
+            self._state = state
+            self._message = message
+
+    def _load_config(self) -> AppConfig:
+        try:
+            return self._config_store.load()
+        except Exception:
+            logging.debug("Could not read settings for the update check", exc_info=True)
+            return AppConfig()
+
+
+def run_headless(args: argparse.Namespace | None = None, instance_lock: SingleInstanceLock | None = None) -> int:
     if args is None:
         args = parse_args()
     ensure_console_window()
     setup_logging(args.verbose)
-    instance_lock = SingleInstanceLock(INSTANCE_MUTEX_NAME)
-    if not instance_lock.acquire():
-        SingleInstanceSignalServer.notify_existing_instance()
-        logging.info("Another Nishizumi Paints instance is already running. Bringing it to the foreground instead of starting a second copy.")
-        return 0
+    if instance_lock is None:
+        instance_lock = SingleInstanceLock(INSTANCE_MUTEX_NAME)
+        if not instance_lock.acquire():
+            SingleInstanceSignalServer.notify_existing_instance()
+            logging.info("Another Nishizumi Paints instance is already running. Bringing it to the foreground instead of starting a second copy.")
+            return 0
     show_console_window()
     bring_console_to_front()
     logging.info("Headless mode is active. To open the full interface again later, run the app with --gui or hold Shift while starting it.")
@@ -28301,7 +28785,10 @@ def run_headless(args: argparse.Namespace | None = None) -> int:
     def _request_shutdown() -> None:
         stop_event.set()
         service.stop()
-    control_server = HeadlessControlServer(service, config_store, _request_shutdown)
+    # The tray icon only appears once there is something to tell, such as a new version.
+    tray_icon = WindowsTrayIcon(bring_console_to_front, _request_shutdown, tooltip=f"{APP_TOOLTIP} (headless)")
+    update_manager = HeadlessUpdateManager(config_store, _request_shutdown, notifier=tray_icon)
+    control_server = HeadlessControlServer(service, config_store, _request_shutdown, update_manager=update_manager)
     control_server_started = control_server.start()
     if not control_server_started and is_headless_service_available():
         logging.info("A headless service is already running, so this new headless launch will exit without starting a second instance.")
@@ -28316,6 +28803,7 @@ def run_headless(args: argparse.Namespace | None = None) -> int:
     signal.signal(signal.SIGINT, _sig_handler)
     signal.signal(signal.SIGTERM, _sig_handler)
     service.start()
+    update_manager.start()
     try:
         while not stop_event.is_set():
             if not service.is_running():
@@ -28323,59 +28811,79 @@ def run_headless(args: argparse.Namespace | None = None) -> int:
                 service.start()
             time.sleep(0.5)
     finally:
+        update_manager.stop()
         control_server.stop()
+        tray_icon.stop()
         instance_signal_server.stop()
         service.stop()
         instance_lock.release()
     return 0
-def resolve_requested_launch_mode(args: argparse.Namespace, config_store: ConfigStore) -> str | None:
+# Returned when the app is already running and nothing asked for a particular mode:
+# the running copy is brought forward instead of asking how to start a second one.
+LAUNCH_MODE_RUNNING_INSTANCE = "running"
+
+
+def resolve_requested_launch_mode(
+    args: argparse.Namespace,
+    config_store: ConfigStore,
+    another_instance_running: bool = False,
+) -> str | None:
     if bool(getattr(args, "gui", False)):
         return "gui"
     if bool(getattr(args, "nogui", False)):
         return "headless"
-    saved_mode = normalize_launch_mode_preference(getattr(config_store.load(), "launch_mode_preference", "ask"))
-    if not is_shift_pressed_at_startup() and saved_mode != "ask":
-        return saved_mode
+    saved_mode = config_store.load_launch_mode_preference()
     if bool(getattr(args, "autostart_launched", False)):
-        return "gui"
+        # Never hold up Windows sign-in with a question.
+        return saved_mode if saved_mode != "ask" else "gui"
+    if not is_shift_pressed_at_startup():
+        if saved_mode != "ask":
+            return saved_mode
+        if another_instance_running:
+            return LAUNCH_MODE_RUNNING_INSTANCE
     selection = show_launch_mode_dialog(saved_mode)
     if selection is None:
         return None
     chosen_mode, remember_choice = selection
+    chosen_mode = normalize_launch_mode_preference(chosen_mode)
     if remember_choice:
-        config = config_store.load()
-        config.launch_mode_preference = normalize_launch_mode_preference(chosen_mode)
         try:
-            config_store.save(config)
-        except Exception:
-            logging.debug("Could not save launch mode preference", exc_info=True)
-    return normalize_launch_mode_preference(chosen_mode)
+            config_store.save_launch_mode_preference(chosen_mode)
+        except Exception as exc:
+            logging.warning("Could not save the startup mode, so the selector will show again next time: %s", exc)
+    return chosen_mode
+
+
+def _running_instance_is_headless() -> bool:
+    status = send_headless_control_command("status")
+    return bool(status and status.get("ok") and str(status.get("mode") or "").strip().lower() == "headless")
 
 
 def main() -> int:
     args = parse_args()
     config_store = ConfigStore()
-    launch_mode = resolve_requested_launch_mode(args, config_store)
-    if launch_mode is None:
-        return 0
-    if launch_mode == "headless":
-        return run_headless(args)
+    # Look for a running copy before anything else, so opening the app again while it
+    # sits in the tray brings it forward instead of showing the startup selector.
     instance_lock = SingleInstanceLock(INSTANCE_MUTEX_NAME)
     lock_acquired = instance_lock.acquire()
-    if not lock_acquired:
-        headless_status = send_headless_control_command("status")
-        if headless_status and headless_status.get("ok") and str(headless_status.get("mode") or "").strip().lower() == "headless":
-            app = DownloaderUI(launched_from_autostart=args.autostart_launched)
-            app.run()
-            return 0
-        SingleInstanceSignalServer.notify_existing_instance()
-        return 0
     try:
+        launch_mode = resolve_requested_launch_mode(args, config_store, another_instance_running=not lock_acquired)
+        if launch_mode is None:
+            return 0
+        if not lock_acquired:
+            if launch_mode == "gui" and _running_instance_is_headless():
+                # The window attaches to the running headless service as its controller.
+                app = DownloaderUI(launched_from_autostart=args.autostart_launched)
+                app.run()
+                return 0
+            SingleInstanceSignalServer.notify_existing_instance()
+            return 0
+        if launch_mode == "headless":
+            return run_headless(args, instance_lock=instance_lock)
         app = DownloaderUI(launched_from_autostart=args.autostart_launched)
         app.run()
         return 0
     finally:
-        if lock_acquired:
-            instance_lock.release()
+        instance_lock.release()
 if __name__ == "__main__":
     sys.exit(main())
