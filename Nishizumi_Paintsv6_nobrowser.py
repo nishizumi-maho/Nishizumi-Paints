@@ -4515,6 +4515,35 @@ def _choose_random_pool_entry(directory: str, random_pool_dir: Path, ai_livery_r
     used_source_ids.add(selected.source_id)
     return selected, False
 
+def _random_pool_set_key(path: Path) -> tuple[str, str]:
+    """(bucket, set) of a file at RandomPool/<bucket>/<set>/<name>."""
+    return path.parent.parent.name.lower(), path.parent.name.lower()
+
+def _blocked_random_pool_set_keys(blocked_source_ids: Iterable[str]) -> set[tuple[str, str]]:
+    """Pool sets whose helmet or suit was blocked while it came bundled with the set.
+
+    That Block stores the set's id (``pool:<directory>:<set>``), while the accessory
+    picker names the same file ``pool_accessory:<bucket>:<set>:helmet.tga``.
+    """
+    keys: set[tuple[str, str]] = set()
+    for source_id in blocked_source_ids:
+        text = str(source_id or "")
+        if not text.startswith("pool:"):
+            continue
+        directory, _sep, set_name = text[len("pool:"):].rpartition(":")
+        if directory and set_name:
+            keys.add((_safe_random_pool_bucket(directory).lower(), set_name.lower()))
+    return keys
+
+def _random_pool_bundled_accessory_blocked(path: Path | None, bundled_source_id: str | None, blocked_source_ids: set[str]) -> bool:
+    """Whether a helmet or suit that came with a pool set was blocked under either id."""
+    if path is None or bundled_source_id is None:
+        return False
+    if bundled_source_id in blocked_source_ids:
+        return True
+    bucket, set_name = path.parent.parent.name, path.parent.name
+    return f"pool_accessory:{bucket}:{set_name}:{path.name}" in blocked_source_ids
+
 def _choose_random_accessory_pool_source(
     accessory_kind: str,
     random_pool_dir: Path,
@@ -4524,9 +4553,15 @@ def _choose_random_accessory_pool_source(
 ) -> tuple[Path | None, str | None]:
     preferences = load_random_paint_preferences()
     blocked_source_ids = random_paint_blocked_source_ids(accessory_kind, "", preferences)
+    blocked_set_keys = _blocked_random_pool_set_keys(blocked_source_ids)
     favorite_source_ids = random_paint_favorite_source_ids(accessory_kind, "", preferences)
     candidates = _iter_random_pool_accessory_sources(accessory_kind, random_pool_dir, ai_livery_root)
-    candidates = [(path, source_id) for path, source_id in candidates if source_id not in blocked_source_ids]
+    candidates = [
+        (path, source_id)
+        for path, source_id in candidates
+        if source_id not in blocked_source_ids
+        and not (source_id.startswith("pool_accessory:") and _random_pool_set_key(path) in blocked_set_keys)
+    ]
     if not candidates:
         return None, None
     favorite_candidates = [(path, source_id) for path, source_id in candidates if source_id in favorite_source_ids]
@@ -5744,7 +5779,10 @@ def _apply_local_tp_random_fallback_assets_for_user(
     reused_existing_source = False
     entry: RandomPoolEntry | None = None
 
-    if need_car or need_helmet or need_suit:
+    if need_car:
+        # Only a driver who needs a car takes a car set. A driver who only needs a
+        # helmet or suit picks from the accessory sources, which include the helmets
+        # and suits of every pool set, so no car set is used up for later drivers.
         entry, reused_existing_source = _choose_random_pool_entry(user.directory, random_pool_dir, ai_livery_root, used_source_ids, seed_text)
 
     base_kwargs = {
@@ -5781,6 +5819,8 @@ def _apply_local_tp_random_fallback_assets_for_user(
     if need_helmet:
         helmet_source = entry.helmet_file if entry is not None else None
         helmet_source_id = entry.source_id if helmet_source is not None else None
+        if _random_pool_bundled_accessory_blocked(helmet_source, helmet_source_id, random_paint_blocked_source_ids("helmet")):
+            helmet_source = helmet_source_id = None
         if helmet_source is None or not helmet_source.exists():
             helmet_source, helmet_source_id = _choose_random_accessory_pool_source(
                 "helmet",
@@ -5809,6 +5849,8 @@ def _apply_local_tp_random_fallback_assets_for_user(
     if need_suit:
         suit_source = entry.suit_file if entry is not None else None
         suit_source_id = entry.source_id if suit_source is not None else None
+        if _random_pool_bundled_accessory_blocked(suit_source, suit_source_id, random_paint_blocked_source_ids("suit")):
+            suit_source = suit_source_id = None
         if suit_source is None or not suit_source.exists():
             suit_source, suit_source_id = _choose_random_accessory_pool_source(
                 "suit",
@@ -14077,7 +14119,7 @@ def apply_tp_collection_pool_fallbacks(
     existing_car_targets = {
         (bool(item.download_id.is_team_paint), int(item.download_id.user_id), item.download_id.directory.lower())
         for item in saved
-        if item.download_id.paint_type is PaintType.CAR
+        if item.download_id.paint_type in PRIMARY_CAR_PAINT_TYPES
     }
     existing_helmet_targets = {
         (bool(item.download_id.is_team_paint), int(item.download_id.user_id))
@@ -14313,7 +14355,7 @@ def apply_tp_showroom_fallbacks_public(
     existing_car_targets = {
         (bool(item.download_id.is_team_paint), int(item.download_id.user_id), item.download_id.directory.lower())
         for item in saved
-        if item.download_id.paint_type is PaintType.CAR
+        if item.download_id.paint_type in PRIMARY_CAR_PAINT_TYPES
     }
     existing_helmet_targets = {
         (bool(item.download_id.is_team_paint), int(item.download_id.user_id))
@@ -14343,7 +14385,7 @@ def apply_tp_showroom_fallbacks_public(
         for item in items:
             key = (bool(item.download_id.is_team_paint), int(item.download_id.user_id), item.download_id.directory.lower())
             accessory_key = (bool(item.download_id.is_team_paint), int(item.download_id.user_id))
-            if item.download_id.paint_type is PaintType.CAR:
+            if item.download_id.paint_type in PRIMARY_CAR_PAINT_TYPES:
                 existing_car_targets.add(key)
             elif item.download_id.paint_type is PaintType.HELMET:
                 existing_helmet_targets.add(accessory_key)
