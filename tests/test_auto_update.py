@@ -1,9 +1,13 @@
 import hashlib
 import importlib.util
+import os
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "Nishizumi_Paintsv6_nobrowser.py"
@@ -115,6 +119,42 @@ class ReleaseDigestParsingTests(unittest.TestCase):
     def test_ignores_a_digest_published_for_a_different_asset(self):
         body = f"{'d' * 64}  SomeOtherApp-Setup-1.0.exe\n"
         self.assertIsNone(APP.parse_release_body_sha256(body, ASSET_NAME))
+
+    def test_a_sibling_asset_listed_first_does_not_take_the_installer_digest(self):
+        digest = "a" * 64
+        for body in (
+            f"{'b' * 64}  {ASSET_NAME}.zip\n{digest}  {ASSET_NAME}\n",
+            f"{ASSET_NAME}.sig: {'b' * 64}\n{ASSET_NAME}: {digest}\n",
+            f"{'b' * 64}  Old-{ASSET_NAME}\n{digest}  {ASSET_NAME}\n",
+        ):
+            self.assertEqual(APP.parse_release_body_sha256(body, ASSET_NAME), digest, body)
+
+    def test_the_release_list_fallback_never_offers_a_pre_release(self):
+        final = {
+            "tag_name": "v7.3.5",
+            "html_url": "https://github.com/x/y/releases/tag/v7.3.5",
+            "prerelease": False,
+            "draft": False,
+        }
+        prerelease = dict(final, tag_name="v7.3.6-experimental.1", prerelease=True)
+        with mock.patch.object(APP, "_github_get_json", side_effect=[[], [prerelease, final]]):
+            self.assertEqual(APP.fetch_latest_github_release().tag_name, "v7.3.5")
+
+
+class VersionCompareTests(unittest.TestCase):
+    def test_parts_compare_as_numbers(self):
+        self.assertGreater(APP.compare_version_tags("7.3.10", "7.3.9"), 0)
+        self.assertLess(APP.compare_version_tags("v7.3.4", "7.3.5"), 0)
+        self.assertEqual(APP.compare_version_tags("v7.3.5", "7.3.5"), 0)
+        self.assertEqual(APP.compare_version_tags("7.3", "7.3.0"), 0)
+
+    def test_a_pre_release_sorts_before_its_final_version(self):
+        # An experimental build carries the final APP_VERSION, so a pre-release tag that
+        # reached the updater must never look newer than that version.
+        self.assertLess(APP.compare_version_tags("v7.3.6-experimental.1", "7.3.6"), 0)
+        self.assertGreater(APP.compare_version_tags("7.3.6", "v7.3.6-beta.1"), 0)
+        self.assertLess(APP.compare_version_tags("v7.3.6rc1", "v7.3.6"), 0)
+        self.assertGreater(APP.compare_version_tags("v7.3.6-experimental.1", "7.3.5"), 0)
 
     def test_release_without_a_digest_is_not_verifiable(self):
         info = APP._extract_release_info(
@@ -251,34 +291,151 @@ class DownloadReleaseInstallerTests(unittest.TestCase):
 
 class UpdateLauncherScriptTests(unittest.TestCase):
     def test_runs_the_installer_silently_then_relaunches_the_app(self):
-        script = APP.build_update_launcher_script(
-            Path(r"C:\Users\me\AppData\Roaming\NishizumiPaints\updates\NishizumiPaints-Setup-7.3.3.exe"),
-            Path(r"C:\Users\me\AppData\Local\Programs\Nishizumi Paints\NishizumiPaints.exe"),
-            Path(r"C:\Users\me\AppData\Roaming\NishizumiPaints\updates\install.log"),
-        )
+        script = APP.build_update_launcher_script()
         self.assertIn("/SILENT", script)
         self.assertIn("/NORESTART", script)
         self.assertIn("/CLOSEAPPLICATIONS", script)
-        self.assertIn("if errorlevel 1 exit /b", script)
-        installer_line = next(line for line in script.splitlines() if "Setup-7.3.3.exe" in line)
-        launch_line = next(line for line in script.splitlines() if line.startswith("start "))
-        self.assertLess(script.index(installer_line), script.index(launch_line))
-        self.assertIn('start "" "C:\\Users\\me\\AppData\\Local\\Programs\\Nishizumi Paints\\NishizumiPaints.exe"', script)
+        lines = script.splitlines()
+        installer_line = next(line for line in lines if line.startswith('"%NISHIZUMI_UPDATE_INSTALLER%"'))
+        launch_line = next(line for line in lines if line.startswith("start "))
+        self.assertIn('/LOG="%NISHIZUMI_UPDATE_LOG%"', installer_line)
+        self.assertLess(lines.index(installer_line), lines.index(launch_line))
+        self.assertEqual(launch_line, 'start "" "%NISHIZUMI_UPDATE_APP%"')
 
-    def test_quotes_the_paths_so_spaces_survive(self):
-        script = APP.build_update_launcher_script(
-            Path(r"C:\dir with spaces\setup.exe"),
-            Path(r"C:\other dir\app.exe"),
-            Path(r"C:\dir with spaces\install.log"),
+    def test_relaunches_the_app_even_when_the_installer_fails(self):
+        lines = APP.build_update_launcher_script().splitlines()
+        installer_index = next(i for i, line in enumerate(lines) if "%NISHIZUMI_UPDATE_INSTALLER%" in line)
+        launch_index = next(i for i, line in enumerate(lines) if line.startswith("start "))
+        between = lines[installer_index + 1:launch_index]
+        self.assertFalse([line for line in between if line.lower().startswith("exit")], between)
+        self.assertTrue([line for line in between if "%NISHIZUMI_UPDATE_FAILED_MARKER%" in line], between)
+
+    def test_the_script_is_ascii_and_holds_no_paths(self):
+        script = APP.build_update_launcher_script(("--gui",))
+        script.encode("ascii")
+        self.assertNotIn(":\\", script)
+
+    def test_the_environment_carries_unusual_paths_unchanged(self):
+        base = Path(r"C:\Users\José & Co (100%)\AppData\Roaming\NishizumiPaints\updates")
+        paths = (
+            base / "run_update.cmd",
+            base / "NishizumiPaints-Setup-7.3.6.exe",
+            Path(r"C:\Users\José & Co (100%)\AppData\Local\Programs\Nishizumi Paints\NishizumiPaints.exe"),
+            base / "install.log",
+            base / "NishizumiPaints-Setup-7.3.6.exe.failed",
         )
-        self.assertIn(r'"C:\dir with spaces\setup.exe"', script)
-        self.assertIn(r'/LOG="C:\dir with spaces\install.log"', script)
+        environment = APP.update_launcher_environment(*paths)
+        self.assertEqual(
+            [environment[name] for name in (
+                "NISHIZUMI_UPDATE_SCRIPT",
+                "NISHIZUMI_UPDATE_INSTALLER",
+                "NISHIZUMI_UPDATE_APP",
+                "NISHIZUMI_UPDATE_LOG",
+                "NISHIZUMI_UPDATE_FAILED_MARKER",
+            )],
+            [str(path) for path in paths],
+        )
 
-    def test_refuses_paths_that_could_break_out_of_the_script(self):
+    def test_refuses_paths_that_could_break_out_of_the_quotes(self):
         safe = Path(r"C:\updates\setup.exe")
-        for bad in (Path('C:\\updates\\ev"il.exe'), Path("C:\\updates\\%PATH%.exe")):
-            with self.assertRaises(RuntimeError, msg=str(bad)):
-                APP.build_update_launcher_script(bad, safe, Path(r"C:\updates\install.log"))
+        for bad in (Path('C:\\updates\\ev"il.exe'), Path("C:\\updates\\line\r\nbreak.exe")):
+            with self.assertRaises(RuntimeError, msg=repr(bad)):
+                APP.update_launcher_environment(safe, bad, safe, safe, safe)
+
+    def test_start_update_installer_passes_the_paths_through_the_environment(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        directory = Path(tmp.name) / "José & Co (100%)"
+        directory.mkdir()
+        installer = directory / "NishizumiPaints-Setup-7.3.6.exe"
+        installer.write_bytes(b"MZ")
+        stale_marker = directory / "NishizumiPaints-Setup-7.3.6.exe.failed"
+        stale_marker.write_text("1", encoding="ascii")
+        app_exe = directory / "NishizumiPaints.exe"
+        with mock.patch.object(APP, "auto_install_unsupported_reason", return_value=""), mock.patch.object(
+            APP.subprocess, "Popen"
+        ) as popen:
+            script_path = APP.start_update_installer(installer, app_exe=app_exe, relaunch_args=("--nogui",))
+        self.assertEqual(script_path, directory / "run_update.cmd")
+        script_path.read_bytes().decode("ascii")
+        self.assertIn(b"\r\n", script_path.read_bytes())
+        self.assertNotIn(b"\r\r\n", script_path.read_bytes())
+        self.assertFalse(stale_marker.exists())
+        command = popen.call_args.args[0]
+        self.assertIsInstance(command, str)
+        self.assertIn('/d /s /c ""%NISHIZUMI_UPDATE_SCRIPT%""', command)
+        environment = popen.call_args.kwargs["env"]
+        self.assertEqual(environment["NISHIZUMI_UPDATE_SCRIPT"], str(script_path))
+        self.assertEqual(environment["NISHIZUMI_UPDATE_INSTALLER"], str(installer))
+        self.assertEqual(environment["NISHIZUMI_UPDATE_APP"], str(app_exe))
+        self.assertEqual(environment["NISHIZUMI_UPDATE_FAILED_MARKER"], str(stale_marker))
+
+    @unittest.skipUnless(sys.platform == "win32", "runs the script with cmd.exe")
+    def test_cmd_runs_the_script_from_a_profile_path_with_accents_and_ampersands(self):
+        python_dir = Path(sys.executable).resolve().parent
+        app_stand_in = python_dir / "pythonw.exe"
+        if not app_stand_in.is_file():
+            self.skipTest("pythonw.exe is needed as a windowless stand-in for the app")
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        directory = Path(tmp.name) / "José & Co (100%)"
+        directory.mkdir()
+        script_path = directory / "run_update.cmd"
+        marker = directory / "NishizumiPaints-Setup-7.3.6.exe.failed"
+        script_path.write_text(APP.build_update_launcher_script(("--gui",)), encoding="ascii", newline="")
+        environment = dict(os.environ)
+        # python.exe stands in for an installer that fails: it cannot open "/SILENT" and exits with 2.
+        environment.update(
+            APP.update_launcher_environment(
+                script_path, Path(sys.executable), app_stand_in, directory / "install.log", marker
+            )
+        )
+        completed = subprocess.run(
+            f'"{APP._windows_command_processor()}" /d /s /c ""%NISHIZUMI_UPDATE_SCRIPT%""',
+            cwd=str(directory),
+            env=environment,
+            capture_output=True,
+            timeout=60,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        output = (completed.stdout + completed.stderr).decode("mbcs", errors="replace")
+        self.assertEqual(completed.returncode, 2, output)
+        self.assertEqual(marker.read_text(encoding="ascii").strip(), "2")
+        self.assertNotIn("cannot find", output.lower())
+        self.assertNotIn("is not recognized", output.lower())
+
+
+class RecentInstallFailureTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.workspace = Path(tmp.name)
+        patcher = mock.patch.object(APP, "update_workspace_dir", return_value=self.workspace)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.release = APP.GitHubReleaseInfo(
+            tag_name="v7.3.6",
+            html_url="https://github.com/nishizumi-maho/Nishizumi-Paints/releases/tag/v7.3.6",
+            asset_name="NishizumiPaints-Setup-7.3.6.exe",
+        )
+        self.marker = self.workspace / "NishizumiPaints-Setup-7.3.6.exe.failed"
+
+    def test_no_marker_means_no_failure(self):
+        self.assertIsNone(APP.recent_update_install_failure(self.release))
+
+    def test_a_fresh_marker_reports_the_installer_exit_code(self):
+        self.marker.write_text("5\r\n", encoding="ascii")
+        self.assertEqual(APP.recent_update_install_failure(self.release), "5")
+
+    def test_a_marker_older_than_a_day_allows_another_automatic_try(self):
+        self.marker.write_text("5", encoding="ascii")
+        later = time.time() + APP.UPDATE_FAILED_AUTO_RETRY_SECONDS + 60
+        self.assertIsNone(APP.recent_update_install_failure(self.release, now=later))
+
+    def test_an_unexpected_asset_name_is_ignored(self):
+        self.marker.write_text("5", encoding="ascii")
+        odd = APP.GitHubReleaseInfo(tag_name="v7.3.6", html_url="", asset_name="..\\evil.exe")
+        self.assertIsNone(APP.recent_update_install_failure(odd))
 
 
 class UpdateWorkspaceTests(unittest.TestCase):

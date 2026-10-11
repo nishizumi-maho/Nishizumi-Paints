@@ -2,6 +2,53 @@
 
 All notable user-facing changes to Nishizumi Paints are documented here.
 
+## [7.3.6] - 2026-10-11 (experimental)
+
+Published as the experimental pre-release `v7.3.6-experimental.1`. The in-app updater does not offer pre-releases, so it has to be installed by hand.
+
+### Changed
+
+- `fetch.tradingpaints.gg` is now the first Trading Paints manifest host the app asks, and `dl.tradingpaints.com`, which has been failing its TLS handshake since 7.3.4, is only the backup. Every app start used to wait for that failure first.
+- The online fallback settings **Lane mode**, **Manual max lanes**, **Process cars, helmets, and suits together online** and **Give timed-out online fallbacks one final online retry** now work. Each car model gets its own lane (Safe: one at a time, Manual: up to N, Session Total: all), helmets and suits run alongside or after the cars, failed downloads get one more online pick with the retry on, and the local pool covers the rest.
+- A favorite random paint is used once per session, by the first driver who needs a fallback on that car, in the local pool, the online fallback and the Session tab's random buttons. It used to go to every driver.
+- The mouse wheel scrolls the page instead of changing the number box, drop-down or slider under the pointer, unless that control was clicked first.
+- The online fallback wastes fewer Trading Paints requests: a forced favorite no longer throws away the showroom paints already fetched for that car, the showroom page walk never asks for a page after an empty one and remembers a showroom's end for five minutes, a favorite that cannot be downloaded is not forced again for every later driver, and a car Trading Paints does not list re-downloads the car catalog at most every 15 minutes instead of every minute.
+- During a Trading Paints outage, a host that keeps failing moves to the back, and a superspeedway track no longer costs 14 requests per driver.
+- An existing AI roster spec map is checked at most once a day, and a failed automatic roster sync is retried after 10 minutes.
+- Command line: `--temp-dir` is used, `--iracing-documents-dir` is the new name of `--paints-dir`, and the retired `--session-yaml`, `--watch` and `--iracing-sdk` are still accepted but do nothing.
+
+### Fixed
+
+- Fixed a team download from the Teams tab sending every request to the broken backup host as well after the main host had answered, and **Download ALL team paints...** asking the backup again for every batch without paints for the team.
+- Fixed closing the app after leaving a session deleting your own car, helmet, and suit even with **Keep my livery locally** on.
+- With **Sync my livery from server** off, your own car and team files are no longer deleted by a driver swap in your team or **Force refresh current car/team**, painted over by the team-driver preload fallback, or replaced every 20 seconds by the iRacing UI previews, which now show as paused. With syncing on, a file the previews replace is kept in paint history first.
+- AI roster cleanup no longer deletes folders of your own in `Documents\iRacing\airosters`, and an AI roster name from Trading Paints can no longer write outside that folder. **Clone active AI roster** reads only file names from the roster and no longer leaves a half-copied folder that blocks every retry.
+- One locked or unwritable file, or a full disk, no longer crashes the background service in a loop that re-downloaded the whole grid. RandomPool copies are written under a temporary name, so a cut-short copy can no longer leave a broken `car.tga` in the pool, and a bad date in the driver overrides or random preferences file no longer fails every pass. Replay-pack restore and capture errors no longer crash the service or delete the live session's paints.
+- Closing the app during a pass now cancels it, so the paints it already saved are cleaned up. Closing the console window, logging off or shutting down now stops the console-only service with its cleanup.
+- Opening the app while a window was attached to the console-only service could start a second downloader on the same paint folder.
+- In online fallback mode, a driver whose own paint is a Custom Number (`car_num_<id>.tga`) no longer gets a random car on top of it.
+- A driver who only needs a random helmet or suit no longer uses up a RandomPool car set, and **Block** now works on a helmet or suit that came with a pool set.
+- **Rebuild from current files** now puts each car into its own RandomPool bucket instead of the accessories bucket, where no car is ever picked.
+- Random paints for the **Super Formula SF23** Honda and Toyota, which Trading Paints lists together but which use different templates, are only used when they are known to be for that car, and the RandomPool no longer files every SF23 paint under the Honda.
+- A car override now replaces the whole paint, including the spec map, decal, custom number and `_ss` paint, and the cache of the previous override is deleted.
+- In team sessions, a teammate driving your car is no longer taken for you, the team-driver preload no longer uses a superspeedway paint at other tracks, and preloads are found when Trading Paints spells the car folder differently.
+- A live race with a replay pack is no longer taken for a saved replay, which left new drivers without paints.
+- Fixed in-app updates never starting for a Windows user folder with an accented letter, and paths with `&`, `%`, or parentheses. A failed installer now reopens the old version, and that version is not installed automatically again for a day.
+- A pre-release tag can no longer look newer than the final release with the same number, and the release digest is no longer read from a sibling asset such as `Setup.exe.zip`. An update check during an install no longer announces the update again, quitting during an update download no longer starts the installer, and a failed automatic download is offered again.
+- Fixed **Reset app settings** and changing the iRacing Documents folder closing the app for good when it is installed in a folder with a space, such as the default `Programs\Nishizumi Paints`.
+- Fixed every window close freezing for 5 seconds, a window that lost its console-only service starting its own service with outdated settings, and every settings change sending a GitHub update check.
+- **Assign current** now works for a driver's own Trading Paints paint, and it and **Forget** run in the background. The Session tab no longer jumps back to the selected driver while scrolling or stutters while paints arrive.
+- AI roster **Rebuild from current files**, **Clone** and **Randomize** no longer freeze the window, `roster.json` is written in one step, the roster and its "(local)" copy no longer swap by themselves, and **Randomize** no longer loses the old roster when a file is locked.
+- Opening the app again no longer stops bringing the running window forward after another program connected to its local port, and the tray icon comes back after Explorer restarts.
+- A team driver swap seen together with a car joining or leaving now downloads the team's paints again straight away, and **Refresh now** at that moment refreshes every driver.
+- Paint history no longer loses entries when several files are saved at once, keeps one copy per save instead of one per retry, and removes the backups it no longer lists.
+- A service restart that overlaps a slow stop no longer leaves two copies of the service running.
+- A RandomPool trim by the car, helmet, or suit size limits alone now reports what it removed.
+- An unreadable `settings.json` is kept as `settings.json.unreadable-<date>` instead of being overwritten with defaults.
+- Turning the iRacing UI previews off during a session now removes their files after the session.
+- A cancelled download no longer leaves a partial file, and a compressed paint can no longer expand past 256 MiB.
+- Showroom links to a paint of a grouped car, such as **Dirt Sprint Cars**, can now be imported into the RandomPool.
+
 ## [7.3.5] - 2026-10-10
 
 First published as the experimental pre-release `v7.3.5-experimental.1`; the final release is the same code. A copy of 7.3.4 or older running console-only cannot check for updates, so it has to be updated once from the normal window or with the installer.

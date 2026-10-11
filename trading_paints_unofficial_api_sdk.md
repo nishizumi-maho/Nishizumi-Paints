@@ -21,8 +21,8 @@ The public showroom path is now the main no-browser fallback flow. Legacy authen
 
 ### 2.1 Session-aware manifest lookup
 
-- `https://dl.tradingpaints.com/fetch.php`
-- `https://fetch.tradingpaints.gg/fetch.php`
+- `https://fetch.tradingpaints.gg/fetch.php` (primary)
+- `https://dl.tradingpaints.com/fetch.php` (backup, only tried when the primary cannot be reached or keeps failing)
 
 Method:
 
@@ -34,8 +34,8 @@ Purpose:
 
 ### 2.1.1 Manual team paint manifest lookup
 
-- `https://dl.tradingpaints.com/fetch.php`
-- `https://fetch.tradingpaints.gg/fetch.php`
+- `https://fetch.tradingpaints.gg/fetch.php` (primary)
+- `https://dl.tradingpaints.com/fetch.php` (backup)
 
 Method:
 

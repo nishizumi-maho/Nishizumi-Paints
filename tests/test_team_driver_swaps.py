@@ -62,12 +62,14 @@ class FakeTeamSdk:
             )
             self.session_info_update += 1
 
-    def swap_driver(self, team_id, user_id):
+    def swap_driver(self, team_id, user_id, remove_team=None):
         with self._lock:
             for driver in self.drivers:
                 if driver["TeamID"] == team_id:
                     driver["UserID"] = user_id
                     driver["UserName"] = f"Driver {user_id}"
+            if remove_team is not None:
+                self.drivers = [driver for driver in self.drivers if driver["TeamID"] != remove_team]
             self.session_info_update += 1
 
     def __getitem__(self, key):
@@ -179,6 +181,21 @@ class TeamDriverSwapServiceLoopTests(unittest.TestCase):
         self.assertEqual(self.calls[3], [12])
         paint = self.tmp / "paint" / CAR / "car_team_103.tga"
         self.assertTrue(paint.exists())
+
+    def test_a_swap_seen_with_a_car_leaving_is_still_downloaded_again(self):
+        # The swap cleared team 102's paints, but the roster branch for the car that
+        # left marked the session processed without fetching team 102 again. Only the
+        # post-swap retry, seconds later, painted the car; keep it out of the way here.
+        APP.TEAM_DRIVER_SWAP_RETRY_DELAYS_SECONDS = (60.0, 60.0, 60.0)
+        self.sdk.add_team(101, 1)
+        self.sdk.add_team(102, 2)
+        self.sdk.add_team(103, 3)
+        self.service.start()
+        self.assertTrue(_wait_until(lambda: len(self.calls) >= 1 and not self.processing.is_set()))
+        self.sdk.swap_driver(102, 12, remove_team=103)
+        self.assertTrue(_wait_until(lambda: len(self.calls) >= 2 and not self.processing.is_set()))
+        self.assertEqual(self.calls[1], [12])
+        self.assertTrue((self.tmp / "paint" / CAR / "car_team_102.tga").exists())
 
 
 class UnprocessedTeamDriverSwapTests(unittest.TestCase):

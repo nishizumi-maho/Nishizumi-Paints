@@ -1,6 +1,7 @@
 import argparse
 import importlib.util
 import json
+import socket
 import sys
 import tempfile
 import threading
@@ -256,6 +257,8 @@ class MainStartupTests(_TempStoreMixin, unittest.TestCase):
         result = self._run_main(acquired=False, saved_mode="gui", headless_running=True)
         result.ui_class.assert_called_once()
         result.notify.assert_not_called()
+        # The controller window does not own the lock; it has to take it later.
+        self.assertIs(result.ui_class.call_args.kwargs["holds_instance_lock"], False)
 
     def test_headless_launch_while_the_window_runs_brings_the_window_forward(self):
         result = self._run_main(acquired=False, saved_mode="headless")
@@ -263,18 +266,43 @@ class MainStartupTests(_TempStoreMixin, unittest.TestCase):
         result.notify.assert_called_once()
 
 
+class SingleInstanceSignalTests(unittest.TestCase):
+    """Ephemeral ports only: the real instance port belongs to the installed app."""
+
+    def _start_server(self, on_activate):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        server = APP.SingleInstanceSignalServer(on_activate, host="127.0.0.1", port=port)
+        self.assertTrue(server.start())
+        self.addCleanup(server.stop)
+        return port
+
+    def test_an_idle_connection_does_not_stop_the_next_launch_from_activating(self):
+        activated = threading.Event()
+        port = self._start_server(activated.set)
+        idle = socket.create_connection(("127.0.0.1", port), timeout=2.0)
+        self.addCleanup(idle.close)
+        self.assertTrue(APP.SingleInstanceSignalServer.notify_existing_instance(port=port, attempts=1))
+        self.assertTrue(activated.wait(4.0), "the SHOW request waited behind a connection that never sent anything")
+
+    def test_a_connection_that_does_not_ask_to_show_does_not_activate(self):
+        activated = threading.Event()
+        port = self._start_server(activated.set)
+        with socket.create_connection(("127.0.0.1", port), timeout=2.0) as client:
+            client.sendall(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+        self.assertFalse(activated.wait(1.5))
+        self.assertTrue(APP.SingleInstanceSignalServer.notify_existing_instance(port=port, attempts=1))
+        self.assertTrue(activated.wait(4.0))
+
+
 class UpdateLauncherRelaunchTests(unittest.TestCase):
     def _script(self, relaunch_args):
-        return APP.build_update_launcher_script(
-            Path(r"C:\updates\NishizumiPaints-Setup-99.0.0.exe"),
-            Path(r"C:\Program Files\Nishizumi Paints\NishizumiPaints.exe"),
-            Path(r"C:\updates\install.log"),
-            relaunch_args,
-        )
+        return APP.build_update_launcher_script(relaunch_args)
 
     def test_relaunches_in_the_mode_the_app_was_running_in(self):
         script = self._script(("--nogui",))
-        self.assertIn('start "" "C:\\Program Files\\Nishizumi Paints\\NishizumiPaints.exe" --nogui', script)
+        self.assertIn('start "" "%NISHIZUMI_UPDATE_APP%" --nogui', script)
 
     def test_refuses_unsafe_relaunch_arguments(self):
         for bad in ("--gui & calc", "/S", '"--gui"', "--GUI", "--gui\r\nexit"):
@@ -302,6 +330,7 @@ class HeadlessUpdateManagerTests(_TempStoreMixin, unittest.TestCase):
         self.installer_started = threading.Event()
         self.start_installer = mock.Mock(side_effect=lambda *a, **k: self.installer_started.set())
         self.unsupported_reason = ""
+        self.install_failure = None
         self.open_url = mock.Mock()
         title_patch = mock.patch.object(APP, "set_console_title")
         self.set_console_title = title_patch.start()
@@ -322,6 +351,7 @@ class HeadlessUpdateManagerTests(_TempStoreMixin, unittest.TestCase):
             clean_workspace=mock.Mock(),
             unsupported_reason=lambda: self.unsupported_reason,
             open_url=self.open_url,
+            install_failure=lambda _release: self.install_failure,
             first_check_delay=0.0,
             check_interval=3600.0,
             retry_delay=3600.0,
@@ -330,6 +360,58 @@ class HeadlessUpdateManagerTests(_TempStoreMixin, unittest.TestCase):
         manager = APP.HeadlessUpdateManager(self.store, self.shutdown, **options)
         self.addCleanup(manager.stop)
         return manager
+
+    def test_a_check_during_an_install_leaves_the_install_state_alone(self):
+        self.save_settings(auto_install_updates=False)
+        release_download = threading.Event()
+        downloading = threading.Event()
+
+        def slow_download(*_args, progress_cb=None, **_kwargs):
+            downloading.set()
+            release_download.wait(5.0)
+            return Path(r"C:\updates\NishizumiPaints-Setup-99.0.0.exe")
+
+        self.download.side_effect = slow_download
+        manager = self.make_manager()
+        self.addCleanup(release_download.set)
+        self.assertTrue(manager.install_available_update()[0])
+        self.assertTrue(downloading.wait(5.0))
+        self.assertEqual(manager.status()["update_state"], "downloading")
+        self.assertTrue(manager.check_now())
+        self.assertEqual(manager.status()["update_state"], "downloading")
+        release_download.set()
+        self.assertTrue(self.installer_started.wait(5.0))
+
+    def test_stopping_during_the_download_does_not_launch_the_installer(self):
+        self.save_settings(auto_install_updates=False)
+        manager = self.make_manager()
+        finished = threading.Event()
+
+        def download_then_stop(*_args, progress_cb=None, **_kwargs):
+            manager._stop_event.set()
+            return Path(r"C:\updates\NishizumiPaints-Setup-99.0.0.exe")
+
+        self.download.side_effect = download_then_stop
+        original_release = manager._release_install
+        manager._release_install = lambda: (original_release(), finished.set())
+        self.assertTrue(manager.install_available_update()[0])
+        self.assertTrue(finished.wait(5.0))
+        self.start_installer.assert_not_called()
+        self.shutdown.assert_not_called()
+        self.assertIn("stopping", manager.status()["update_message"])
+
+    def test_a_version_whose_installer_just_failed_is_announced_instead_of_reinstalled(self):
+        # The update script relaunches the old version after a failed install and
+        # records the failure; the relaunched service must not install it again at once.
+        self.save_settings(auto_install_updates=True)
+        self.install_failure = "5"
+        manager = self.make_manager()
+        with self.assertLogs(level="WARNING") as logs:
+            manager.check_now()
+        self.download.assert_not_called()
+        self.shutdown.assert_not_called()
+        self.assertIn("exit code 5", "\n".join(logs.output))
+        self.assertIn("Click here to install", self.notifier.calls[-1].message)
 
     def test_a_new_version_is_announced_once_with_a_notification(self):
         self.save_settings(auto_install_updates=False)
@@ -580,6 +662,77 @@ class ControllerWindowUpdateTests(unittest.TestCase):
             APP.DownloaderUI._poll_service(ui)
         ui.request_exit_for_update.assert_not_called()
         ui.service.start.assert_called()
+
+    def test_a_window_that_cannot_take_the_lock_does_not_start_a_second_downloader(self):
+        # The headless console closed and another full copy of the app took over:
+        # starting the embedded service here would run two downloaders at once.
+        ui = self._controller({"ok": True, "update_state": "idle"})
+        ui._exiting = False
+        ui._holds_instance_lock = False
+        ui._instance_blocked_logged = False
+        ui.service.is_running.return_value = False
+        ui._claim_single_instance = lambda: APP.DownloaderUI._claim_single_instance(ui)
+        ui._attach_to_existing_headless_if_available.return_value = False
+        with mock.patch.object(APP, "send_headless_control_command", return_value=None), \
+             mock.patch.object(APP, "SingleInstanceLock", return_value=_FakeLock(False)):
+            APP.DownloaderUI._poll_service(ui)
+        ui.service.start.assert_not_called()
+
+    def test_taking_over_from_a_lost_headless_service_takes_the_lock_first(self):
+        ui = self._controller({"ok": True, "update_state": "idle"})
+        ui._exiting = False
+        ui._holds_instance_lock = False
+        ui.service.is_running.return_value = False
+        ui._claim_single_instance = lambda: APP.DownloaderUI._claim_single_instance(ui)
+        lock = _FakeLock(True)
+        with mock.patch.object(APP, "send_headless_control_command", return_value=None), \
+             mock.patch.object(APP, "SingleInstanceLock", return_value=lock):
+            APP.DownloaderUI._poll_service(ui)
+        self.assertIs(ui._owned_instance_lock, lock)
+        ui.instance_signal_server.start.assert_called()
+        ui.service.update_config.assert_called()
+        ui.service.start.assert_called()
+
+    def test_the_controller_panel_follows_the_current_session(self):
+        ui = self._controller({"ok": True, "update_state": "idle", "latest_release_tag": "v1", "current_session": "A"})
+        status = {"ok": True, "update_state": "idle", "latest_release_tag": "v1", "current_session": "B"}
+        with mock.patch.object(APP, "send_headless_control_command", return_value=status):
+            APP.DownloaderUI._poll_service(ui)
+        ui._update_headless_ui.assert_called_with(status)
+
+    def test_a_failed_automatic_download_offers_the_update_again(self):
+        ui = mock.MagicMock()
+        ui._exiting = False
+        release = _release()
+        APP.DownloaderUI._finish_update_install(ui, release, None, "network down", manual=False)
+        ui._prompt_for_update.assert_called_once_with(release)
+
+
+class ConsoleCloseHandlerTests(unittest.TestCase):
+    class _Kernel32:
+        def __init__(self):
+            self.callback = None
+
+        def SetConsoleCtrlHandler(self, callback, add):
+            self.callback = callback
+            return 1
+
+    def test_closing_the_console_runs_the_shutdown(self):
+        kernel32 = self._Kernel32()
+        closed = mock.Mock()
+        handler = APP.install_console_close_handler(closed, kernel32=kernel32)
+        self.assertIsNotNone(handler)
+        for event in (2, 5, 6):  # close, logoff, shutdown
+            self.assertTrue(kernel32.callback(event))
+        self.assertEqual(closed.call_count, 3)
+
+    def test_ctrl_c_is_left_to_python(self):
+        kernel32 = self._Kernel32()
+        closed = mock.Mock()
+        APP.install_console_close_handler(closed, kernel32=kernel32)
+        self.assertFalse(kernel32.callback(0))
+        self.assertFalse(kernel32.callback(1))
+        closed.assert_not_called()
 
 
 if __name__ == "__main__":

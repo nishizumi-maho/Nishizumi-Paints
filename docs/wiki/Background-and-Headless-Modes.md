@@ -91,6 +91,11 @@ A window attached to the headless service leaves updates to the service. **Downl
 - `--nogui` runs without the built-in UI.
 - `--keep-session-paints` keeps live session paints instead of cleaning them up.
 - `--no-ui-previews` turns the always-on [iRacing UI car previews](iRacing-UI-Car-Previews) off for that run.
+- `--iracing-documents-dir <folder>` (old name `--paints-dir`) uses another iRacing documents folder, the one that holds `paint`, `replay` and `airosters`. Passing its `paint` folder works too. Paints always go into that `paint` folder, because it is the only place iRacing reads them from.
+- `--temp-dir <folder>` keeps downloads in progress in a `NishizumiPaints` folder inside the folder given, instead of in the system temp folder.
+- `--poll-seconds`, `--retries`, `--retry-backoff-seconds`, `--max-concurrent-manifests` and `--max-concurrent-downloads` override those settings for that run, and `-v` turns on debug logging.
+
+`--session-yaml`, `--watch` and `--iracing-sdk` are still accepted so old shortcuts keep working, but they do nothing: the app always reads the live iRacing session.
 
 ## Interaction with Easy and Advanced mode
 

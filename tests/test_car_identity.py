@@ -55,6 +55,7 @@ class TradingPaintsCarIdentityTests(unittest.TestCase):
                     "mid": 264,
                     "tp_name": "Ferrari 296 GT3",
                     "iracing_name": "Ferrari 296 GT3",
+                    "tp_make_name": "Ferrari 296 GT3",
                     "directory": "ferrari296gt3",
                     "slug": "Ferrari-296-GT3",
                     "category": "Road",

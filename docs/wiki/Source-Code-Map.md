@@ -36,7 +36,7 @@ If you need to understand what information a later function expects, start here.
 
 Important functions in the session/manifest area include:
 
-- `parse_session_yaml`
+- `read_session_from_sdk`
 - `_build_session_from_parts`
 - `fetch_user_files`
 - `_build_fetch_context_payload`
