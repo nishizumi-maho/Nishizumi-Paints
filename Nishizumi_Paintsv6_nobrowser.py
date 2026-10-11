@@ -17388,6 +17388,19 @@ def _download_item_matches_driver_personal_asset(session_user: SessionUser, item
         return False
     return is_user_file(session_user, item)
 
+def _retarget_personal_download_to_session_directory(session_user: SessionUser, item: DownloadFile) -> DownloadFile:
+    if not _is_car_related_paint_type(item.download_id.paint_type):
+        return item
+    target_directory = sanitize_paint_directory(str(session_user.directory or "").strip() or item.download_id.directory, fallback="misc")
+    if target_directory == item.download_id.directory:
+        return item
+    return DownloadFile(
+        download_id=replace(item.download_id, directory=target_directory),
+        url=item.url,
+        ai_roster_optional_filename=item.ai_roster_optional_filename,
+        ai_roster_dir=item.ai_roster_dir,
+    )
+
 def _retarget_personal_download_for_team(session_user: SessionUser, item: DownloadFile) -> DownloadFile:
     target_directory = item.download_id.directory
     if _is_car_related_paint_type(item.download_id.paint_type):
@@ -17495,7 +17508,11 @@ def _fetch_team_driver_personal_manifest(
     _remember_team_driver_personal_manifest(session, user, personal)
     return list(personal)
 
-def _team_driver_preload_candidate_download_ids(user: SessionUser, slot: str) -> list[DownloadId]:
+def _team_driver_preload_candidate_download_ids(
+    user: SessionUser,
+    slot: str,
+    superspeedway_track: bool = False,
+) -> list[DownloadId]:
     normalized_slot = str(slot or "").strip().lower()
     if normalized_slot == "helmet":
         return [DownloadId(user_id=int(user.user_id), directory=user.directory, paint_type=PaintType.HELMET)]
@@ -17504,7 +17521,10 @@ def _team_driver_preload_candidate_download_ids(user: SessionUser, slot: str) ->
     if normalized_slot != "car":
         return []
     candidates: list[DownloadId] = []
-    for ss_variant in (False, True):
+    # As in the manifest stage: a superspeedway prefers the _ss paint and falls back to
+    # the normal one; any other track never uses an _ss paint. The cache keeps files
+    # for an hour, so a Daytona preload used to count as ready at the next road course.
+    for ss_variant in ((True, False) if superspeedway_track else (False,)):
         for paint_type in (PaintType.CAR, PaintType.CAR_NUMBER, PaintType.CAR_DECAL):
             candidates.append(
                 DownloadId(
@@ -17561,21 +17581,36 @@ def cleanup_team_driver_preload_cache(
             freed_bytes += size
     return removed_files, freed_bytes
 
+def _fresh_team_driver_preload_sources(
+    session: Session,
+    user: SessionUser,
+    slot: str,
+    cache_root: Path,
+    now: float | None = None,
+) -> list[DownloadId]:
+    """The cached files to use for this slot: one per paint file, in the track's variant."""
+    current = time.time() if now is None else now
+    chosen: dict[tuple[PaintType, bool], DownloadId] = {}
+    for download_id in _team_driver_preload_candidate_download_ids(user, slot, bool(session.is_superspeedway_track)):
+        key = (download_id.paint_type, bool(download_id.is_numbered_car_spec))
+        if key in chosen:
+            continue
+        if _team_driver_preload_file_fresh(save_path_for(download_id, cache_root), current):
+            chosen[key] = download_id
+    return list(chosen.values())
+
 def _team_driver_preloaded_slot_available(
+    session: Session,
     user: SessionUser,
     slot: str,
     cache_root: Path | None = None,
 ) -> bool:
     resolved_root = Path(cache_root) if cache_root is not None else default_team_driver_preload_cache_dir()
-    now = time.time()
     primary_types = PRIMARY_CAR_PAINT_TYPES if str(slot or "").strip().lower() == "car" else None
-    for download_id in _team_driver_preload_candidate_download_ids(user, slot):
-        path = save_path_for(download_id, resolved_root)
-        if not _team_driver_preload_file_fresh(path, now):
-            continue
-        if primary_types is None or download_id.paint_type in primary_types:
-            return True
-    return False
+    return any(
+        primary_types is None or download_id.paint_type in primary_types
+        for download_id in _fresh_team_driver_preload_sources(session, user, slot, resolved_root)
+    )
 
 def _pending_team_driver_preload_slots(
     session: Session,
@@ -17588,7 +17623,7 @@ def _pending_team_driver_preload_slots(
     for slot in _SESSION_ASSET_SLOTS:
         if slot not in normalized_slots:
             continue
-        if _team_driver_preloaded_slot_available(user, slot, cache_root):
+        if _team_driver_preloaded_slot_available(session, user, slot, cache_root):
             _clear_team_driver_preload_slot_failure(session, user, slot)
             continue
         if not _team_driver_preload_slot_retry_allowed(session, user, slot):
@@ -17642,14 +17677,11 @@ def _copy_preloaded_team_driver_slot(
     if not session_user_uses_team_target(user):
         return []
     normalized_slot = str(slot or "").strip().lower()
-    if not _team_driver_preloaded_slot_available(user, normalized_slot, cache_root):
+    if not _team_driver_preloaded_slot_available(session, user, normalized_slot, cache_root):
         return []
     saved: list[SavedFile] = []
-    now = time.time()
-    for source_id in _team_driver_preload_candidate_download_ids(user, normalized_slot):
+    for source_id in _fresh_team_driver_preload_sources(session, user, normalized_slot, cache_root):
         source_path = save_path_for(source_id, cache_root)
-        if not _team_driver_preload_file_fresh(source_path, now):
-            continue
         target_id = replace(
             source_id,
             user_id=int(user.team_id or 0),
@@ -17662,6 +17694,8 @@ def _copy_preloaded_team_driver_slot(
     if normalized_slot == "car" and not any(item.download_id.paint_type in PRIMARY_CAR_PAINT_TYPES for item in saved):
         delete_saved(saved, paints_root=paints_dir)
         return []
+    if normalized_slot == "car" and session.is_superspeedway_track:
+        saved = _ensure_superspeedway_companion_saved_files(saved, paints_dir)
     return saved
 
 def apply_preloaded_team_driver_personal_fallbacks(
@@ -17782,7 +17816,7 @@ def start_team_driver_personal_paint_preload(
                 missing_slots = [
                     slot
                     for slot in initial_missing_slots
-                    if not _team_driver_preloaded_slot_available(user, slot, cache_root)
+                    if not _team_driver_preloaded_slot_available(session, user, slot, cache_root)
                     and _team_driver_preload_slot_retry_allowed(session, user, slot)
                 ]
                 if not missing_slots:
@@ -17806,7 +17840,12 @@ def start_team_driver_personal_paint_preload(
                         _remember_team_driver_preload_slot_failure(session, user, slot)
                     continue
                 wanted = _filter_team_driver_personal_items_for_slots(session, user, manifest, missing_slots)
-                wanted = _dedupe_download_items(wanted)
+                # Trading Paints may spell the car folder differently from iRacing; the
+                # match allows for that, but the files were saved under Trading Paints'
+                # spelling and looked up under the session's, so they were never found.
+                wanted = _dedupe_download_items(
+                    [_retarget_personal_download_to_session_directory(user, item) for item in wanted]
+                )
                 if not wanted:
                     for slot in missing_slots:
                         _remember_team_driver_preload_slot_failure(session, user, slot)
@@ -17843,7 +17882,7 @@ def start_team_driver_personal_paint_preload(
                     slots_saved = sorted(
                         slot
                         for slot in missing_slots
-                        if _team_driver_preloaded_slot_available(user, slot, cache_root)
+                        if _team_driver_preloaded_slot_available(session, user, slot, cache_root)
                     )
                     if slots_saved:
                         logging.info(
@@ -17903,7 +17942,7 @@ def _select_team_session_downloads(
     cached_slots = [
         slot
         for slot in fallback_candidate_slots
-        if _team_driver_preloaded_slot_available(user, slot)
+        if _team_driver_preloaded_slot_available(session, user, slot)
     ]
     fallback_candidate_slots = [slot for slot in fallback_candidate_slots if slot not in set(cached_slots)]
 
