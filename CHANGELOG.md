@@ -2,6 +2,37 @@
 
 All notable user-facing changes to Nishizumi Paints are documented here.
 
+## [7.3.6] - 2026-10-11 (experimental)
+
+Published as the experimental pre-release `v7.3.6-experimental.1`. The in-app updater does not offer pre-releases, so it has to be installed by hand.
+
+### Changed
+
+- `fetch.tradingpaints.gg` is now the first Trading Paints manifest host the app asks, and `dl.tradingpaints.com`, which has been failing its TLS handshake since 7.3.4, is only the backup. Every app start used to wait for that failure first.
+- The online fallback wastes fewer Trading Paints requests: a forced favorite no longer throws away the showroom paints already fetched for that car, the showroom page walk never asks for a page after an empty one, a favorite that cannot be downloaded is not forced again for every later driver, and a car Trading Paints does not list re-downloads the car catalog at most every 15 minutes instead of every minute.
+
+### Fixed
+
+- Fixed a team download from the Teams tab sending every request to the broken backup host as well after the main host had answered, and **Download ALL team paints...** asking the backup again for every batch without paints for the team.
+- Fixed closing the app after leaving a session deleting your own car, helmet, and suit even with **Keep my livery locally** on.
+- With **Sync my livery from server** off, your own car and team files are no longer deleted by a driver swap in your team or **Force refresh current car/team**, painted over by the team-driver preload fallback, or replaced every 20 seconds by the iRacing UI previews, which now show as paused.
+- AI roster cleanup no longer deletes folders of your own in `Documents\iRacing\airosters`, and an AI roster name from Trading Paints can no longer write outside that folder. **Clone active AI roster** reads only file names from the roster and no longer leaves a half-copied folder that blocks every retry.
+- One locked or unwritable file, or a full disk, no longer crashes the background service in a loop that re-downloaded the whole grid. RandomPool copies are written under a temporary name, so a cut-short copy can no longer leave a broken `car.tga` in the pool, and a bad date in the driver overrides or random preferences file no longer fails every pass. Replay-pack restore and capture errors no longer crash the service or delete the live session's paints.
+- Closing the app during a pass now cancels it, so the paints it already saved are cleaned up.
+- In online fallback mode, a driver whose own paint is a Custom Number (`car_num_<id>.tga`) no longer gets a random car on top of it.
+- A driver who only needs a random helmet or suit no longer uses up a RandomPool car set, and **Block** now works on a helmet or suit that came with a pool set.
+- **Rebuild from current files** now puts each car into its own RandomPool bucket instead of the accessories bucket, where no car is ever picked.
+- Fixed in-app updates never starting for a Windows user folder with an accented letter, and paths with `&`, `%`, or parentheses. A failed installer now reopens the old version, and that version is not installed automatically again for a day.
+- A pre-release tag can no longer look newer than the final release with the same number, and the release digest is no longer read from a sibling asset such as `Setup.exe.zip`.
+- Fixed **Reset app settings** and changing the iRacing Documents folder closing the app for good when it is installed in a folder with a space, such as the default `Programs\Nishizumi Paints`.
+- Fixed every window close freezing for 5 seconds, a window that lost its console-only service starting its own service with outdated settings, and every settings change sending a GitHub update check.
+- **Assign current** now works for a driver's own Trading Paints paint.
+- Opening the app again no longer stops bringing the running window forward after another program connected to its local port.
+- A team driver swap seen together with a car joining or leaving now downloads the team's paints again straight away.
+- Paint history no longer loses entries when several files are saved at once, keeps one copy per save instead of one per retry, and removes the backups it no longer lists.
+- A service restart that overlaps a slow stop no longer leaves two copies of the service running.
+- A RandomPool trim by the car, helmet, or suit size limits alone now reports what it removed.
+
 ## [7.3.5] - 2026-10-10
 
 First published as the experimental pre-release `v7.3.5-experimental.1`; the final release is the same code. A copy of 7.3.4 or older running console-only cannot check for updates, so it has to be updated once from the normal window or with the installer.
