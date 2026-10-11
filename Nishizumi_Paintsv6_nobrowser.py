@@ -925,6 +925,11 @@ def scrollable_page_geometry(
     return max(view_width, content_width), max(view_height, content_height), needs_horizontal, needs_vertical
 
 
+# Widgets that change their value on the mouse wheel.
+WHEEL_VALUE_WIDGET_CLASSES = frozenset({"TSpinbox", "TCombobox", "Spinbox", "TScale", "Scale"})
+WHEEL_VALUE_GUARD_TAG = "NishizumiWheelGuard"
+
+
 def mousewheel_scroll_steps(delta: object, number: object = 0) -> int:
     """Turn a Tk mouse wheel event into scroll units, positive meaning downwards."""
     try:
@@ -23615,6 +23620,47 @@ class DownloaderUI:
                 root.bind_all(sequence, handler, add="+")
             except Exception:
                 pass
+        for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            try:
+                root.bind_class(WHEEL_VALUE_GUARD_TAG, sequence, self._on_value_widget_wheel)
+            except Exception:
+                pass
+
+    def _guard_value_widgets_from_wheel(self, widget=None) -> None:
+        """Stop the wheel from changing spinboxes and comboboxes the user did not click.
+
+        Tk delivers the wheel to the widget under the pointer, and a spinbox or
+        combobox changes its value on it. Scrolling a page past the RandomPool size
+        cap lowered it and saved it, and the next trim deleted pooled paints. The
+        guard tag runs before the widget's own binding: unless the widget has the
+        keyboard focus, the wheel scrolls the page instead.
+        """
+        pending = [widget if widget is not None else self.root]
+        while pending:
+            current = pending.pop()
+            try:
+                pending.extend(current.winfo_children())
+                if current.winfo_class() not in WHEEL_VALUE_WIDGET_CLASSES:
+                    continue
+                tags = tuple(current.bindtags())
+                if WHEEL_VALUE_GUARD_TAG not in tags:
+                    current.bindtags((WHEEL_VALUE_GUARD_TAG,) + tags)
+            except Exception:
+                continue
+
+    def _widget_has_focus(self, widget) -> bool:
+        try:
+            focused = self.root.focus_get()
+        except Exception:
+            return False
+        return focused is not None and str(focused) == str(widget)
+
+    def _on_value_widget_wheel(self, event):
+        if self._widget_has_focus(event.widget):
+            # A focused spinbox or combobox changes its value, as the user asked.
+            return None
+        self._handle_page_wheel(event, "y")
+        return "break"
 
     def _on_page_mousewheel(self, event):
         return self._handle_page_wheel(event, "y")
@@ -23629,19 +23675,30 @@ class DownloaderUI:
         if not steps:
             return None
         try:
-            # On Windows the wheel event is delivered to the focused widget, so the
-            # page under the pointer has to be looked up by position.
+            # Tk delivers the wheel to the widget under the pointer; look the page up
+            # by position all the same, so the page scrolls wherever it was turned.
             widget = self.root.winfo_containing(event.x_root, event.y_root)
         except Exception:
             widget = None
+        if widget is not None and self._widget_has_focus(widget) and self._is_wheel_value_widget(widget):
+            # A focused spinbox or combobox under the pointer just changed its value.
+            return None
         while widget is not None:
             state = self._page_scroll_states.get(str(widget))
             if state is not None:
                 return self._scroll_page(state, steps, axis)
             if self._widget_scrolls_itself(widget, axis):
-                return self._forward_wheel_to_widget(widget, steps, axis)
+                # The list or text under the pointer scrolls itself with its own
+                # binding; scrolling it here as well moved it twice per notch.
+                return None
             widget = getattr(widget, "master", None)
         return None
+
+    def _is_wheel_value_widget(self, widget) -> bool:
+        try:
+            return widget.winfo_class() in WHEEL_VALUE_WIDGET_CLASSES
+        except Exception:
+            return False
 
     def _scroll_page(self, state: dict[str, object], steps: int, axis: str):
         shown = state["vertical_shown"] if axis == "y" else state["horizontal_shown"]
@@ -23666,25 +23723,6 @@ class DownloaderUI:
         except Exception:
             return False
         return 0.0 < (last - first) < 0.999
-
-    def _forward_wheel_to_widget(self, widget, steps: int, axis: str):
-        # Tk scrolls the widget under the pointer by itself everywhere except Windows,
-        # where the wheel follows the keyboard focus instead.
-        try:
-            if self.root.tk.call("tk", "windowingsystem") != "win32":
-                return None
-            if self.root.focus_get() is widget:
-                return None
-        except Exception:
-            return None
-        try:
-            if axis == "y":
-                widget.yview_scroll(steps, "units")
-            else:
-                widget.xview_scroll(steps, "units")
-        except Exception:
-            return None
-        return "break"
 
     def _build_ui(self) -> None:
         ttk = self.ttk
@@ -24640,6 +24678,7 @@ class DownloaderUI:
         ttk.Label(footer, text="Always active while open", foreground="#555555").pack(side="left")
         ttk.Label(footer, textvariable=self.update_status_var).pack(side="right", padx=(0, 12))
         ttk.Label(footer, text=f"Version: {APP_VERSION}").pack(side="right")
+        self._guard_value_widgets_from_wheel()
         self._update_session_action_state()
 
     def _session_row_iid(self, row: SessionDriverSnapshot) -> str:

@@ -228,6 +228,68 @@ class ScrollablePageWidgetTests(unittest.TestCase):
         self._settle()
         self.assertGreater(self.canvas.yview()[0], 0.0)
 
+    def _wheel_over(self, widget, delta=-120):
+        self.root.winfo_containing = lambda _x, _y: widget
+        widget.event_generate(
+            "<MouseWheel>",
+            delta=delta,
+            rootx=widget.winfo_rootx() + 2,
+            rooty=widget.winfo_rooty() + 2,
+            when="now",
+        )
+        self._settle()
+
+    def test_wheel_over_an_unfocused_spinbox_scrolls_the_page_and_keeps_the_value(self):
+        # Tk delivers the wheel to the widget under the pointer, and a spinbox changes
+        # its value on it: scrolling past the RandomPool cap lowered and saved it.
+        value = self.tkinter.StringVar(value="5.0")
+        spinbox = self.ttk.Spinbox(self.page, from_=0, to=10, increment=0.5, textvariable=value)
+        spinbox.grid(row=0, column=0, sticky="w")
+        combo_value = self.tkinter.StringVar(value="Safe")
+        combo = self.ttk.Combobox(self.page, state="readonly", values=["Session Total", "Safe", "Manual"], textvariable=combo_value)
+        combo.grid(row=1, column=0, sticky="w")
+        self._add_options(60, first_row=2)
+        self._refresh()
+        self.ui._guard_value_widgets_from_wheel()
+        self.root.focus_set()
+        self._settle()
+        self._wheel_over(spinbox)
+        self.assertEqual(value.get(), "5.0")
+        self.assertGreater(self.canvas.yview()[0], 0.0)
+        self.canvas.yview_moveto(0.0)
+        self._settle()
+        self._wheel_over(combo)
+        self.assertEqual(combo_value.get(), "Safe")
+        self.assertGreater(self.canvas.yview()[0], 0.0)
+
+    def test_wheel_over_a_focused_spinbox_changes_its_value_and_not_the_page(self):
+        value = self.tkinter.StringVar(value="5.0")
+        spinbox = self.ttk.Spinbox(self.page, from_=0, to=10, increment=0.5, textvariable=value)
+        spinbox.grid(row=0, column=0, sticky="w")
+        self._add_options(60, first_row=1)
+        self._refresh()
+        self.ui._guard_value_widgets_from_wheel()
+        spinbox.focus_force()
+        self._settle()
+        self._wheel_over(spinbox, delta=120)
+        self.assertNotEqual(value.get(), "5.0")
+        self.assertEqual(self.canvas.yview()[0], 0.0)
+
+    def test_a_list_under_the_pointer_is_not_scrolled_a_second_time(self):
+        listbox = self.tkinter.Listbox(self.page, height=4)
+        listbox.grid(row=0, column=0, sticky="ew")
+        for index in range(50):
+            listbox.insert("end", f"paint {index}")
+        self._refresh()
+        self.root.focus_set()
+        self._settle()
+        before = listbox.yview()
+        self.root.winfo_containing = lambda _x, _y: listbox
+        # The list's own binding scrolls it; the page handler must leave it alone.
+        self.assertIsNone(self.ui._on_page_mousewheel(_WheelEvent(delta=-120)))
+        self._settle()
+        self.assertEqual(listbox.yview(), before)
+
     def test_hidden_tabs_are_measured_once_they_are_shown(self):
         hidden_tab, hidden_page = self.ui._add_scrollable_tab(self.notebook, "Hidden")
         hidden_state = self.ui._page_scroll_states[str(hidden_page.master)]
