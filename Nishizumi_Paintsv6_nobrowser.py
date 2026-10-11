@@ -98,6 +98,10 @@ TP_CAR_TEMPLATES_URL = "https://www.tradingpaints.com/cartemplates"
 TP_SHOWROOM_INDEX_URL = "https://www.tradingpaints.com/showroom"
 TP_CAR_IDENTITY_CACHE_TTL_SECONDS = 6 * 60 * 60
 TP_CAR_IDENTITY_RETRY_SECONDS = 60.0
+# A car the catalog does not know forces a fresh catalog fetch at most this often,
+# counted from the last fetch of any kind. A car Trading Paints does not list stays
+# unknown, and refetching both catalog pages for it every minute stalled lookups.
+TP_CAR_IDENTITY_UNKNOWN_REFRESH_SECONDS = 15 * 60
 TP_CAR_IDENTITY_MIN_EXPECTED_ENTRIES = 50
 TP_CAR_IDENTITY_CACHE_FILENAME = ".nishizumi_tp_car_identity.json"
 TP_CAR_IDENTITY_DISK_CACHE_VERSION = 1
@@ -4206,8 +4210,11 @@ def enforce_random_pool_limit(
             except OSError:
                 sort_key = 0.0
         bucket_infos.append((sort_key, size_bytes, bucket_dir))
+    # What the per-category caps removed above counts as freed too; it used to be
+    # dropped here, so a trim by the car cap alone reported nothing removed.
+    category_freed_bytes = freed_bytes
     if total_bytes <= limit_bytes:
-        return total_bytes, 0
+        return total_bytes, category_freed_bytes
     bucket_infos.sort(key=lambda item: item[0])
     freed_bytes = 0
     for _sort_key, size_bytes, bucket_dir in bucket_infos:
@@ -4219,7 +4226,7 @@ def enforce_random_pool_limit(
         except Exception:
             continue
     _cleanup_random_pool_dirs(random_pool_dir)
-    return max(total_bytes - freed_bytes, 0), freed_bytes
+    return max(total_bytes - freed_bytes, 0), category_freed_bytes + freed_bytes
 
 def clear_random_pool(random_pool_dir: Path) -> tuple[int, int, int]:
     if not random_pool_dir.exists():
@@ -6714,8 +6721,11 @@ def _tp_learn_observed_iracing_alias(
     alias_entry["source"] = "iracing_sdk_plus_trading_paints_cartemplates"
     alias_entry["status"] = "mapped"
     with _TP_CAR_IDENTITY_CACHE_LOCK:
-        cars_map = mapping_doc.setdefault("cars", {})
+        # Copy on write: import workers and the UI iterate the cars map without the
+        # lock, and adding a key under them raised "dictionary changed size".
+        cars_map = dict(mapping_doc.get("cars") or {})
         cars_map[directory_key] = alias_entry
+        mapping_doc["cars"] = cars_map
     logging.info(
         "Automatic car identity learned from iRacing + Trading Paints: %s (%s) -> TP car %s (%s).",
         car_name,
@@ -6730,7 +6740,15 @@ def _refresh_tp_car_identity_after_unknown() -> dict[str, Any]:
     global _TP_CAR_IDENTITY_LAST_UNKNOWN_REFRESH_AT
     now = time.monotonic()
     with _TP_CAR_IDENTITY_CACHE_LOCK:
-        if now - _TP_CAR_IDENTITY_LAST_UNKNOWN_REFRESH_AT < TP_CAR_IDENTITY_RETRY_SECONDS:
+        fetched_recently = (
+            _TP_CAR_IDENTITY_LAST_ATTEMPT_AT > 0
+            and now - _TP_CAR_IDENTITY_LAST_ATTEMPT_AT < TP_CAR_IDENTITY_UNKNOWN_REFRESH_SECONDS
+        )
+        refreshed_recently = (
+            _TP_CAR_IDENTITY_LAST_UNKNOWN_REFRESH_AT > 0
+            and now - _TP_CAR_IDENTITY_LAST_UNKNOWN_REFRESH_AT < TP_CAR_IDENTITY_UNKNOWN_REFRESH_SECONDS
+        )
+        if fetched_recently or refreshed_recently:
             return _TP_CAR_IDENTITY_CACHE_DOC or _load_tp_showroom_mapping()
         _TP_CAR_IDENTITY_LAST_UNKNOWN_REFRESH_AT = now
     return _load_tp_showroom_mapping(force_refresh=True)
@@ -6974,6 +6992,9 @@ def _tp_normalized_vehicle_name(value: object) -> str:
 
 
 def _tp_showroom_mapping_entry_for_name(name: object, mapping_path: Path | None = None) -> tuple[str, dict] | None:
+    if not _tp_identity_name_key(name):
+        # Imports with no vehicle name pass "", which no catalog entry can match.
+        return None
     mapping_doc = _load_tp_showroom_mapping(mapping_path)
     matched = _tp_identity_match_for_name(name, mapping_doc)
     if matched is None:
@@ -7202,6 +7223,10 @@ def _fetch_tp_showroom_pool_http(
             page_index=next_page,
             showroom_source=showroom_source,
         )
+        if not batch:
+            # Showroom pages are contiguous, so every page after an empty one is empty
+            # too. A small showroom used to cost one request per page up to the limit.
+            page_choices = [page_idx for page_idx in page_choices if page_idx < next_page]
         for car in batch:
             scheme_id = str(car.get("id") or "").strip()
             if scheme_id and scheme_id in seen_ids:
@@ -7261,8 +7286,10 @@ def choose_showroom_paint_direct(
     if forced_id:
         title = str(forced_scheme_title or f"scheme {forced_id}").strip()
         chosen = {"id": forced_id, "title": title, "type": "paint", "hasnumber": "0", "pro_user": False}
-        showroom_cars = [chosen]
-        sampled_pages: set[int] = set()
+        # Hand the caller's pool back unchanged: it stores showroom_cars in its per-car
+        # cache, and a one-item pool hid every fetched scheme from later drivers.
+        showroom_cars = list(showroom_cars or [])
+        sampled_pages: set[int] = set(int(page) for page in (showroom_sampled_pages or ()))
         reused_previous_scheme = False
         reused_recent_history = False
     else:
@@ -7383,8 +7410,10 @@ def choose_showroom_accessory_direct(
     if forced_id:
         title = str(forced_scheme_title or f"scheme {forced_id}").strip()
         chosen = {"id": forced_id, "title": title, "type": "paint", "hasnumber": "0", "pro_user": False}
-        showroom_cars = [chosen]
-        sampled_pages: set[int] = set()
+        # Hand the caller's pool back unchanged: it stores showroom_cars in its per-car
+        # cache, and a one-item pool hid every fetched scheme from later drivers.
+        showroom_cars = list(showroom_cars or [])
+        sampled_pages: set[int] = set(int(page) for page in (showroom_sampled_pages or ()))
         reused_previous_scheme = False
         reused_recent_history = False
     else:
@@ -14371,6 +14400,9 @@ def apply_tp_showroom_fallbacks_public(
     random_preferences = load_random_paint_preferences()
     recent_history_changed = False
     used_showroom_scheme_ids: set[str] = set()
+    # A favorite that could not be downloaded is not forced again for later drivers,
+    # which each paid the full download retries for the same missing scheme.
+    failed_favorite_scheme_ids: set[str] = set()
     random_pool_dir = default_random_pool_dir()
     ai_livery_root = default_ai_livery_dir()
     local_fallback_used_source_ids: set[str] = set()
@@ -14419,7 +14451,7 @@ def apply_tp_showroom_fallbacks_public(
         favorite_entry = random_paint_favorite_online_entry(normalized_kind, "", random_preferences)
         favorite_scheme_id = str((favorite_entry or {}).get("scheme_id") or "").strip()
         favorite_title = str((favorite_entry or {}).get("title") or "").strip()
-        if favorite_scheme_id in blocked_scheme_ids:
+        if favorite_scheme_id in blocked_scheme_ids or favorite_scheme_id in failed_favorite_scheme_ids:
             favorite_scheme_id = ""
         for _attempt in range(1, 5):
             if _cancel_requested(cancel_event):
@@ -14479,6 +14511,8 @@ def apply_tp_showroom_fallbacks_public(
                 logs.append(f"Public showroom {normalized_kind} for {label} could not be saved: {exc}")
                 saved_items = []
             if not saved_items:
+                if forced_scheme_id:
+                    failed_favorite_scheme_ids.add(forced_scheme_id)
                 logs.append(
                     f"Public showroom paint {chosen_scheme_id or '(unknown)'} for {label} {normalized_kind} was unavailable or could not be saved; trying another paint."
                 )
@@ -14608,7 +14642,7 @@ def apply_tp_showroom_fallbacks_public(
                 favorite_entry = random_paint_favorite_online_entry("car", user.directory, random_preferences)
                 favorite_scheme_id = str((favorite_entry or {}).get("scheme_id") or "").strip()
                 favorite_title = str((favorite_entry or {}).get("title") or "").strip()
-                if favorite_scheme_id in blocked_scheme_ids:
+                if favorite_scheme_id in blocked_scheme_ids or favorite_scheme_id in failed_favorite_scheme_ids:
                     favorite_scheme_id = ""
                 for _attempt in range(1, 5):
                     if _cancel_requested(cancel_event):
@@ -14667,6 +14701,8 @@ def apply_tp_showroom_fallbacks_public(
                         logs.append(f"Public showroom car for {label} on {user.directory} could not be saved: {exc}")
                         saved_items = []
                     if not saved_items:
+                        if forced_scheme_id:
+                            failed_favorite_scheme_ids.add(forced_scheme_id)
                         logs.append(
                             f"Public showroom paint {chosen_scheme_id or '(unknown)'} for {label} on {user.directory} was unavailable or could not be saved; trying another paint."
                         )
@@ -16444,10 +16480,22 @@ def import_saved_paint_groups_to_ai_livery(saved: list[SavedFile], session: Sess
         copied_sets += 1
     return copied_sets, copied_files
 
-def _parse_saved_paint_filename(path: Path) -> tuple[PaintType, str, int, bool, bool] | None:
-    parent_name = path.parent.name
-    paints_root_name = path.parent.parent.name if path.parent.parent != path.parent else ""
-    directory = "__accessories__" if parent_name.lower() == "paint" or paints_root_name.lower() == "paint" else parent_name
+def _parse_saved_paint_filename(path: Path, paints_root: Path | None = None) -> tuple[PaintType, str, int, bool, bool] | None:
+    # The car directory is the file's folder relative to the paint root, so
+    # paint\stockcars2\chevy\car_1.tga is stockcars2\chevy. Checking whether the
+    # grandparent was named "paint" sent every car under paint\<car> to the
+    # accessories bucket, where no car is ever picked.
+    relative_parts: tuple[str, ...] | None = None
+    if paints_root is not None:
+        try:
+            relative_parts = path.parent.relative_to(paints_root).parts
+        except ValueError:
+            relative_parts = None
+    if relative_parts is not None:
+        directory = "\\".join(relative_parts) if relative_parts else "__accessories__"
+    else:
+        parent_name = path.parent.name
+        directory = "__accessories__" if parent_name.lower() == "paint" else parent_name
     name = path.name.lower()
     patterns: list[tuple[PaintType, str]] = [
         (PaintType.CAR, r"^car_(team_)?(\d+)(?:(_ss))?\.tga$"),
@@ -16482,7 +16530,7 @@ def rebuild_random_pool_from_paints_root(
     for child in paints_root.rglob('*'):
         if not child.is_file():
             continue
-        parsed = _parse_saved_paint_filename(child)
+        parsed = _parse_saved_paint_filename(child, paints_root)
         if parsed is None:
             continue
         paint_type, directory, target_id, is_team, is_ss = parsed
