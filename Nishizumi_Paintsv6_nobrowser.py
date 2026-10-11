@@ -138,6 +138,19 @@ GITHUB_RELEASE_ASSET_HOSTS = (
 UPDATE_INSTALLER_MAX_BYTES = 400 * 1024 * 1024
 UPDATE_DOWNLOAD_TIMEOUT = (10.0, 60.0)
 UPDATE_INSTALLER_SILENT_ARGS = ("/SILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/CLOSEAPPLICATIONS")
+# cmd reads a batch file in the OEM code page, so the update script itself is plain
+# ASCII and every path reaches it through these environment variables. A profile path
+# with accented letters, '&', '%' or parentheses then survives intact.
+UPDATE_SCRIPT_ENV_SCRIPT = "NISHIZUMI_UPDATE_SCRIPT"
+UPDATE_SCRIPT_ENV_INSTALLER = "NISHIZUMI_UPDATE_INSTALLER"
+UPDATE_SCRIPT_ENV_APP = "NISHIZUMI_UPDATE_APP"
+UPDATE_SCRIPT_ENV_LOG = "NISHIZUMI_UPDATE_LOG"
+UPDATE_SCRIPT_ENV_FAILED_MARKER = "NISHIZUMI_UPDATE_FAILED_MARKER"
+# The update script writes the installer's exit code next to the installer when it
+# fails. The relaunched app then does not install that version automatically again for
+# a day, so a failing installer cannot download and fail in a loop.
+UPDATE_FAILED_MARKER_SUFFIX = ".failed"
+UPDATE_FAILED_AUTO_RETRY_SECONDS = 24 * 60 * 60
 # Manifest hosts, primary first. fetch.tradingpaints.gg is the host that answers;
 # dl.tradingpaints.com has been failing its TLS handshake since 7.3.4, so it is only
 # the backup, tried when the primary cannot be reached or keeps failing.
@@ -1240,6 +1253,13 @@ class GitHubReleaseInfo:
             and is_trusted_release_asset_url(self.asset_download_url)
         )
 def _parse_version_parts(tag: str) -> tuple[int, ...]:
+    return _version_sort_key(tag)[0]
+def _version_sort_key(tag: str) -> tuple[tuple[int, ...], bool]:
+    """Numeric version parts, and whether the tag is a pre-release of that version.
+
+    ``v7.3.6-experimental.1`` is (7, 3, 6) and a pre-release, so it sorts before
+    ``v7.3.6`` instead of after it as 7.3.6.1.
+    """
     cleaned = (tag or '').strip()
     if cleaned.lower().startswith("release-"):
         cleaned = cleaned[8:]
@@ -1247,11 +1267,18 @@ def _parse_version_parts(tag: str) -> tuple[int, ...]:
         cleaned = cleaned[7:]
     if cleaned.lower().startswith("v"):
         cleaned = cleaned[1:]
-    nums = [int(part) for part in re.findall(r"\d+", cleaned)]
-    return tuple(nums or [0])
+    match = re.match(r"\s*(\d+(?:\.\d+)*)(.*)$", cleaned, flags=re.DOTALL)
+    if not match:
+        nums = [int(part) for part in re.findall(r"\d+", cleaned)]
+        return tuple(nums or [0]), False
+    nums = [int(part) for part in match.group(1).split(".")]
+    prerelease = bool(re.match(r"\s*[-+.~_]?\s*[A-Za-z]", match.group(2)))
+    return tuple(nums), prerelease
 def compare_version_tags(left: str, right: str) -> int:
-    lparts = list(_parse_version_parts(left))
-    rparts = list(_parse_version_parts(right))
+    lparts_tuple, left_prerelease = _version_sort_key(left)
+    rparts_tuple, right_prerelease = _version_sort_key(right)
+    lparts = list(lparts_tuple)
+    rparts = list(rparts_tuple)
     width = max(len(lparts), len(rparts))
     lparts.extend([0] * (width - len(lparts)))
     rparts.extend([0] * (width - len(rparts)))
@@ -1259,6 +1286,8 @@ def compare_version_tags(left: str, right: str) -> int:
         return 1
     if tuple(lparts) < tuple(rparts):
         return -1
+    if left_prerelease != right_prerelease:
+        return -1 if left_prerelease else 1
     return 0
 def _github_api_headers() -> dict[str, str]:
     return {
@@ -1300,9 +1329,10 @@ def parse_release_body_sha256(body: str | None, asset_name: str | None) -> str |
     if not name or not str(body or '').strip():
         return None
     escaped = re.escape(name)
+    # The name must stand alone: "X.exe" must not match inside "X.exe.zip" or "old-X.exe".
     patterns = (
-        rf"(?i)\b([0-9a-f]{{64}})\b[^\S\n]*[*]?{escaped}\b",
-        rf"(?i){escaped}\b[^\n]*?\b([0-9a-f]{{64}})\b",
+        rf"(?i)\b([0-9a-f]{{64}})\b[^\S\n]*[*]?{escaped}(?![\w.-])",
+        rf"(?i)(?<![\w.-]){escaped}(?![\w.-])[^\n]*?\b([0-9a-f]{{64}})\b",
     )
     for pattern in patterns:
         match = re.search(pattern, str(body))
@@ -1385,13 +1415,14 @@ def fetch_latest_github_release() -> GitHubReleaseInfo:
     latest_payload = _github_get_json(GITHUB_RELEASES_API_LATEST)
     if isinstance(latest_payload, dict):
         return _extract_release_info(latest_payload)
-    # Defensive fallback, though /latest should return a single object.
-    releases_url = f"https://api.github.com/repos/{GITHUB_RELEASE_OWNER}/{GITHUB_RELEASE_REPO}/releases?per_page=1"
+    # Defensive fallback, though /latest should return a single object. /latest never
+    # answers with a pre-release or a draft, and neither may this list.
+    releases_url = f"https://api.github.com/repos/{GITHUB_RELEASE_OWNER}/{GITHUB_RELEASE_REPO}/releases?per_page=20"
     releases_payload = _github_get_json(releases_url)
-    if isinstance(releases_payload, list) and releases_payload:
-        first = releases_payload[0]
-        if isinstance(first, dict):
-            return _extract_release_info(first)
+    if isinstance(releases_payload, list):
+        for candidate in releases_payload:
+            if isinstance(candidate, dict) and not candidate.get("prerelease") and not candidate.get("draft"):
+                return _extract_release_info(candidate)
     raise RuntimeError("GitHub update check did not find a usable release.")
 
 
@@ -1511,24 +1542,78 @@ def download_release_installer(
     return target
 
 
-def build_update_launcher_script(
+def update_install_failure_marker_path(installer_path: Path) -> Path:
+    """Where the update script records a failed install of ``installer_path``."""
+    installer = Path(installer_path)
+    return installer.with_name(installer.name + UPDATE_FAILED_MARKER_SUFFIX)
+
+
+def recent_update_install_failure(release: GitHubReleaseInfo, now: float | None = None) -> str | None:
+    """The installer exit code when installing this release failed within the last day.
+
+    None when there is no recent failure. A manual install clears the record, because
+    the update workspace is emptied before every download.
+    """
+    try:
+        filename = _safe_installer_filename(release.asset_name)
+    except RuntimeError:
+        return None
+    marker = update_install_failure_marker_path(update_workspace_dir() / filename)
+    try:
+        modified = marker.stat().st_mtime
+    except OSError:
+        return None
+    current = time.time() if now is None else float(now)
+    if current - modified > UPDATE_FAILED_AUTO_RETRY_SECONDS:
+        return None
+    try:
+        code = marker.read_text(encoding="ascii", errors="replace").strip()
+    except OSError:
+        code = ""
+    return code or "unknown"
+
+
+def update_launcher_environment(
+    script_path: Path,
     installer_path: Path,
     app_exe: Path,
     log_path: Path,
-    relaunch_args: Sequence[str] = (),
-) -> str:
+    failed_marker_path: Path,
+) -> dict[str, str]:
+    """The paths the update script reads, as environment variables.
+
+    A value is expanded once inside double quotes and never scanned again, so only a
+    double quote or a line break could break out, and Windows paths cannot hold either.
+    """
+    values = {
+        UPDATE_SCRIPT_ENV_SCRIPT: script_path,
+        UPDATE_SCRIPT_ENV_INSTALLER: installer_path,
+        UPDATE_SCRIPT_ENV_APP: app_exe,
+        UPDATE_SCRIPT_ENV_LOG: log_path,
+        UPDATE_SCRIPT_ENV_FAILED_MARKER: failed_marker_path,
+    }
+    environment: dict[str, str] = {}
+    for name, value in values.items():
+        text = str(Path(value))
+        if not text or any(character in text for character in '"\r\n\0'):
+            raise RuntimeError(f"Refusing to build an update script for an unsafe path: {text!r}")
+        environment[name] = text
+    return environment
+
+
+def build_update_launcher_script(relaunch_args: Sequence[str] = ()) -> str:
     """Batch wrapper that installs the update and relaunches the app afterwards.
 
     The app has to exit before the installer can replace its own files, so the install
     is handed to a detached script rather than run in-process. ``relaunch_args`` reopens
     the app in the mode it was running in (``--gui`` or ``--nogui``), so an update never
     stops at the startup mode selector.
+
+    The script is pure ASCII: the paths come from the environment variables built by
+    ``update_launcher_environment``. The app is relaunched even when the installer
+    fails, because a failed Inno Setup install is rolled back and the old version is
+    better than no app at all; the failure is recorded so it is not retried in a loop.
     """
-    parts = {"installer": Path(installer_path), "app": Path(app_exe), "log": Path(log_path)}
-    for label, value in parts.items():
-        text = str(value)
-        if '"' in text or "%" in text or "\n" in text or "\r" in text:
-            raise RuntimeError(f"Refusing to build an update script for an unsafe {label} path: {text!r}")
     for argument in relaunch_args:
         if not re.fullmatch(r"--[a-z][a-z0-9-]*", str(argument)):
             raise RuntimeError(f"Refusing to build an update script with an unsafe relaunch argument: {argument!r}")
@@ -1537,14 +1622,24 @@ def build_update_launcher_script(
     return "\r\n".join(
         [
             "@echo off",
-            "setlocal",
-            f'"{parts["installer"]}" {arguments} /LOG="{parts["log"]}"',
-            'if errorlevel 1 exit /b %errorlevel%',
-            f'start "" "{parts["app"]}"{relaunch}',
-            "exit /b 0",
+            "setlocal DisableDelayedExpansion",
+            f'"%{UPDATE_SCRIPT_ENV_INSTALLER}%" {arguments} /LOG="%{UPDATE_SCRIPT_ENV_LOG}%"',
+            'set "NISHIZUMI_UPDATE_RC=%ERRORLEVEL%"',
+            f'if not "%NISHIZUMI_UPDATE_RC%"=="0" (echo %NISHIZUMI_UPDATE_RC%) > "%{UPDATE_SCRIPT_ENV_FAILED_MARKER}%"',
+            f'start "" "%{UPDATE_SCRIPT_ENV_APP}%"{relaunch}',
+            "exit /b %NISHIZUMI_UPDATE_RC%",
             "",
         ]
     )
+
+
+def _windows_command_processor() -> str:
+    """Absolute path of cmd.exe, so a cmd.exe next to the app is never picked up instead."""
+    system_root = os.environ.get("SystemRoot") or os.environ.get("windir") or r"C:\Windows"
+    candidate = Path(system_root) / "System32" / "cmd.exe"
+    if candidate.is_file():
+        return str(candidate)
+    return os.environ.get("COMSPEC") or "cmd.exe"
 
 
 def start_update_installer(
@@ -1563,14 +1658,23 @@ def start_update_installer(
     directory = installer.parent
     script_path = directory / "run_update.cmd"
     log_path = directory / "install.log"
-    script_path.write_text(build_update_launcher_script(installer, target_exe, log_path, relaunch_args), encoding="ascii")
+    failed_marker = update_install_failure_marker_path(installer)
+    environment = dict(os.environ)
+    environment.update(update_launcher_environment(script_path, installer, target_exe, log_path, failed_marker))
+    script = build_update_launcher_script(relaunch_args)
+    failed_marker.unlink(missing_ok=True)
+    script_path.write_text(script, encoding="ascii", newline="")
     creationflags = 0
     if sys.platform == "win32":
         creationflags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
         creationflags |= getattr(subprocess, "DETACHED_PROCESS", 0)
+    # /s keeps the quotes around the script path, and the path itself comes from the
+    # environment, so '&', '%' and non-ASCII letters in it cannot break the command.
+    # /d skips any AutoRun command configured for cmd.
     subprocess.Popen(
-        ["cmd.exe", "/c", str(script_path)],
+        f'"{_windows_command_processor()}" /d /s /c ""%{UPDATE_SCRIPT_ENV_SCRIPT}%""',
         cwd=str(directory),
+        env=environment,
         creationflags=creationflags,
         close_fds=True,
     )
@@ -1654,14 +1758,19 @@ class SingleInstanceSignalServer:
                 break
             try:
                 with conn:
+                    # An accepted socket is blocking, so without a timeout one client
+                    # that connects and sends nothing would stop every later launch
+                    # from bringing this instance forward.
                     try:
-                        conn.recv(64)
+                        conn.settimeout(1.0)
+                        data = conn.recv(64)
                     except Exception:
-                        pass
-                    try:
-                        self.on_activate()
-                    except Exception:
-                        pass
+                        data = b""
+                    if data.startswith(b"SHOW"):
+                        try:
+                            self.on_activate()
+                        except Exception:
+                            pass
             except Exception:
                 pass
     def stop(self) -> None:
@@ -26120,6 +26229,13 @@ class DownloaderUI:
                 f"Update {release.tag_name} cannot be installed automatically because it has no verifiable installer asset."
             )
             return False
+        failure = recent_update_install_failure(release)
+        if failure is not None:
+            self._append_log(
+                f"The last attempt to install {release.tag_name} failed (installer exit code {failure}), so it is not "
+                "installed automatically again for a day. Use Check updates to try again, or see install.log in the updates folder."
+            )
+            return False
         return True
 
     def _prompt_for_update(self, release: GitHubReleaseInfo) -> None:
@@ -28488,6 +28604,7 @@ class HeadlessUpdateManager:
         clean_workspace: Callable[..., None] = clean_update_workspace,
         unsupported_reason: Callable[[], str] = auto_install_unsupported_reason,
         open_url: Callable[[str], object] = webbrowser.open,
+        install_failure: Callable[[GitHubReleaseInfo], str | None] = recent_update_install_failure,
         first_check_delay: float = HEADLESS_UPDATE_FIRST_CHECK_DELAY_SECONDS,
         check_interval: float = GITHUB_UPDATE_CHECK_INTERVAL_SECONDS,
         retry_delay: float = HEADLESS_UPDATE_RETRY_SECONDS,
@@ -28501,6 +28618,7 @@ class HeadlessUpdateManager:
         self._clean_workspace = clean_workspace
         self._unsupported_reason = unsupported_reason
         self._open_url = open_url
+        self._install_failure = install_failure
         self._first_check_delay = max(0.0, float(first_check_delay))
         self._check_interval = max(1.0, float(check_interval))
         self._retry_delay = max(1.0, float(retry_delay))
@@ -28689,6 +28807,15 @@ class HeadlessUpdateManager:
             return False
         if not release.installer_is_verifiable():
             logging.info("Update %s cannot be installed automatically because it has no verifiable installer.", release.tag_name)
+            return False
+        failure = self._install_failure(release)
+        if failure is not None:
+            logging.warning(
+                "The last attempt to install %s failed (installer exit code %s), so it is not installed automatically again for a day. "
+                "Click the Windows notification to try again, or see install.log in the updates folder.",
+                release.tag_name,
+                failure,
+            )
             return False
         return True
 
