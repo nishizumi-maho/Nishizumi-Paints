@@ -4927,9 +4927,12 @@ def save_random_paint_preferences(preferences: dict[str, object], path: Path | N
                 if entry is not None:
                     safe_bucket[str(entry["key"])] = entry
         safe[bucket_name] = safe_bucket
-    temp = resolved.with_name(resolved.name + ".tmp")
-    temp.write_text(json.dumps(safe, indent=2, sort_keys=True), encoding="utf-8")
-    os.replace(temp, resolved)
+    temp = resolved.with_name(f"{resolved.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temp.write_text(json.dumps(safe, indent=2, sort_keys=True), encoding="utf-8")
+        os.replace(temp, resolved)
+    finally:
+        temp.unlink(missing_ok=True)
 
 def _random_preference_entry_for_source(
     *,
@@ -4976,6 +4979,10 @@ def remember_random_paint_favorite(entry: dict[str, object]) -> bool:
     normalized = _normalize_random_paint_preference_entry(entry)
     if normalized is None:
         return False
+    with _PAINT_PREFERENCE_FILES_LOCK:
+        return _remember_random_paint_favorite_locked(normalized)
+
+def _remember_random_paint_favorite_locked(normalized: dict[str, object]) -> bool:
     preferences = load_random_paint_preferences()
     key = str(normalized["key"])
     favorites = preferences.setdefault("favorites", {})
@@ -4995,6 +5002,10 @@ def block_random_paint_source(entry: dict[str, object]) -> bool:
     normalized = _normalize_random_paint_preference_entry(entry)
     if normalized is None:
         return False
+    with _PAINT_PREFERENCE_FILES_LOCK:
+        return _block_random_paint_source_locked(normalized)
+
+def _block_random_paint_source_locked(normalized: dict[str, object]) -> bool:
     preferences = load_random_paint_preferences()
     key = str(normalized["key"])
     favorites = preferences.setdefault("favorites", {})
@@ -5160,6 +5171,11 @@ def load_driver_paint_overrides(path: Path | None = None) -> dict[str, dict[str,
             result[key] = normalized
     return result
 
+# Override and preference changes come from the service and from Session-tab worker
+# threads. Each one loads, changes and saves the whole file, so two at once could
+# drop one change, and a shared temp name made the second save fail.
+_PAINT_PREFERENCE_FILES_LOCK = threading.RLock()
+
 def save_driver_paint_overrides(overrides: dict[str, dict[str, object]], path: Path | None = None) -> None:
     resolved = Path(path) if path is not None else default_driver_paint_overrides_path()
     resolved.parent.mkdir(parents=True, exist_ok=True)
@@ -5175,25 +5191,37 @@ def save_driver_paint_overrides(overrides: dict[str, dict[str, object]], path: P
         )
         if key:
             clean[key] = normalized
-    temp_path = resolved.with_name(resolved.name + ".tmp")
-    temp_path.write_text(
-        json.dumps({"overrides": clean}, indent=2, ensure_ascii=False, sort_keys=True),
-        encoding="utf-8",
-    )
-    os.replace(temp_path, resolved)
+    temp_path = resolved.with_name(f"{resolved.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temp_path.write_text(
+            json.dumps({"overrides": clean}, indent=2, ensure_ascii=False, sort_keys=True),
+            encoding="utf-8",
+        )
+        os.replace(temp_path, resolved)
+    finally:
+        temp_path.unlink(missing_ok=True)
 
 def remember_driver_paint_override(entry: dict[str, object], path: Path | None = None) -> dict[str, object]:
     normalized = _normalize_driver_paint_override_entry(entry)
     if normalized is None:
         raise ValueError("Invalid driver paint override entry.")
-    overrides = load_driver_paint_overrides(path)
     key = _driver_paint_override_key(
         int(normalized["user_id"]),
         str(normalized["kind"]),
         str(normalized.get("directory") or ""),
     )
-    overrides[key] = normalized
-    save_driver_paint_overrides(overrides, path)
+    with _PAINT_PREFERENCE_FILES_LOCK:
+        overrides = load_driver_paint_overrides(path)
+        previous = overrides.get(key)
+        overrides[key] = normalized
+        save_driver_paint_overrides(overrides, path)
+    if path is None and isinstance(previous, dict) and str(previous.get("scheme_id") or "") != str(normalized.get("scheme_id") or ""):
+        # The cache folder is per scheme; reassigning used to keep every earlier
+        # paint (4-15 MB per car set) forever.
+        try:
+            shutil.rmtree(_driver_paint_override_cache_dir(previous), ignore_errors=True)
+        except Exception:
+            logging.debug("Could not remove the previous driver override cache", exc_info=True)
     return normalized
 
 def _driver_paint_override_cache_dir(entry: dict[str, object], cache_root: Path | None = None) -> Path:
@@ -5277,11 +5305,12 @@ def forget_driver_paint_override(user_id: int, kind: str, directory: str = "", *
     key = _driver_paint_override_key(user_id, kind, directory)
     if not key:
         return False, 0, 0
-    overrides = load_driver_paint_overrides()
-    entry = overrides.pop(key, None)
-    if entry is None:
-        return False, 0, 0
-    save_driver_paint_overrides(overrides)
+    with _PAINT_PREFERENCE_FILES_LOCK:
+        overrides = load_driver_paint_overrides()
+        entry = overrides.pop(key, None)
+        if entry is None:
+            return False, 0, 0
+        save_driver_paint_overrides(overrides)
     removed_files = 0
     freed_bytes = 0
     if remove_cache:
@@ -5514,6 +5543,10 @@ def _apply_cached_driver_paint_override_for_user(
             )
             if copied:
                 saved_items.extend(copied)
+        if saved_items:
+            _remove_paint_files_the_override_replaces(session, saved_items, base_kwargs, paints_dir)
+            if session.is_superspeedway_track:
+                saved_items = _ensure_superspeedway_companion_saved_files(saved_items, paints_dir)
         return saved_items
     paint_type = PaintType.HELMET if kind == "helmet" else PaintType.SUIT
     source_path = cached.helmet_file if kind == "helmet" else cached.suit_file
@@ -5527,6 +5560,39 @@ def _apply_cached_driver_paint_override_for_user(
         ),
         paints_dir,
     )
+
+def _remove_paint_files_the_override_replaces(
+    session: Session,
+    saved_items: list[SavedFile],
+    base_kwargs: dict[str, object],
+    paints_dir: Path,
+) -> int:
+    """Remove the driver's own spec map, decal, custom number and _ss files a car override lacks.
+
+    Overrides are applied after the Trading Paints download, so without this the
+    override's car rendered with the original paint's spec map and decal, and a
+    superspeedway track kept showing the original car_<id>_ss.tga.
+    """
+    provided = {item.download_id.paint_type for item in saved_items}
+    keep_ss = bool(session.is_superspeedway_track)
+    removed = 0
+    for paint_type in (PaintType.CAR, PaintType.CAR_SPEC, PaintType.CAR_DECAL, PaintType.CAR_NUMBER):
+        for superspeedway in (False, True):
+            if paint_type in provided and (not superspeedway or keep_ss):
+                # Written by the override itself, or about to get an _ss copy of it.
+                continue
+            download_id = DownloadId(paint_type=paint_type, is_superspeedway_variant=superspeedway, **base_kwargs)
+            try:
+                paths = save_paths_for(download_id, paints_dir)
+            except ValueError:
+                continue
+            for path in paths:
+                if not path.is_file():
+                    continue
+                remember_previous_paint_file(path, session.session_id, download_id)
+                if _hard_delete_file(path, paints_root=paints_dir):
+                    removed += 1
+    return removed
 
 def apply_driver_paint_overrides(
     *,
@@ -14136,32 +14202,19 @@ def _download_and_save_tp_collection_result(
     )
     if not retargeted_items:
         return []
-    downloaded_items: list[DownloadedFile] = []
-    for ordinal, item in enumerate(retargeted_items, start=1):
-        downloaded = download_file(
-            session.session_id,
-            temp_dir,
-            item,
-            retries,
-            retry_backoff_seconds,
-            ordinal=ordinal,
-            total=len(retargeted_items),
-            cancel_event=cancel_event,
-        )
-        if downloaded is not None:
-            downloaded_items.append(downloaded)
-    saved_items: list[SavedFile] = []
-    for downloaded in downloaded_items:
-        saved = move_or_extract(
-            downloaded,
-            paints_dir,
-            retries=retries,
-            retry_backoff_seconds=retry_backoff_seconds,
-            cancel_event=cancel_event,
-        )
-        if saved:
-            saved_items.extend(saved)
-    return saved_items
+    # Spec map and decal wait for the car, and a failed car gets one repair round,
+    # as on the public showroom path.
+    return _download_and_save_with_auto_repair(
+        session_id=session.session_id,
+        temp_dir=temp_dir,
+        paints_dir=paints_dir,
+        items=retargeted_items,
+        retries=retries,
+        retry_backoff_seconds=retry_backoff_seconds,
+        cancel_event=cancel_event,
+        label=f"collection {kind} scheme {result.chosen_scheme_id or '(unknown)'}",
+        skip_car_extras_until_car=(kind == "car"),
+    )
 
 def _mark_tp_collection_saved_targets(
     saved_items: list[SavedFile],
@@ -14347,7 +14400,6 @@ def apply_tp_collection_pool_fallbacks(
         target_is_team = session_user_uses_team_target(user)
         target_id = int(user.team_id) if target_is_team else int(user.user_id)
         label = user.display_name or (f"AI {target_id}" if user.is_ai else f"user {target_id}")
-        summary.attempted_targets += 1
         chosen, reused_existing_source = _choose_tp_collection_candidate(
             candidates,
             kind,
@@ -14355,7 +14407,6 @@ def apply_tp_collection_pool_fallbacks(
             allow_repeating_when_exhausted=bool(allow_repeating_when_exhausted),
         )
         if chosen is None:
-            summary.missing_source_targets += 1
             if candidates:
                 if strict_collection_only:
                     logs.append(
@@ -14393,8 +14444,9 @@ def apply_tp_collection_pool_fallbacks(
             kind=kind,
         )
         if cached_items:
+            if kind == "car" and session.is_superspeedway_track:
+                cached_items = _ensure_superspeedway_companion_saved_files(cached_items, paints_dir)
             _record_saved(cached_items)
-            summary.applied_targets += 1
             logs.append(f"Trading Paints collection pool applied cached {kind} to {'AI' if user.is_ai else 'driver'} {label} using collection {collection_id}, scheme {scheme_id} ({title}).")
             return True
         result = _tp_collection_public_direct_result(
@@ -14403,7 +14455,6 @@ def apply_tp_collection_pool_fallbacks(
             directory=user.directory,
         )
         if result is None:
-            summary.missing_source_targets += 1
             logs.append(
                 f"Trading Paints collection pool picked uncached {kind} scheme {scheme_id} from collection {collection_id} for "
                 f"{'AI' if user.is_ai else 'driver'} {label}, but that item is not exposed as a usable public showroom asset."
@@ -14423,13 +14474,11 @@ def apply_tp_collection_pool_fallbacks(
             )
         except Exception as exc:
             logging.debug("Trading Paints browserless collection pool public download exception", exc_info=True)
-            summary.missing_source_targets += 1
             logs.append(f"Trading Paints collection pool errored while downloading public {kind} scheme {scheme_id} from collection {collection_id}: {exc}")
             return False
         if not _tp_collection_saved_items_have_primary_kind(saved_items, kind):
             if saved_items:
                 delete_saved(saved_items, paints_root=paints_dir)
-            summary.missing_source_targets += 1
             logs.append(
                 f"Trading Paints collection pool selected uncached public {kind} scheme {scheme_id} from collection {collection_id}, "
                 f"but the primary public asset was unavailable."
@@ -14440,8 +14489,9 @@ def apply_tp_collection_pool_fallbacks(
         except Exception as exc:  # noqa: BLE001
             # The paint is already in place; only the cache for next time is missing.
             logs.append(f"Trading Paints collection pool could not cache {kind} scheme {scheme_id}: {exc}")
+        if kind == "car" and session.is_superspeedway_track:
+            saved_items = _ensure_superspeedway_companion_saved_files(saved_items, paints_dir)
         _record_saved(saved_items)
-        summary.applied_targets += 1
         logs.append(
             f"Trading Paints collection pool downloaded and cached public {kind} for "
             f"{'AI' if user.is_ai else 'driver'} {label} using collection {collection_id}, scheme {scheme_id} ({title})."
@@ -14476,8 +14526,10 @@ def apply_tp_collection_pool_fallbacks(
         target_key = (target_is_team, target_id, user.directory.lower())
         accessory_target_key = (target_is_team, target_id)
         missing_strict_collection_car = False
+        slot_results: list[bool] = []
         if car_enabled_for_user and target_key not in existing_car_targets:
             car_applied = _apply_choice(user, "car", _car_candidates_for_directory(user.directory))
+            slot_results.append(car_applied)
             missing_strict_collection_car = bool(strict_collection_only and not car_applied)
             if missing_strict_collection_car:
                 label = user.display_name or (f"AI {target_id}" if user.is_ai else f"user {target_id}")
@@ -14486,9 +14538,17 @@ def apply_tp_collection_pool_fallbacks(
                     f"{'AI' if user.is_ai else 'driver'} {label} on {user.directory} because no collection car paint could be applied."
                 )
         if not missing_strict_collection_car and bool(random_helmets) and helmet_enabled_for_user and accessory_target_key not in existing_helmet_targets:
-            _apply_choice(user, "helmet", _accessory_candidates_for_kind("helmet"))
+            slot_results.append(_apply_choice(user, "helmet", _accessory_candidates_for_kind("helmet")))
         if not missing_strict_collection_car and bool(random_suits) and suit_enabled_for_user and accessory_target_key not in existing_suit_targets:
-            _apply_choice(user, "suit", _accessory_candidates_for_kind("suit"))
+            slot_results.append(_apply_choice(user, "suit", _accessory_candidates_for_kind("suit")))
+        # One count per driver, like the other fallbacks: a driver whose car, helmet
+        # and suit all came from the pool used to count as three applied targets.
+        if slot_results:
+            summary.attempted_targets += 1
+            if all(slot_results):
+                summary.applied_targets += 1
+            else:
+                summary.missing_source_targets += 1
     if skipped_team_event_targets > 0:
         logs.append(f"Random fallback in team events is disabled, so Nishizumi Paints skipped {skipped_team_event_targets} team target(s).")
     if skipped_local_targets > 0:
@@ -19552,6 +19612,10 @@ def process_session(
         retry_backoff_seconds=retry_backoff_seconds,
         cancel_event=cancel_event,
     )
+    # Counted now: overrides, local roster copies and preload copies are added to
+    # `saved` later and are not Trading Paints downloads.
+    tp_saved_file_count = len(saved)
+    tp_saved_set_count = len(_group_saved_car_sets(saved))
     if _cancel_requested(cancel_event):
         return _cancelled_result(
             "save",
@@ -19647,8 +19711,6 @@ def process_session(
         )
     random_pool_dir = default_random_pool_dir()
     ai_livery_root = default_ai_livery_dir()
-    tp_saved_file_count = len(saved)
-    tp_saved_set_count = len(_group_saved_car_sets(saved))
     fallback_mode = str(tp_fallback_mode or "local").strip().lower()
     tp_manifest_member_id = resolve_tp_manifest_member_id(tp_manifest_member_id_override, session.local_user_id)
     effective_random_fallback_ai = bool(random_fallback_ai)
