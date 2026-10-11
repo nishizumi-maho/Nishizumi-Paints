@@ -11,6 +11,7 @@ import concurrent.futures
 import html
 import json
 import logging
+import math
 import os
 import queue
 import socket
@@ -3633,6 +3634,13 @@ def _to_int_or_none(value: object) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+def _number_or_default(value: object, default: float) -> float:
+    """A float read from a JSON file the user may have edited; anything unusable is the default."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return float(default)
+    return number if math.isfinite(number) else float(default)
 def _to_boolish(value: object, default: bool = False) -> bool:
     if isinstance(value, bool):
         return value
@@ -4294,6 +4302,17 @@ def _group_saved_car_sets(saved: list[SavedFile]) -> dict[tuple[str, int, bool],
         grouped.setdefault(key, {})[saved_file.download_id.paint_type] = saved_file.file_path
     return grouped
 
+def _write_random_pool_file_atomically(destination: Path, *, source: Path | None = None, text: str | None = None) -> None:
+    temp_path = destination.with_name(f"{destination.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        if source is not None:
+            shutil.copy2(source, temp_path)
+        else:
+            temp_path.write_text(text or "", encoding="utf-8")
+        os.replace(temp_path, destination)
+    finally:
+        temp_path.unlink(missing_ok=True)
+
 def archive_saved_tp_sets_to_random_pool(
     saved: list[SavedFile],
     random_pool_dir: Path,
@@ -4328,20 +4347,6 @@ def archive_saved_tp_sets_to_random_pool(
         except Exception:
             source_hash = hashlib.sha1(str(source_anchor).encode("utf-8", "ignore")).hexdigest()[:16]
         bucket_dir = random_pool_dir / _safe_random_pool_bucket(directory) / source_hash
-        bucket_dir.mkdir(parents=True, exist_ok=True)
-        meta_path = bucket_dir / "meta.json"
-        if not meta_path.exists():
-            meta_path.write_text(
-                json.dumps({
-                    "directory": directory,
-                    "source_hash": source_hash,
-                    "source_path": str(source_anchor),
-                    "cached_at": time.time(),
-                    "target_id": int(target_id),
-                    "is_team_paint": bool(is_team),
-                }, indent=2, ensure_ascii=False),
-                encoding="utf-8",
-            )
         mapping = {
             PaintType.CAR: bucket_dir / "car.tga",
             PaintType.CAR_SPEC: bucket_dir / "car_spec.mip",
@@ -4351,14 +4356,35 @@ def archive_saved_tp_sets_to_random_pool(
         }
         copied_any = False
         copied_labels: list[str] = []
-        for paint_type, destination in mapping.items():
-            source_path = file_map.get(paint_type)
-            if source_path is None or not source_path.exists() or destination.exists():
-                continue
-            shutil.copy2(source_path, destination)
-            added_files += 1
-            copied_any = True
-            copied_labels.append(f"{paint_type.value} -> {destination.name}")
+        try:
+            bucket_dir.mkdir(parents=True, exist_ok=True)
+            meta_path = bucket_dir / "meta.json"
+            if not meta_path.exists():
+                _write_random_pool_file_atomically(
+                    meta_path,
+                    text=json.dumps({
+                        "directory": directory,
+                        "source_hash": source_hash,
+                        "source_path": str(source_anchor),
+                        "cached_at": time.time(),
+                        "target_id": int(target_id),
+                        "is_team_paint": bool(is_team),
+                    }, indent=2, ensure_ascii=False),
+                )
+            for paint_type, destination in mapping.items():
+                source_path = file_map.get(paint_type)
+                if source_path is None or not source_path.exists() or destination.exists():
+                    continue
+                # A file in the pool counts as complete because it exists, so a copy
+                # cut short by a full disk or a shutdown must never get the final name.
+                _write_random_pool_file_atomically(destination, source=source_path)
+                added_files += 1
+                copied_any = True
+                copied_labels.append(f"{paint_type.value} -> {destination.name}")
+        except Exception as exc:  # noqa: BLE001
+            # The pool is an optional cache: a failed set is skipped, never the session.
+            logging.warning("Random pool could not cache TP assets for %s on %s: %s", target_id, directory, exc)
+            continue
         if copied_any or any(dest.exists() for dest in mapping.values()):
             added_sets += 1
             target_label = f"team {target_id}" if is_team else f"user {target_id}"
@@ -4525,12 +4551,30 @@ def _copy_source_file_to_saved_targets(source_path: Path | None, session_id: Ses
         return []
     saved: list[SavedFile] = []
     for destination in save_paths_for(download_id, paints_dir):
-        destination.parent.mkdir(parents=True, exist_ok=True)
         temp_destination = destination.with_name(destination.name + ".tmp")
-        temp_destination.unlink(missing_ok=True)
-        shutil.copy2(source_path, temp_destination)
-        remember_previous_paint_file(destination, session_id, download_id)
-        os.replace(temp_destination, destination)
+        try:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            temp_destination.unlink(missing_ok=True)
+            shutil.copy2(source_path, temp_destination)
+            remember_previous_paint_file(destination, session_id, download_id)
+            # iRacing can hold a paint file open while it reloads textures, the same
+            # case move_or_extract retries for.
+            for attempt in range(1, 4):
+                try:
+                    os.replace(temp_destination, destination)
+                    break
+                except OSError as exc:
+                    if attempt >= 3 or not _should_retry_save_exception(exc):
+                        raise
+                    time.sleep(0.3 * attempt)
+        except Exception as exc:  # noqa: BLE001
+            # One locked or unwritable file must not end the whole session pass.
+            try:
+                temp_destination.unlink(missing_ok=True)
+            except OSError:
+                pass
+            logging.warning("Could not save %s from %s: %s", destination, source_path, exc)
+            continue
         saved.append(SavedFile(session_id=session_id, download_id=download_id, file_path=destination))
     return saved
 
@@ -4661,9 +4705,9 @@ def _normalize_random_paint_preference_entry(entry: dict[str, object]) -> dict[s
         "title": str(entry.get("title") or "").strip(),
         "source_link": _normalize_tp_showroom_link(entry.get("source_link"), entry.get("title") or ""),
         "source": source or ("random_pool" if source_type == "local" else "fallback_online"),
-        "created_at": float(entry.get("created_at") or time.time()),
-        "last_used_at": float(entry.get("last_used_at") or 0.0),
-        "use_count": max(0, int(entry.get("use_count") or 0)),
+        "created_at": _number_or_default(entry.get("created_at") or time.time(), time.time()),
+        "last_used_at": _number_or_default(entry.get("last_used_at") or 0.0, 0.0),
+        "use_count": max(0, int(_number_or_default(entry.get("use_count") or 0, 0))),
     }
 
 def _empty_random_paint_preferences() -> dict[str, object]:
@@ -4916,7 +4960,7 @@ def _normalize_driver_paint_override_entry(entry: dict[str, object]) -> dict[str
         "title": str(entry.get("title") or "").strip(),
         "source_link": str(entry.get("source_link") or "").strip(),
         "source": str(entry.get("source") or "manual").strip() or "manual",
-        "assigned_at": float(entry.get("assigned_at") or time.time()),
+        "assigned_at": _number_or_default(entry.get("assigned_at") or time.time(), time.time()),
     }
 
 def load_driver_paint_overrides(path: Path | None = None) -> dict[str, dict[str, object]]:
@@ -14169,7 +14213,11 @@ def apply_tp_collection_pool_fallbacks(
                 f"but the primary public asset was unavailable."
             )
             return False
-        archive_saved_to_tp_collection_pool(saved_items, collection_pool_dir, collection_id, kind, user.directory, scheme_id, title)
+        try:
+            archive_saved_to_tp_collection_pool(saved_items, collection_pool_dir, collection_id, kind, user.directory, scheme_id, title)
+        except Exception as exc:  # noqa: BLE001
+            # The paint is already in place; only the cache for next time is missing.
+            logs.append(f"Trading Paints collection pool could not cache {kind} scheme {scheme_id}: {exc}")
         _record_saved(saved_items)
         summary.applied_targets += 1
         logs.append(
@@ -14369,20 +14417,25 @@ def apply_tp_showroom_fallbacks_public(
             chosen_scheme_id = str(result.chosen_scheme_id or "").strip()
             if chosen_scheme_id:
                 used_showroom_scheme_ids.add(chosen_scheme_id)
-            saved_items = _download_and_save_direct_showroom_accessory_result(
-                session=session,
-                user=user,
-                result=result,
-                accessory_kind=normalized_kind,
-                temp_dir=temp_root,
-                paints_dir=paints_dir,
-                retries=retries,
-                retry_backoff_seconds=retry_backoff_seconds,
-                source_label="fallback_online",
-                preserve_on_cleanup=False,
-                log=logs.append,
-                cancel_event=cancel_event,
-            )
+            try:
+                saved_items = _download_and_save_direct_showroom_accessory_result(
+                    session=session,
+                    user=user,
+                    result=result,
+                    accessory_kind=normalized_kind,
+                    temp_dir=temp_root,
+                    paints_dir=paints_dir,
+                    retries=retries,
+                    retry_backoff_seconds=retry_backoff_seconds,
+                    source_label="fallback_online",
+                    preserve_on_cleanup=False,
+                    log=logs.append,
+                    cancel_event=cancel_event,
+                )
+            except Exception as exc:  # noqa: BLE001
+                # A disk or file-lock error is one failed paint, not a failed session pass.
+                logs.append(f"Public showroom {normalized_kind} for {label} could not be saved: {exc}")
+                saved_items = []
             if not saved_items:
                 logs.append(
                     f"Public showroom paint {chosen_scheme_id or '(unknown)'} for {label} {normalized_kind} was unavailable or could not be saved; trying another paint."
@@ -14554,19 +14607,23 @@ def apply_tp_showroom_fallbacks_public(
                     chosen_scheme_id = str(result.chosen_scheme_id or "").strip()
                     if chosen_scheme_id:
                         used_showroom_scheme_ids.add(chosen_scheme_id)
-                    saved_items = _download_and_save_direct_showroom_car_result(
-                        session=session,
-                        user=user,
-                        result=result,
-                        temp_dir=temp_root,
-                        paints_dir=paints_dir,
-                        retries=retries,
-                        retry_backoff_seconds=retry_backoff_seconds,
-                        source_label="fallback_online",
-                        preserve_on_cleanup=False,
-                        log=logs.append,
-                        cancel_event=cancel_event,
-                    )
+                    try:
+                        saved_items = _download_and_save_direct_showroom_car_result(
+                            session=session,
+                            user=user,
+                            result=result,
+                            temp_dir=temp_root,
+                            paints_dir=paints_dir,
+                            retries=retries,
+                            retry_backoff_seconds=retry_backoff_seconds,
+                            source_label="fallback_online",
+                            preserve_on_cleanup=False,
+                            log=logs.append,
+                            cancel_event=cancel_event,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logs.append(f"Public showroom car for {label} on {user.directory} could not be saved: {exc}")
+                        saved_items = []
                     if not saved_items:
                         logs.append(
                             f"Public showroom paint {chosen_scheme_id or '(unknown)'} for {label} on {user.directory} was unavailable or could not be saved; trying another paint."
@@ -14611,6 +14668,9 @@ def apply_tp_showroom_fallbacks_public(
                     applied_items_for_target=applied_items_for_target,
                 )
 
+            if _cancel_requested(cancel_event):
+                logs.append("Trading Paints public showroom fallback cancelled because the iRacing session changed or ended.")
+                break
             if car_still_needs_local or helmet_still_needs_local or suit_still_needs_local:
                 local_saved, item_logs, reused_existing_source = _apply_local_tp_random_fallback_assets_for_user(
                     session=session,
@@ -18189,11 +18249,28 @@ def restore_replay_pack_for_session(
             except Exception:
                 continue
             destination = paints_root / relative_path
-            destination.parent.mkdir(parents=True, exist_ok=True)
             temp_destination = destination.with_name(destination.name + '.tmp')
-            temp_destination.unlink(missing_ok=True)
-            shutil.copy2(source_path, temp_destination)
-            os.replace(temp_destination, destination)
+            try:
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                temp_destination.unlink(missing_ok=True)
+                shutil.copy2(source_path, temp_destination)
+                for attempt in range(1, 4):
+                    try:
+                        os.replace(temp_destination, destination)
+                        break
+                    except OSError as exc:
+                        if attempt >= 3 or not _should_retry_save_exception(exc):
+                            raise
+                        time.sleep(0.3 * attempt)
+            except Exception as exc:  # noqa: BLE001
+                # This runs on the service loop: one file iRacing holds open must not
+                # crash it and restart the restore in a loop.
+                try:
+                    temp_destination.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                logging.warning("Could not restore replay pack file %s: %s", destination, exc)
+                continue
             restored.append(SavedFile(session_id=session.session_id, download_id=download_id, file_path=destination))
         if restored:
             restored.sort(key=lambda s: (s.download_id.is_team_paint, s.download_id.user_id, s.download_id.directory.lower(), s.download_id.paint_type.value))
@@ -19275,14 +19352,21 @@ def process_session(
             pool_saved = filtered_pool_saved
             if skipped_local_pool:
                 logging.info("Random TP pool skipped the local user's own saved files to avoid caching a temporary showroom-swapped livery.")
-        archived_sets, archived_files, archived_logs, pool_bytes_after, pool_freed_bytes = archive_saved_tp_sets_to_random_pool(
-            pool_saved,
-            random_pool_dir,
-            max_random_pool_gb,
-            max_pool_car_gb=max_random_pool_car_gb,
-            max_pool_helmet_gb=max_random_pool_helmet_gb,
-            max_pool_suit_gb=max_random_pool_suit_gb,
-        )
+        try:
+            archived_sets, archived_files, archived_logs, pool_bytes_after, pool_freed_bytes = archive_saved_tp_sets_to_random_pool(
+                pool_saved,
+                random_pool_dir,
+                max_random_pool_gb,
+                max_pool_car_gb=max_random_pool_car_gb,
+                max_pool_helmet_gb=max_random_pool_helmet_gb,
+                max_pool_suit_gb=max_random_pool_suit_gb,
+            )
+        except Exception as exc:  # noqa: BLE001
+            # Raising here would crash the service loop after every paint of this pass
+            # was saved, so none of them would be tracked for cleanup.
+            logging.warning("Random TP pool update failed; the session paints are unaffected: %s", exc)
+            logging.debug("Random TP pool traceback\n%s", traceback.format_exc())
+            archived_sets, archived_files, archived_logs, pool_bytes_after, pool_freed_bytes = 0, 0, [], 0, 0
         if archived_sets > 0:
             logging.info(
                 "Random TP pool updated with %s set(s) and %s file(s) after fallback resolution",
@@ -19559,6 +19643,11 @@ def start_session_cancel_monitor(
                     break
                 stop_event.wait(max(0.25, float(poll_seconds)))
         finally:
+            if stop_event.is_set() and not cancel_event.is_set():
+                # The service is stopping. The pass has to end too, so the files it
+                # saved so far reach the service's cleanup before the process exits.
+                cancel_event.set()
+                logging.info("Cancelling active paint pipeline because the service is stopping.")
             if owned_reader:
                 close_sdk_reader(monitor_reader)
 
@@ -21867,15 +21956,21 @@ class DownloaderService:
             next_replay_pack_scan_at = now + (REPLAY_PACK_ACTIVE_SCAN_SECONDS if active_capture_context else REPLAY_PACK_IDLE_SCAN_SECONDS)
             if not should_scan:
                 return
-            known_replay_files, replay_pack_index = sync_replay_packs_for_folder(
-                replay_dir=replay_dir,
-                replay_packs_dir=replay_packs_dir,
-                known_files=known_replay_files,
-                current_session=current_session_arg,
-                saved=saved_arg,
-                paints_root=paints_dir,
-                known_packs=replay_pack_index,
-            )
+            try:
+                known_replay_files, replay_pack_index = sync_replay_packs_for_folder(
+                    replay_dir=replay_dir,
+                    replay_packs_dir=replay_packs_dir,
+                    known_files=known_replay_files,
+                    current_session=current_session_arg,
+                    saved=saved_arg,
+                    paints_root=paints_dir,
+                    known_packs=replay_pack_index,
+                )
+            except Exception as exc:  # noqa: BLE001
+                # A crash here would run the loop's exit cleanup and delete every paint
+                # of the live session; a missed replay pack is the smaller loss.
+                logging.warning("Replay pack capture failed: %s", exc)
+                logging.debug("Replay pack capture traceback\n%s", traceback.format_exc())
             last_replay_dir_token = _replay_dir_change_token(replay_dir)
             next_replay_pack_full_scan_at = now + REPLAY_PACK_FULL_SCAN_SECONDS
         self._update_runtime_snapshot(current_session, last_saved, last_known_member_id, session_rows=session_rows, replay_mode_active=replay_mode_active)
