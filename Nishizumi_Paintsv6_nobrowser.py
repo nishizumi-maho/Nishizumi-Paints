@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import bz2
 import concurrent.futures
+import copy
 import html
 import json
 import logging
@@ -172,8 +173,15 @@ TRADING_PAINTS_SHOWROOM_COMPRESSED_URL = "https://showroom-assets.tradingpaints.
 TRADING_PAINTS_SHOWROOM_MIP_URL = "https://showroom-assets.tradingpaints.gg/mips/{asset_id}.mip"
 AI_SPECIAL_CAR_IDS_WITH_DEFAULT_DESIGN = {27, 179}
 AI_ROSTER_META_FILENAME = ".nishizumi_ai_roster.json"
+AI_ROSTER_REPLACED_SUFFIX = ".nishizumi-replaced"
 AI_ROSTER_OPTIONAL_UNAVAILABLE_SUFFIX = ".unavailable"
 AI_ROSTER_OPTIONAL_UNAVAILABLE_TTL_SECONDS = 24 * 60 * 60
+# An existing optional asset (a spec map) is checked against Trading Paints at most
+# this often. Every app start used to send one request per existing spec map.
+AI_ROSTER_OPTIONAL_PROBE_SECONDS = 24 * 60 * 60
+AI_ROSTER_PROBE_STATE_FILENAME = ".nishizumi_ai_roster_probes.json"
+# A failed roster sync is tried again after this long instead of never.
+AI_ROSTER_SYNC_RETRY_SECONDS = 10 * 60
 AI_LOCAL_ROSTER_SUFFIX = " (local)"
 AI_RANDOM_ROSTER_SUFFIX = " (random)"
 AI_GENERIC_RANDOM_ROSTER_NAME = "Nishizumi Random AI - Current"
@@ -2201,6 +2209,9 @@ class AIRosterSyncResult:
     downloaded: int = 0
     failed: int = 0
     ai_rosters_dir: Path | None = None
+    # True when the roster list was read and every roster was handled, so the sync
+    # does not have to run again for this member.
+    completed: bool = False
 @dataclass
 class IracingSdkReader:
     sdk: object
@@ -15449,7 +15460,8 @@ def _cleanup_ai_roster_dirs(ai_rosters_dir: Path) -> None:
     for child in ai_rosters_dir.iterdir():
         if not child.is_dir():
             continue
-        if (child / "roster.json").exists():
+        leftover_swap = child.name.endswith(AI_ROSTER_REPLACED_SUFFIX) and (child / AI_ROSTER_META_FILENAME).exists()
+        if (child / "roster.json").exists() and not leftover_swap:
             continue
         # Only folders this app made (they carry its metadata file, or are a staging
         # folder) or empty ones. A backup or half-built roster of the user's own stays.
@@ -15475,13 +15487,50 @@ def _write_ai_roster_metadata(roster_dir: Path, roster: AIWebRosterItem | None =
         "source_roster_id": str(source_roster_id or ''),
         "source_name": str(source_name or ''),
     }
-    (roster_dir / AI_ROSTER_META_FILENAME).write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    _write_text_if_changed(roster_dir / AI_ROSTER_META_FILENAME, json.dumps(payload, indent=2, ensure_ascii=False))
+def _write_text_if_changed(path: Path, text: str) -> bool:
+    """Replace a small text file in one step, and leave it alone when nothing changed.
+
+    iRacing can read roster.json while a sync writes it; a write in place could hand
+    it a half-written file, and rewriting an unchanged file only moved its date.
+    """
+    data = text.encode("utf-8")
+    try:
+        if path.read_bytes() == data:
+            return False
+    except OSError:
+        pass
+    temp_path = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temp_path.write_bytes(data)
+        os.replace(temp_path, path)
+    finally:
+        temp_path.unlink(missing_ok=True)
+    return True
+_AI_ROSTER_PAYLOAD_CACHE_LOCK = threading.Lock()
+_AI_ROSTER_PAYLOAD_CACHE: dict[str, tuple[tuple[int, int], dict[str, list[dict]]]] = {}
 def _read_ai_roster_payload(roster_dir: Path) -> tuple[dict[str, list[dict]], list[dict]]:
-    payload = json.loads((roster_dir / "roster.json").read_text(encoding="utf-8"))
+    # Parsed rosters are kept by file size and time: the manifest stage reads the
+    # active roster once per AI driver, and unnamed AI sessions scored every roster
+    # again for each driver.
+    roster_file = roster_dir / "roster.json"
+    stat_result = roster_file.stat()
+    signature = (int(stat_result.st_mtime_ns), int(stat_result.st_size))
+    cache_key = os.path.normcase(os.path.abspath(str(roster_file)))
+    with _AI_ROSTER_PAYLOAD_CACHE_LOCK:
+        cached = _AI_ROSTER_PAYLOAD_CACHE.get(cache_key)
+    if cached is not None and cached[0] == signature:
+        normalized_drivers = copy.deepcopy(cached[1]["drivers"])
+        return {"drivers": normalized_drivers}, normalized_drivers
+    payload = json.loads(roster_file.read_text(encoding="utf-8"))
     drivers = payload.get('drivers') if isinstance(payload, dict) else None
     if not isinstance(drivers, list):
         raise ValueError("AI roster JSON did not contain a drivers list")
     normalized_drivers = [_normalize_ai_driver_entry(driver) for driver in drivers if isinstance(driver, dict)]
+    with _AI_ROSTER_PAYLOAD_CACHE_LOCK:
+        if len(_AI_ROSTER_PAYLOAD_CACHE) > 256:
+            _AI_ROSTER_PAYLOAD_CACHE.clear()
+        _AI_ROSTER_PAYLOAD_CACHE[cache_key] = (signature, {"drivers": copy.deepcopy(normalized_drivers)})
     return {"drivers": normalized_drivers}, normalized_drivers
 def _ai_roster_asset_id_from_filename(filename: str) -> str | None:
     name = Path(str(filename or '').strip()).name
@@ -15572,13 +15621,24 @@ def _iter_ai_roster_asset_specs(drivers: list[dict]) -> list[tuple[str, str, str
                     seen.add(spec_filename.lower())
                     specs.append((spec_filename, _ai_roster_asset_url(asset_id, spec_filename), "car_spec", True))
     return specs
-def _download_ai_roster_asset(roster_dir: Path, filename: str, url: str, optional: bool, retries: int, retry_backoff_seconds: float) -> str:
+def _download_ai_roster_asset(
+    roster_dir: Path,
+    filename: str,
+    url: str,
+    optional: bool,
+    retries: int,
+    retry_backoff_seconds: float,
+    probe_existing: bool = True,
+    cancel_event: threading.Event | None = None,
+) -> str:
+    if _cancel_requested(cancel_event):
+        return "cancelled"
     destination = safe_join_under(roster_dir, Path(filename).name)
     if optional and _ai_roster_asset_marked_unavailable(roster_dir, filename):
         return "optional_unavailable"
     try:
         if destination.exists() and destination.stat().st_size > 0:
-            if optional:
+            if optional and probe_existing:
                 status_code = _probe_optional_ai_roster_asset_status(url)
                 if isinstance(status_code, int) and status_code in TP_UNAVAILABLE_DOWNLOAD_STATUS_CODES:
                     _mark_ai_roster_asset_unavailable(roster_dir, filename, url, status_code)
@@ -15637,17 +15697,53 @@ def _download_ai_roster_asset(roster_dir: Path, filename: str, url: str, optiona
         return "optional_unavailable"
     logging.warning("AI roster asset %s could not be synced from %s: %s", filename, url, last_exc)
     return "failed"
-def sync_ai_roster_collection_assets(roster_dir: Path, drivers: list[dict], retries: int, retry_backoff_seconds: float) -> tuple[int, int, int, int]:
+def _load_ai_roster_probe_state(roster_dir: Path) -> dict[str, float]:
+    try:
+        raw = json.loads((roster_dir / AI_ROSTER_PROBE_STATE_FILENAME).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    state: dict[str, float] = {}
+    for name, value in raw.items():
+        number = _number_or_default(value, 0.0)
+        if number > 0:
+            state[str(name)] = number
+    return state
+def sync_ai_roster_collection_assets(
+    roster_dir: Path,
+    drivers: list[dict],
+    retries: int,
+    retry_backoff_seconds: float,
+    cancel_event: threading.Event | None = None,
+) -> tuple[int, int, int, int]:
     specs = _iter_ai_roster_asset_specs(drivers)
     if not specs:
         return 0, 0, 0, 0
     counts = Counter()
     worker_count = max(1, min(16, len(specs)))
+    probe_state = _load_ai_roster_probe_state(roster_dir)
+    now = time.time()
+    probed_names: set[str] = set()
     with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
-        future_to_spec = {
-            executor.submit(_download_ai_roster_asset, roster_dir, filename, url, optional, retries, retry_backoff_seconds): (filename, url, optional)
-            for filename, url, _kind, optional in specs
-        }
+        future_to_spec = {}
+        for filename, url, _kind, optional in specs:
+            name = Path(filename).name
+            probe_due = now - probe_state.get(name, 0.0) >= AI_ROSTER_OPTIONAL_PROBE_SECONDS
+            if optional and probe_due:
+                probed_names.add(name)
+            future = executor.submit(
+                _download_ai_roster_asset,
+                roster_dir,
+                filename,
+                url,
+                optional,
+                retries,
+                retry_backoff_seconds,
+                probe_due,
+                cancel_event,
+            )
+            future_to_spec[future] = (filename, url, optional)
         for future in concurrent.futures.as_completed(future_to_spec):
             try:
                 counts[future.result()] += 1
@@ -15655,6 +15751,13 @@ def sync_ai_roster_collection_assets(roster_dir: Path, drivers: list[dict], retr
                 filename, url, optional = future_to_spec[future]
                 counts["optional_unavailable" if optional else "failed"] += 1
                 logging.warning("AI roster asset worker failed for %s from %s: %s", filename, url, exc)
+    if probed_names and not _cancel_requested(cancel_event):
+        for name in probed_names:
+            probe_state[name] = now
+        try:
+            _write_text_if_changed(roster_dir / AI_ROSTER_PROBE_STATE_FILENAME, json.dumps(probe_state, indent=2, sort_keys=True))
+        except OSError:
+            logging.debug("Could not save the AI roster probe times for %s", roster_dir, exc_info=True)
     downloaded = int(counts.get("downloaded", 0))
     existing = int(counts.get("existing", 0))
     optional_unavailable = int(counts.get("optional_unavailable", 0))
@@ -15751,11 +15854,10 @@ def _infer_active_ai_roster_dir_from_session(session: Session, ai_rosters_dir: P
         exact_matches, name_matches, index_matches, total_ai = _score_ai_roster_against_session(session, drivers)
         if exact_matches < exact_threshold and name_matches < name_threshold:
             continue
-        try:
-            freshness = float((child / "roster.json").stat().st_mtime)
-        except OSError:
-            freshness = 0.0
-        candidate = (exact_matches, name_matches, index_matches, freshness, child)
+        # Ties go to a local copy the user made, then by folder name. The roster.json
+        # time used before changed with every sync, so the pick flipped on its own.
+        preference = 1 if _ai_roster_dir_is_local(child) else 0
+        candidate = (exact_matches, name_matches, index_matches, preference, child)
         if _ai_roster_dir_is_generated_random(child):
             generated_candidates.append(candidate)
         else:
@@ -15763,7 +15865,7 @@ def _infer_active_ai_roster_dir_from_session(session: Session, ai_rosters_dir: P
     candidates = regular_candidates or generated_candidates
     if not candidates:
         return None
-    candidates.sort(key=lambda item: (item[0], item[1], item[2], item[3]), reverse=True)
+    candidates.sort(key=lambda item: (-item[0], -item[1], -item[2], -item[3], item[4].name.casefold()))
     return candidates[0][4]
 def _find_roster_driver_for_session_ai(user: SessionUser, drivers: list[dict]) -> dict | None:
     user_name = _normalize_ai_match_text(user.display_name)
@@ -16133,8 +16235,8 @@ def _build_ai_roster_notes(drivers: list[dict]) -> str:
 def _write_ai_roster_files(roster_dir: Path, canonical_payload: dict[str, list[dict]], drivers: list[dict], roster: AIWebRosterItem | None = None, *, is_local: bool = False, source_roster_id: str = "", source_name: str = "") -> None:
     roster_dir.mkdir(parents=True, exist_ok=True)
     roster_json = json.dumps(canonical_payload, indent=2, ensure_ascii=False)
-    (roster_dir / "roster.json").write_text(roster_json, encoding="utf-8")
-    (roster_dir / "notes.txt").write_text(_build_ai_roster_notes(drivers), encoding="utf-8")
+    _write_text_if_changed(roster_dir / "roster.json", roster_json)
+    _write_text_if_changed(roster_dir / "notes.txt", _build_ai_roster_notes(drivers))
     _write_ai_roster_metadata(roster_dir, roster, is_local=is_local, source_roster_id=source_roster_id, source_name=source_name)
 def fetch_ai_roster_list(member_id: int, retries: int, retry_backoff_seconds: float) -> list[AIWebRosterItem]:
     url = TRADING_PAINTS_COLLECTIONS_URL.format(member_id=member_id)
@@ -16184,7 +16286,14 @@ def fetch_ai_roster_json(roster: AIWebRosterItem, retries: int, retry_backoff_se
     if last_exc is not None:
         raise last_exc
     return None
-def sync_ai_rosters(member_id: int, ai_rosters_dir: Path, retries: int, retry_backoff_seconds: float, do_cleanup: bool = True) -> AIRosterSyncResult:
+def sync_ai_rosters(
+    member_id: int,
+    ai_rosters_dir: Path,
+    retries: int,
+    retry_backoff_seconds: float,
+    do_cleanup: bool = True,
+    cancel_event: threading.Event | None = None,
+) -> AIRosterSyncResult:
     result = AIRosterSyncResult(member_id=member_id, ai_rosters_dir=ai_rosters_dir)
     ai_rosters_dir.mkdir(parents=True, exist_ok=True)
     started_at = time.monotonic()
@@ -16193,8 +16302,12 @@ def sync_ai_rosters(member_id: int, ai_rosters_dir: Path, retries: int, retry_ba
         result.discovered = len(rosters)
         if not rosters:
             logging.info("AI roster sync found no Trading Paints AI carsets for member %s", member_id)
+            result.completed = True
             return result
         for item in rosters:
+            if _cancel_requested(cancel_event):
+                logging.info("AI roster sync stopped because the service is stopping.")
+                return result
             try:
                 raw_json = fetch_ai_roster_json(item, retries=retries, retry_backoff_seconds=retry_backoff_seconds)
                 if not raw_json:
@@ -16215,12 +16328,14 @@ def sync_ai_rosters(member_id: int, ai_rosters_dir: Path, retries: int, retry_ba
                     drivers=drivers,
                     retries=retries,
                     retry_backoff_seconds=retry_backoff_seconds,
+                    cancel_event=cancel_event,
                 )
                 result.downloaded += 1
                 logging.info("AI roster synced: %s (%s drivers)", item.name, len(drivers))
             except Exception as exc:  # noqa: BLE001
                 result.failed += 1
                 logging.warning("AI roster sync failed for %s: %s", item.name, exc)
+        result.completed = not _cancel_requested(cancel_event)
         return result
     except Exception as exc:  # noqa: BLE001
         logging.warning("AI roster sync failed for member %s: %s", member_id, exc)
@@ -16394,10 +16509,24 @@ def randomize_active_ai_roster_from_pool(
             source_roster_id=session.ai_roster_id,
             source_name=session.ai_roster_name or base_name,
         )
+        # Move the old roster aside and swap the new one in; if that fails part-way
+        # (iRacing holding a file), the old roster comes back instead of being lost.
+        backup_dir = ai_rosters_dir / f"{target_dir.name}{AI_ROSTER_REPLACED_SUFFIX}"
+        if backup_dir.exists():
+            _reset_generated_ai_roster_dir(ai_rosters_dir, backup_dir)
+            backup_dir.rmdir()
+        moved_old = False
         if target_dir.exists():
-            _reset_generated_ai_roster_dir(ai_rosters_dir, target_dir)
-            target_dir.rmdir()
-        staging_dir.rename(target_dir)
+            target_dir.rename(backup_dir)
+            moved_old = True
+        try:
+            staging_dir.rename(target_dir)
+        except Exception:
+            if moved_old and not target_dir.exists():
+                backup_dir.rename(target_dir)
+            raise
+        if moved_old:
+            shutil.rmtree(backup_dir, ignore_errors=True)
     except Exception as exc:  # noqa: BLE001
         shutil.rmtree(staging_dir, ignore_errors=True)
         return False, f"Could not create randomized AI roster '{random_name}': {exc}"
@@ -22250,6 +22379,30 @@ class DownloaderService:
         last_known_member_id: int | None = None
         last_known_team_id: int | None = None
         last_ai_roster_sync_member_id: int | None = None
+        # A sync that did not finish is tried again later; it used to count as done
+        # for the whole life of the service.
+        ai_roster_sync_retry_at = 0.0
+
+        def _run_ai_roster_sync(member_id_for_roster_sync: int, config_for_sync: AppConfig) -> bool:
+            nonlocal ai_roster_sync_retry_at
+            self._set_status("Syncing AI rosters")
+            try:
+                result = sync_ai_rosters(
+                    member_id=member_id_for_roster_sync,
+                    ai_rosters_dir=default_ai_rosters_dir(config_for_sync),
+                    retries=positive_int(config_for_sync.retries, 3),
+                    retry_backoff_seconds=max(config_for_sync.retry_backoff_seconds, 0.1),
+                    do_cleanup=True,
+                    cancel_event=self._stop_event,
+                )
+            finally:
+                self._set_status("Watching")
+            if result.completed:
+                return True
+            ai_roster_sync_retry_at = time.monotonic() + AI_ROSTER_SYNC_RETRY_SECONDS
+            if not self._stop_event.is_set():
+                logging.info("AI roster sync did not finish; it is tried again in %s minutes.", AI_ROSTER_SYNC_RETRY_SECONDS // 60)
+            return False
         last_poll_state: SdkPollState | None = None
         replay_mode_active = False
         known_replay_files = _snapshot_replay_files(replay_dir)
@@ -22349,34 +22502,18 @@ class DownloaderService:
                     )
                     if member_id_for_sync is None or member_id_for_sync <= 0:
                         logging.info("Manual AI roster sync requested, but no iRacing member ID is known yet. Fill the AI roster member ID in the AI tab or join any iRacing session first.")
-                    else:
-                        self._set_status("Syncing AI rosters")
-                        sync_ai_rosters(
-                            member_id=member_id_for_sync,
-                            ai_rosters_dir=default_ai_rosters_dir(config),
-                            retries=positive_int(config.retries, 3),
-                            retry_backoff_seconds=max(config.retry_backoff_seconds, 0.1),
-                            do_cleanup=True,
-                        )
+                    elif _run_ai_roster_sync(member_id_for_sync, config):
                         last_ai_roster_sync_member_id = member_id_for_sync
-                        self._set_status("Watching")
                 ai_roster_override_member_id = normalize_tp_member_id(getattr(config, "ai_roster_member_id_override", 0))
                 if (
                     config.sync_ai_rosters_from_server
                     and ai_roster_override_member_id > 0
                     and last_ai_roster_sync_member_id != ai_roster_override_member_id
+                    and time.monotonic() >= ai_roster_sync_retry_at
                 ):
-                    self._set_status("Syncing AI rosters")
                     logging.info("AI roster sync using configured AI tab member ID %s", ai_roster_override_member_id)
-                    sync_ai_rosters(
-                        member_id=ai_roster_override_member_id,
-                        ai_rosters_dir=default_ai_rosters_dir(config),
-                        retries=positive_int(config.retries, 3),
-                        retry_backoff_seconds=max(config.retry_backoff_seconds, 0.1),
-                        do_cleanup=True,
-                    )
-                    last_ai_roster_sync_member_id = ai_roster_override_member_id
-                    self._set_status("Watching")
+                    if _run_ai_roster_sync(ai_roster_override_member_id, config):
+                        last_ai_roster_sync_member_id = ai_roster_override_member_id
                 if self._global_texture_reload_event.is_set():
                     self._global_texture_reload_event.clear()
                     if sdk_reader is None:
@@ -22484,17 +22621,10 @@ class DownloaderService:
                     and member_id_for_auto_ai_sync is not None
                     and member_id_for_auto_ai_sync > 0
                     and last_ai_roster_sync_member_id != member_id_for_auto_ai_sync
+                    and time.monotonic() >= ai_roster_sync_retry_at
                 ):
-                    self._set_status("Syncing AI rosters")
-                    sync_ai_rosters(
-                        member_id=member_id_for_auto_ai_sync,
-                        ai_rosters_dir=default_ai_rosters_dir(config),
-                        retries=positive_int(config.retries, 3),
-                        retry_backoff_seconds=max(config.retry_backoff_seconds, 0.1),
-                        do_cleanup=True,
-                    )
-                    last_ai_roster_sync_member_id = member_id_for_auto_ai_sync
-                    self._set_status("Watching")
+                    if _run_ai_roster_sync(member_id_for_auto_ai_sync, config):
+                        last_ai_roster_sync_member_id = member_id_for_auto_ai_sync
                 current_fingerprint = session.fingerprint()
                 current_user_map = _session_user_map(session)
                 replay_mode_active = bool(
@@ -27564,22 +27694,34 @@ class DownloaderUI:
     def copy_session_cars_to_ai(self) -> None:
         self._copy_saved_paints_to_ai(False)
     def clone_active_ai_roster(self) -> None:
-        snapshot = self.service.get_runtime_snapshot()
-        success, message = clone_active_ai_roster_to_local(snapshot.current_session, default_ai_rosters_dir(self.config))
-        self._append_log(message)
-        if success:
-            self.status_var.set("Local AI roster created")
-    def randomize_active_ai_roster(self) -> None:
-        snapshot = self.service.get_runtime_snapshot()
-        success, message = randomize_active_ai_roster_from_pool(
-            snapshot.current_session,
-            default_ai_rosters_dir(self.config),
-            default_random_pool_dir(),
-            default_ai_livery_dir(),
+        session = self.service.get_runtime_snapshot().current_session
+        rosters_dir = default_ai_rosters_dir(self.config)
+
+        def _done(result: object, error: BaseException | None) -> None:
+            success, message = result if error is None else (False, f"Could not create a local AI roster: {error}")  # type: ignore[misc]
+            self._append_log(message)
+            if success:
+                self.status_var.set("Local AI roster created")
+
+        self._run_ui_task(
+            "ai_roster", "Local AI roster copy", lambda: clone_active_ai_roster_to_local(session, rosters_dir), _done
         )
-        self._append_log(message)
-        if success:
-            self.status_var.set("Random AI roster created")
+    def randomize_active_ai_roster(self) -> None:
+        session = self.service.get_runtime_snapshot().current_session
+        rosters_dir = default_ai_rosters_dir(self.config)
+
+        def _done(result: object, error: BaseException | None) -> None:
+            success, message = result if error is None else (False, f"Could not randomize the AI roster: {error}")  # type: ignore[misc]
+            self._append_log(message)
+            if success:
+                self.status_var.set("Random AI roster created")
+
+        self._run_ui_task(
+            "ai_roster",
+            "AI roster randomization",
+            lambda: randomize_active_ai_roster_from_pool(session, rosters_dir, default_random_pool_dir(), default_ai_livery_dir()),
+            _done,
+        )
     def open_ai_rosters_folder(self) -> None:
         path = default_ai_rosters_dir(self.config)
         path.mkdir(parents=True, exist_ok=True)
@@ -29102,26 +29244,74 @@ class DownloaderUI:
         except Exception as exc:
             self._append_log(f"Random pool cleanup failed: {exc}")
         self._refresh_random_pool_summary(force=True)
+    def _run_ui_task(
+        self,
+        key: str,
+        label: str,
+        work: Callable[[], object],
+        done: Callable[[object, BaseException | None], None],
+    ) -> None:
+        """Run file-heavy work for a button off the Tk thread, then report back on it.
+
+        Rebuilding the pool, cloning or randomizing a roster copied and hashed files
+        inside the click handler, and the window froze until it finished.
+        """
+        in_progress: set[str] = self.__dict__.setdefault("_ui_tasks_in_progress", set())
+        if key in in_progress:
+            self._append_log(f"{label} is already running.")
+            return
+        in_progress.add(key)
+        self._append_log(f"{label} started.")
+
+        def _worker() -> None:
+            result: object = None
+            error: BaseException | None = None
+            try:
+                result = work()
+            except Exception as exc:  # noqa: BLE001
+                error = exc
+                logging.debug("%s failed", label, exc_info=True)
+
+            def _finish() -> None:
+                in_progress.discard(key)
+                done(result, error)
+
+            try:
+                self.root.after(0, _finish)
+            except Exception:
+                in_progress.discard(key)
+
+        threading.Thread(target=_worker, name=f"NishizumiUiTask-{key}", daemon=True).start()
+
     def rebuild_random_pool_now(self) -> None:
-        try:
-            added_sets, added_files, pool_bytes_after, pool_freed_bytes = rebuild_random_pool_from_paints_root(
-                default_paints_dir(self.config),
+        config = self.config
+        paints_root = default_paints_dir(config)
+
+        def _work() -> object:
+            return rebuild_random_pool_from_paints_root(
+                paints_root,
                 default_random_pool_dir(),
-                getattr(self.config, "max_random_pool_gb", 5.0),
-                max_pool_car_gb=getattr(self.config, "max_random_pool_car_gb", 3.0),
-                max_pool_helmet_gb=getattr(self.config, "max_random_pool_helmet_gb", 1.0),
-                max_pool_suit_gb=getattr(self.config, "max_random_pool_suit_gb", 1.0),
+                getattr(config, "max_random_pool_gb", 5.0),
+                max_pool_car_gb=getattr(config, "max_random_pool_car_gb", 3.0),
+                max_pool_helmet_gb=getattr(config, "max_random_pool_helmet_gb", 1.0),
+                max_pool_suit_gb=getattr(config, "max_random_pool_suit_gb", 1.0),
             )
-            self._append_log(
-                f"Random pool rebuild complete: added {added_sets} set(s) and {added_files} file(s) from current paint files. Pool now uses {pool_bytes_after / float(1024 ** 3):.2f} GB."
-            )
-            if pool_freed_bytes > 0:
+
+        def _done(result: object, error: BaseException | None) -> None:
+            if error is not None:
+                self._append_log(f"Random pool rebuild failed: {error}")
+            else:
+                added_sets, added_files, pool_bytes_after, pool_freed_bytes = result  # type: ignore[misc]
                 self._append_log(
-                    f"Random pool rebuild also trimmed {pool_freed_bytes / float(1024 ** 3):.2f} GB to stay within the configured limit."
+                    f"Random pool rebuild complete: added {added_sets} set(s) and {added_files} file(s) from current paint files. Pool now uses {pool_bytes_after / float(1024 ** 3):.2f} GB."
                 )
-        except Exception as exc:
-            self._append_log(f"Random pool rebuild failed: {exc}")
-        self._refresh_random_pool_summary(force=True)
+                if pool_freed_bytes > 0:
+                    self._append_log(
+                        f"Random pool rebuild also trimmed {pool_freed_bytes / float(1024 ** 3):.2f} GB to stay within the configured limit."
+                    )
+            self._refresh_random_pool_summary(force=True)
+
+        self._run_ui_task("rebuild_random_pool", "Random pool rebuild", _work, _done)
     def start_minimized(self) -> None:
         if self.minimize_to_tray_var.get():
             self.hide_to_background()

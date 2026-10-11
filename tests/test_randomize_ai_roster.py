@@ -178,10 +178,33 @@ class RandomizeActiveAiRosterTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("does not report an active AI roster", message)
 
+    def test_a_failed_swap_keeps_the_previous_random_roster(self):
+        self._add_pool_set("set_a")
+        self._add_pool_set("set_b")
+        ok, message = self._randomize(seed="first")
+        self.assertTrue(ok, message)
+        target = self.rosters / RANDOM_ROSTER
+        before = (target / "roster.json").read_bytes()
+        real_rename = Path.rename
+
+        def failing_rename(path, destination):
+            # iRacing holding a file in the new folder makes the final rename fail.
+            if str(path).endswith(".building"):
+                raise PermissionError(13, "locked")
+            return real_rename(path, destination)
+
+        with mock.patch.object(Path, "rename", failing_rename):
+            ok, _message = self._randomize(seed="second")
+        self.assertFalse(ok)
+        self.assertEqual((target / "roster.json").read_bytes(), before)
+        self.assertFalse((self.rosters / f"{RANDOM_ROSTER}{APP.AI_ROSTER_REPLACED_SUFFIX}").exists())
+
     def test_ui_button_handler_calls_defined_function(self):
         # Without the function behind it the button raised NameError.
         ui = mock.Mock()
         ui.service.get_runtime_snapshot.return_value = mock.Mock(current_session=self.session)
+        # The button runs the work off the Tk thread; run it right here instead.
+        ui._run_ui_task = lambda _key, _label, work, done: done(work(), None)
         with mock.patch.object(APP, "default_ai_rosters_dir", return_value=self.rosters), \
              mock.patch.object(APP, "default_random_pool_dir", return_value=self.pool), \
              mock.patch.object(APP, "default_ai_livery_dir", return_value=self.livery):
