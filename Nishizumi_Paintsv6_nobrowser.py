@@ -160,6 +160,7 @@ UPDATE_FAILED_AUTO_RETRY_SECONDS = 24 * 60 * 60
 # Manifest hosts, primary first. fetch.tradingpaints.gg is the host that answers;
 # dl.tradingpaints.com has been failing its TLS handshake since 7.3.4, so it is only
 # the backup, tried when the primary cannot be reached or keeps failing.
+TRADING_PAINTS_FETCH_USER_URL = "https://fetch.tradingpaints.gg/fetch_user.php"
 TRADING_PAINTS_FETCH_CONTEXT_URLS = (
     "https://fetch.tradingpaints.gg/fetch.php",
     "https://dl.tradingpaints.com/fetch.php",
@@ -3078,22 +3079,41 @@ def tp_fetch_context_urls() -> list[str]:
     ]
 
 
-def _note_tp_fetch_url_result(url: str, exc: BaseException | None) -> bool:
-    """Record how a manifest host answered. Returns True when the host could not be reached at all."""
+_TP_FETCH_HOST_UNREACHABLE_UNTIL: dict[str, float] = {}
+
+
+def _note_tp_fetch_url_result(url: str, exc: BaseException | None, exhausted: bool = False) -> bool:
+    """Record how a manifest host answered. Returns True when the host could not be reached at all.
+
+    ``exhausted`` means this failure used up the last retry on the host. A host that
+    answers with server errors or never answers in time then goes last as well;
+    before, every driver of a pass paid all its retries on it again.
+    """
     unreachable = isinstance(exc, requests.ConnectionError)
+    netloc = urllib.parse.urlsplit(url).netloc.lower()
     with _TP_FETCH_URL_DOWN_LOCK:
         if exc is None:
             _TP_FETCH_URL_DOWN_UNTIL.pop(url, None)
-        elif unreachable:
+            _TP_FETCH_HOST_UNREACHABLE_UNTIL.pop(netloc, None)
+        elif unreachable or exhausted:
             if _TP_FETCH_URL_DOWN_UNTIL.get(url, 0.0) <= time.monotonic():
                 logging.info(
-                    "Trading Paints manifest host %s could not be reached (%s); using the other host first for %.0f minutes.",
+                    "Trading Paints manifest host %s %s (%s); using the other host first for %.0f minutes.",
                     urllib.parse.urlsplit(url).netloc,
+                    "could not be reached" if unreachable else "kept failing",
                     type(exc).__name__,
                     TRADING_PAINTS_FETCH_HOST_DOWN_SECONDS / 60.0,
                 )
             _TP_FETCH_URL_DOWN_UNTIL[url] = time.monotonic() + TRADING_PAINTS_FETCH_HOST_DOWN_SECONDS
+            if unreachable:
+                _TP_FETCH_HOST_UNREACHABLE_UNTIL[netloc] = time.monotonic() + TRADING_PAINTS_FETCH_HOST_DOWN_SECONDS
     return unreachable
+
+
+def _tp_fetch_host_unreachable(netloc: str) -> bool:
+    """Whether a manifest host failed to connect within the last few minutes."""
+    with _TP_FETCH_URL_DOWN_LOCK:
+        return _TP_FETCH_HOST_UNREACHABLE_UNTIL.get(str(netloc).lower(), 0.0) > time.monotonic()
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -3971,7 +3991,7 @@ def fetch_user_files(
     cancel_event: threading.Event | None = None,
     superspeedway_variant: bool = False,
 ) -> list[DownloadFile]:
-    url = f"https://fetch.tradingpaints.gg/fetch_user.php?user={user_id}"
+    url = f"{TRADING_PAINTS_FETCH_USER_URL}?user={user_id}"
     if superspeedway_variant:
         url += "&ss=1"
     last_exc: Exception | None = None
@@ -4005,6 +4025,27 @@ def fetch_user_files(
 def _safe_random_pool_bucket(directory: str) -> str:
     bucket = normalize_directory(directory)
     return bucket or "unknown_car"
+# The largest real paint (a 4096x4096 TGA with alpha) is about 64 MiB.
+MAX_EXTRACTED_PAINT_BYTES = 256 * 1024 * 1024
+
+
+def _copy_bz2_capped(source: Path, out_handle, limit: int = MAX_EXTRACTED_PAINT_BYTES) -> int:
+    """Decompress ``source`` into ``out_handle``; refuse anything bigger than a paint can be.
+
+    A corrupt or hostile .bz2 from a manifest URL could otherwise fill the disk.
+    """
+    written = 0
+    with source.open("rb") as raw, bz2.open(raw, "rb") as decompressor:
+        while True:
+            chunk = decompressor.read(1024 * 1024)
+            if not chunk:
+                return written
+            written += len(chunk)
+            if written > limit:
+                raise RuntimeError(f"{source.name} expands to more than {limit // (1024 * 1024)} MiB, which no paint does.")
+            out_handle.write(chunk)
+
+
 def _file_sha1(path: Path) -> str:
     hasher = hashlib.sha1()
     with path.open("rb") as handle:
@@ -15664,8 +15705,8 @@ def _download_ai_roster_asset(
                         if chunk:
                             handle.write(chunk)
             if url.lower().endswith(".bz2"):
-                with temp_download.open("rb") as source, bz2.open(source, "rb") as decompressor, temp_extract.open("wb") as out:
-                    shutil.copyfileobj(decompressor, out)
+                with temp_extract.open("wb") as out:
+                    _copy_bz2_capped(temp_download, out)
                 temp_download.unlink(missing_ok=True)
             else:
                 os.replace(temp_download, temp_extract)
@@ -16981,7 +17022,7 @@ def fetch_context_files(
                 return []
             except (requests.RequestException, ET.ParseError, RuntimeError) as exc:
                 last_exc = exc
-                unreachable = _note_tp_fetch_url_result(url, exc)
+                unreachable = _note_tp_fetch_url_result(url, exc, exhausted=attempt >= retries)
                 if attempt >= retries or (unreachable and url_index + 1 < len(urls)):
                     break
                 delay = compute_retry_delay(retry_backoff_seconds, attempt)
@@ -17026,6 +17067,9 @@ def _fetch_user_files_for_session(
                     logging.debug("Trading Paints fetch_user.php returned regular car asset(s) for user %s after _ss request.", user_id)
                 return _select_manifest_variants_for_session(session, ss_items)
             logging.debug("Trading Paints fetch_user.php returned no car assets for user %s after _ss request; retrying regular manifest.", user_id)
+        except (requests.ConnectionError, requests.Timeout):
+            # The regular request goes to the same host and would fail the same way.
+            raise
         except Exception as exc:  # noqa: BLE001
             logging.debug("Trading Paints fetch_user.php _ss request failed for user %s; retrying regular manifest: %s", user_id, exc)
     return _select_manifest_variants_for_session(
@@ -17056,6 +17100,10 @@ def _fetch_context_files_for_session(
                     logging.debug("Trading Paints fetch.php returned regular car asset(s) for user %s after _ss request.", user.user_id)
                 return _select_manifest_variants_for_session(session, ss_items)
             logging.debug("Trading Paints fetch.php returned no car assets for user %s after _ss request; retrying regular manifest.", user.user_id)
+        except (requests.ConnectionError, requests.Timeout):
+            # Both manifest hosts were just tried; the regular request would only
+            # repeat the same failures (14 requests per driver during an outage).
+            raise
         except Exception as exc:  # noqa: BLE001
             logging.debug("Trading Paints fetch.php _ss request failed for user %s; retrying regular manifest: %s", user.user_id, exc)
     return _select_manifest_variants_for_session(
@@ -17093,6 +17141,9 @@ def fetch_best_manifest_files(
     try:
         return _fetch_context_files_for_session(session, user, retries, retry_backoff_seconds, cancel_event=cancel_event)
     except Exception as exc:
+        if _tp_fetch_host_unreachable(urllib.parse.urlsplit(TRADING_PAINTS_FETCH_USER_URL).netloc):
+            # fetch_user.php lives on a host that just failed to connect.
+            raise
         logging.warning(
             "Context fetch.php manifest failed for user %s; falling back to fetch_user.php: %s",
             user.user_id,
@@ -17876,21 +17927,29 @@ def download_file(
             )
             try:
                 session = get_thread_http_session()
+                cancelled_mid_stream = False
                 with session.get(item.url, timeout=(10, 90), stream=True) as response:
                     response.raise_for_status()
                     with dest_file.open("wb") as f:
-                        for chunk in response.iter_content(chunk_size=1024 * 1024):
+                        # 256 KiB reads: on a slow link a 1 MiB read held a cancel back
+                        # for about 20 seconds.
+                        for chunk in response.iter_content(chunk_size=256 * 1024):
                             if _cancel_requested(cancel_event):
-                                logging.info(
-                                    "%sCancelled download for user %s %s because the iRacing session changed or ended",
-                                    progress_prefix,
-                                    item.download_id.user_id,
-                                    item.download_id.paint_type.value,
-                                )
-                                return None
+                                cancelled_mid_stream = True
+                                break
                             if chunk:
                                 bytes_downloaded_total += len(chunk)
                                 f.write(chunk)
+                if cancelled_mid_stream:
+                    # The file is closed now, so the partial download can go.
+                    dest_file.unlink(missing_ok=True)
+                    logging.info(
+                        "%sCancelled download for user %s %s because the iRacing session changed or ended",
+                        progress_prefix,
+                        item.download_id.user_id,
+                        item.download_id.paint_type.value,
+                    )
+                    return None
                 logging.debug("%sDownloaded to temp file: %s", progress_prefix, dest_file)
                 success = True
                 return DownloadedFile(
@@ -18025,10 +18084,8 @@ def move_or_extract(
             try:
                 temp_primary_dest.unlink(missing_ok=True)
                 if src.suffix.lower() == ".bz2":
-                    with src.open("rb") as source, bz2.open(source, "rb") as decompressor, temp_primary_dest.open(
-                        "wb"
-                    ) as out:
-                        shutil.copyfileobj(decompressor, out)
+                    with temp_primary_dest.open("wb") as out:
+                        _copy_bz2_capped(src, out)
                 else:
                     shutil.copy2(src, temp_primary_dest)
                 _remember_once(primary_dest)
@@ -21079,8 +21136,8 @@ def _iracing_ui_preview_store_download(downloaded: DownloadedFile, cache_root: P
         temp_path = destination.with_name(destination.name + ".tmp")
         temp_path.unlink(missing_ok=True)
         if source.suffix.lower() == ".bz2":
-            with source.open("rb") as handle, bz2.open(handle, "rb") as decompressor, temp_path.open("wb") as out:
-                shutil.copyfileobj(decompressor, out)
+            with temp_path.open("wb") as out:
+                _copy_bz2_capped(source, out)
         else:
             shutil.copy2(source, temp_path)
         os.replace(temp_path, destination)

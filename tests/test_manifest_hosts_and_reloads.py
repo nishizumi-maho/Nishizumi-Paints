@@ -63,7 +63,9 @@ class ManifestHostFallbackTests(unittest.TestCase):
     def setUp(self):
         with APP._TP_FETCH_URL_DOWN_LOCK:
             APP._TP_FETCH_URL_DOWN_UNTIL.clear()
+            APP._TP_FETCH_HOST_UNREACHABLE_UNTIL.clear()
         self.addCleanup(APP._TP_FETCH_URL_DOWN_UNTIL.clear)
+        self.addCleanup(APP._TP_FETCH_HOST_UNREACHABLE_UNTIL.clear)
         original = APP.get_thread_http_session
         self.addCleanup(setattr, APP, "get_thread_http_session", original)
         self.user = APP.SessionUser(user_id=42, directory=CAR)
@@ -101,6 +103,45 @@ class ManifestHostFallbackTests(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 1.0, "no backoff should be spent on the broken host")
         self.assertEqual(http.calls, [PRIMARY, BACKUP])
         self.assertEqual([item.download_id.user_id for item in files], [42])
+
+    def _no_backoff(self):
+        original_delay = APP.compute_retry_delay
+        APP.compute_retry_delay = lambda _base, _attempt: 0.0
+        self.addCleanup(setattr, APP, "compute_retry_delay", original_delay)
+
+    def test_a_host_that_keeps_failing_goes_last_for_the_next_driver(self):
+        # A 5xx spell on the primary cost every driver all its retries before.
+        self._no_backoff()
+        http = _HttpSession({PRIMARY: requests.exceptions.HTTPError("503 Service Unavailable")})
+        self._use(http)
+        self._fetch()
+        self.assertEqual(http.calls, [PRIMARY, PRIMARY, PRIMARY, BACKUP])
+        http.calls.clear()
+        self._fetch()
+        self.assertEqual(http.calls, [BACKUP])
+
+    def test_a_superspeedway_outage_costs_one_round_of_requests(self):
+        self._no_backoff()
+        down = requests.exceptions.ConnectionError("down")
+        http = _HttpSession({PRIMARY: down, BACKUP: down})
+        self._use(http)
+        session = APP.Session(
+            session_id=APP.SessionId(1, 2),
+            users={self.user},
+            local_user_id=42,
+            series_id=164,
+            is_superspeedway_track=True,
+        )
+        fetch_user_calls = []
+        original_fetch_user = APP.fetch_user_files
+        APP.fetch_user_files = lambda *a, **k: fetch_user_calls.append(a) or []
+        self.addCleanup(setattr, APP, "fetch_user_files", original_fetch_user)
+        with self.assertRaises(requests.exceptions.ConnectionError):
+            APP.fetch_best_manifest_files(session, self.user, 3, 0.0)
+        # One pass over both hosts for the _ss request; the regular request and
+        # fetch_user.php on the host that just failed are not tried on top.
+        self.assertEqual(http.calls, [PRIMARY, BACKUP, BACKUP, BACKUP])
+        self.assertEqual(fetch_user_calls, [])
 
     def test_later_fetches_start_with_the_host_that_works(self):
         http = _HttpSession({PRIMARY: requests.exceptions.SSLError("handshake failure")})
