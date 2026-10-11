@@ -4,6 +4,7 @@ import sys
 import threading
 import time
 import unittest
+import urllib.parse
 from pathlib import Path
 
 import requests
@@ -23,7 +24,8 @@ def setUpModule():
 
 
 CAR = "dirtlatemodel 350"
-BROKEN, HEALTHY = APP.TRADING_PAINTS_FETCH_CONTEXT_URLS
+# The tests below make the primary host fail and check that the backup takes over.
+PRIMARY, BACKUP = APP.TRADING_PAINTS_FETCH_CONTEXT_URLS
 
 
 def _manifest(user_id):
@@ -78,52 +80,65 @@ class ManifestHostFallbackTests(unittest.TestCase):
     def _fetch(self):
         return APP.fetch_context_files(self.session, self.user, retries=3, retry_backoff_seconds=5.0)
 
+    def test_the_working_gg_host_is_the_primary_and_the_com_host_the_backup(self):
+        primary, backup = APP.TRADING_PAINTS_FETCH_CONTEXT_URLS
+        self.assertEqual(urllib.parse.urlsplit(primary).netloc, "fetch.tradingpaints.gg")
+        self.assertEqual(urllib.parse.urlsplit(backup).netloc, "dl.tradingpaints.com")
+        self.assertEqual(APP.tp_fetch_context_urls(), [primary, backup])
+
+    def test_a_healthy_primary_is_the_only_host_asked(self):
+        http = _HttpSession({})
+        self._use(http)
+        files = self._fetch()
+        self.assertEqual(http.calls, [APP.TRADING_PAINTS_FETCH_CONTEXT_URLS[0]])
+        self.assertEqual([item.download_id.user_id for item in files], [42])
+
     def test_general_session_manifest_uses_the_healthy_alternative_after_tls_failure(self):
-        http = _HttpSession({BROKEN: requests.exceptions.SSLError("handshake failure")})
+        http = _HttpSession({PRIMARY: requests.exceptions.SSLError("handshake failure")})
         self._use(http)
         started = time.monotonic()
         files = self._fetch()
         self.assertLess(time.monotonic() - started, 1.0, "no backoff should be spent on the broken host")
-        self.assertEqual(http.calls, [BROKEN, HEALTHY])
+        self.assertEqual(http.calls, [PRIMARY, BACKUP])
         self.assertEqual([item.download_id.user_id for item in files], [42])
 
     def test_later_fetches_start_with_the_host_that_works(self):
-        http = _HttpSession({BROKEN: requests.exceptions.SSLError("handshake failure")})
+        http = _HttpSession({PRIMARY: requests.exceptions.SSLError("handshake failure")})
         self._use(http)
         self._fetch()
         http.calls.clear()
         self._fetch()
-        self.assertEqual(http.calls, [HEALTHY])
-        self.assertEqual(APP.tp_fetch_context_urls(), [HEALTHY, BROKEN])
+        self.assertEqual(http.calls, [BACKUP])
+        self.assertEqual(APP.tp_fetch_context_urls(), [BACKUP, PRIMARY])
 
     def test_a_host_that_answers_again_is_trusted_again(self):
-        APP._note_tp_fetch_url_result(BROKEN, requests.exceptions.ConnectionError("refused"))
-        self.assertEqual(APP.tp_fetch_context_urls(), [HEALTHY, BROKEN])
-        APP._note_tp_fetch_url_result(BROKEN, None)
-        self.assertEqual(APP.tp_fetch_context_urls(), [BROKEN, HEALTHY])
+        APP._note_tp_fetch_url_result(PRIMARY, requests.exceptions.ConnectionError("refused"))
+        self.assertEqual(APP.tp_fetch_context_urls(), [BACKUP, PRIMARY])
+        APP._note_tp_fetch_url_result(PRIMARY, None)
+        self.assertEqual(APP.tp_fetch_context_urls(), [PRIMARY, BACKUP])
 
     def test_http_errors_keep_the_normal_retries(self):
-        self.assertFalse(APP._note_tp_fetch_url_result(BROKEN, requests.exceptions.HTTPError("503")))
-        self.assertFalse(APP._note_tp_fetch_url_result(BROKEN, requests.exceptions.ReadTimeout("slow")))
-        self.assertEqual(APP.tp_fetch_context_urls(), [BROKEN, HEALTHY])
+        self.assertFalse(APP._note_tp_fetch_url_result(PRIMARY, requests.exceptions.HTTPError("503")))
+        self.assertFalse(APP._note_tp_fetch_url_result(PRIMARY, requests.exceptions.ReadTimeout("slow")))
+        self.assertEqual(APP.tp_fetch_context_urls(), [PRIMARY, BACKUP])
 
     def test_the_last_host_left_still_gets_its_retries(self):
         error = requests.exceptions.ConnectionError("down")
-        http = _HttpSession({BROKEN: error, HEALTHY: error})
+        http = _HttpSession({PRIMARY: error, BACKUP: error})
         self._use(http)
         original_delay = APP.compute_retry_delay
         APP.compute_retry_delay = lambda _base, _attempt: 0.0
         self.addCleanup(setattr, APP, "compute_retry_delay", original_delay)
         with self.assertRaises(requests.exceptions.ConnectionError):
             self._fetch()
-        self.assertEqual(http.calls, [BROKEN, HEALTHY, HEALTHY, HEALTHY])
+        self.assertEqual(http.calls, [PRIMARY, BACKUP, BACKUP, BACKUP])
 
     def test_team_manifest_uses_the_healthy_alternative_after_tls_failure(self):
-        http = _HttpSession({BROKEN: requests.exceptions.SSLError("handshake failure")})
+        http = _HttpSession({PRIMARY: requests.exceptions.SSLError("handshake failure")})
         self._use(http)
         target = APP.TPTeamPaintTarget(0, "Ferrari 296 GT3", (CAR,), 264, "Ferrari-296-GT3")
         APP.fetch_tp_team_paint_files(target, request_member_id=42, retries=3, retry_backoff_seconds=0.0)
-        self.assertEqual(http.calls[:2], [BROKEN, HEALTHY])
+        self.assertEqual(http.calls[:2], [PRIMARY, BACKUP])
 
 
 class _ReloadSdk:

@@ -138,9 +138,12 @@ GITHUB_RELEASE_ASSET_HOSTS = (
 UPDATE_INSTALLER_MAX_BYTES = 400 * 1024 * 1024
 UPDATE_DOWNLOAD_TIMEOUT = (10.0, 60.0)
 UPDATE_INSTALLER_SILENT_ARGS = ("/SILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/CLOSEAPPLICATIONS")
+# Manifest hosts, primary first. fetch.tradingpaints.gg is the host that answers;
+# dl.tradingpaints.com has been failing its TLS handshake since 7.3.4, so it is only
+# the backup, tried when the primary cannot be reached or keeps failing.
 TRADING_PAINTS_FETCH_CONTEXT_URLS = (
-    "https://dl.tradingpaints.com/fetch.php",
     "https://fetch.tradingpaints.gg/fetch.php",
+    "https://dl.tradingpaints.com/fetch.php",
 )
 # How long a manifest host that failed to connect (TLS, DNS, refused, connect timeout)
 # is tried last instead of first, so a broken host does not cost every driver its retries.
