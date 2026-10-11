@@ -8416,32 +8416,39 @@ def fetch_tp_team_paint_files(
     found: list[DownloadFile] = []
     attempts = 0
     manifest_urls = tp_fetch_context_urls()
+    max_attempts = max(1, int(retries))
+    # Payloads still waiting for an answer. A payload a host answered is never sent
+    # again; only the ones that failed move on to the next host.
+    pending = list(payloads)
     for endpoint_index, endpoint in enumerate(manifest_urls):
-        host_unreachable = False
-        for payload in payloads:
+        has_next_host = endpoint_index + 1 < len(manifest_urls)
+        failed: list[dict[str, str]] = []
+        for payload_index, payload in enumerate(pending):
             if _cancel_requested(cancel_event):
                 return _dedupe_tp_team_download_items(found), logs
             attempts += 1
             list_value = payload.get("list", "")
-            for attempt in range(1, max(1, int(retries)) + 1):
+            answered = False
+            unreachable = False
+            for attempt in range(1, max_attempts + 1):
                 if _cancel_requested(cancel_event):
                     return _dedupe_tp_team_download_items(found), logs
                 try:
                     http = get_thread_http_session()
                     resp = http.post(endpoint, data=payload, timeout=30)
                     resp.raise_for_status()
-                    _note_tp_fetch_url_result(endpoint, None)
                     items = _parse_tp_team_fetch_manifest(resp.text, target)
+                    _note_tp_fetch_url_result(endpoint, None)
+                    answered = True
                     if items:
                         found.extend(items)
                         write(f"Team manifest matched {len(items)} file(s) via {endpoint}; list={list_value}.")
                     break
                 except (requests.RequestException, ET.ParseError) as exc:
                     unreachable = _note_tp_fetch_url_result(endpoint, exc)
-                    host_unreachable = host_unreachable or unreachable
-                    if attempt >= max(1, int(retries)) or (
-                        unreachable and endpoint_index + 1 < len(manifest_urls)
-                    ):
+                    # A host that cannot be reached at all is left right away when
+                    # another host remains; the last host keeps its normal retries.
+                    if attempt >= max_attempts or (unreachable and has_next_host):
                         write(f"Team manifest attempt failed via {endpoint}; list={list_value}; error={exc}")
                         break
                     delay = compute_retry_delay(retry_backoff_seconds, attempt)
@@ -8449,8 +8456,18 @@ def fetch_tp_team_paint_files(
                         cancel_event.wait(delay)
                     else:
                         time.sleep(delay)
-            if host_unreachable:
+            if answered:
+                continue
+            failed.append(payload)
+            if unreachable:
+                # The remaining payloads go to the next host. On the last host the
+                # scan stops instead of retrying every payload against a host that
+                # cannot be reached.
+                failed.extend(pending[payload_index + 1:])
                 break
+        pending = failed
+        if not pending:
+            break
     deduped = _dedupe_tp_team_download_items(found)
     write(f"Team manifest scan completed: {len(deduped)} unique team asset(s) after {attempts} payload attempt(s).")
     return deduped, logs
@@ -8893,8 +8910,11 @@ def fetch_tp_team_all_paint_files(
             batch_targets.append(target)
         payload = _tp_team_bulk_payload(target_team_id, batch_rows)
         batch_items: list[DownloadFile] = []
+        batch_answered = False
         manifest_urls = tp_fetch_context_urls()
         for endpoint_index, endpoint in enumerate(manifest_urls):
+            if _cancel_requested(cancel_event):
+                break
             attempts += 1
             for attempt in range(1, max(1, int(retries)) + 1):
                 if _cancel_requested(cancel_event):
@@ -8903,8 +8923,9 @@ def fetch_tp_team_all_paint_files(
                     http = get_thread_http_session()
                     resp = http.post(endpoint, data=payload, timeout=25)
                     resp.raise_for_status()
-                    _note_tp_fetch_url_result(endpoint, None)
                     root = ET.fromstring(resp.text)
+                    _note_tp_fetch_url_result(endpoint, None)
+                    batch_answered = True
                     for target in batch_targets:
                         batch_items.extend(_parse_tp_team_fetch_manifest_root(root, target))
                     break
@@ -8920,7 +8941,9 @@ def fetch_tp_team_all_paint_files(
                         cancel_event.wait(delay)
                     else:
                         time.sleep(delay)
-            if batch_items:
+            # Most batches hold none of the team's cars, so an empty answer is the
+            # normal result: only a batch no host answered goes to the next host.
+            if batch_answered:
                 break
         checked_rows += len(batch_rows)
         if batch_items:

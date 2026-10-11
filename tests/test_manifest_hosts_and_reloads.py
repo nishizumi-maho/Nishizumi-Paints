@@ -141,6 +141,97 @@ class ManifestHostFallbackTests(unittest.TestCase):
         self.assertEqual(http.calls[:2], [PRIMARY, BACKUP])
 
 
+class _ScriptedHttp:
+    """Fake manifest host: `always` maps a URL to the error it always raises, `scripts`
+    maps a URL to per-call steps (an error to raise, or None to answer)."""
+
+    def __init__(self, scripts=None, always=None):
+        self.scripts = {url: list(steps) for url, steps in (scripts or {}).items()}
+        self.always = dict(always or {})
+        self.calls = []
+
+    def post(self, url, data=None, timeout=None):
+        self.calls.append(url)
+        if url in self.always:
+            raise self.always[url]
+        steps = self.scripts.get(url)
+        if steps:
+            step = steps.pop(0)
+            if step is not None:
+                raise step
+        user_id = str(data["list"]).split("=", 1)[0]
+        return _Response(_manifest(user_id))
+
+
+class TeamManifestHostTests(unittest.TestCase):
+    def setUp(self):
+        with APP._TP_FETCH_URL_DOWN_LOCK:
+            APP._TP_FETCH_URL_DOWN_UNTIL.clear()
+        self.addCleanup(APP._TP_FETCH_URL_DOWN_UNTIL.clear)
+        original_session = APP.get_thread_http_session
+        self.addCleanup(setattr, APP, "get_thread_http_session", original_session)
+        original_delay = APP.compute_retry_delay
+        APP.compute_retry_delay = lambda _base, _attempt: 0.0
+        self.addCleanup(setattr, APP, "compute_retry_delay", original_delay)
+        self.target = APP.TPTeamPaintTarget(team_id=77, raw_car="Ferrari 296 GT3", directories=(CAR,), mid=264)
+        self.payload_count = len(APP._tp_team_fetch_payloads(self.target, request_member_id=42))
+
+    def _use(self, http):
+        APP.get_thread_http_session = lambda: http
+
+    def _scan(self):
+        return APP.fetch_tp_team_paint_files(self.target, request_member_id=42, retries=3, retry_backoff_seconds=0.0)
+
+    def test_the_backup_is_not_asked_once_the_primary_answered_every_payload(self):
+        http = _ScriptedHttp(always={BACKUP: requests.exceptions.SSLError("handshake failure")})
+        self._use(http)
+        _files, logs = self._scan()
+        self.assertGreater(self.payload_count, 1)
+        self.assertEqual(http.calls, [PRIMARY] * self.payload_count)
+        self.assertEqual([line for line in logs if "attempt failed" in line], [])
+
+    def test_only_the_payloads_the_primary_did_not_answer_move_to_the_backup(self):
+        http = _ScriptedHttp(scripts={PRIMARY: [None, None, requests.exceptions.SSLError("handshake failure")]})
+        self._use(http)
+        self._scan()
+        self.assertEqual(http.calls.count(PRIMARY), 3)
+        self.assertEqual(http.calls.count(BACKUP), self.payload_count - 2)
+
+    def test_a_retried_blip_on_the_last_host_does_not_end_the_scan(self):
+        APP._note_tp_fetch_url_result(PRIMARY, requests.exceptions.ConnectionError("earlier blip"))
+        http = _ScriptedHttp(
+            scripts={PRIMARY: [requests.exceptions.ConnectionError("blip")]},
+            always={BACKUP: requests.exceptions.SSLError("handshake failure")},
+        )
+        self._use(http)
+        self._scan()
+        self.assertEqual(http.calls.count(BACKUP), 1)
+        self.assertEqual(http.calls.count(PRIMARY), self.payload_count + 1)
+
+    def test_the_scan_stops_when_the_last_host_cannot_be_reached_either(self):
+        error = requests.exceptions.ConnectionError("down")
+        http = _ScriptedHttp(always={PRIMARY: error, BACKUP: error})
+        self._use(http)
+        files, _logs = self._scan()
+        self.assertEqual(files, [])
+        self.assertEqual(http.calls, [PRIMARY, BACKUP, BACKUP, BACKUP])
+
+    def test_team_all_paints_keeps_empty_batches_on_the_primary(self):
+        targets = [
+            APP.TPTeamPaintTarget(team_id=77, raw_car=f"car {n}", directories=(f"car{n}",), mid=1000 + n)
+            for n in range(30)
+        ]
+        original = APP.iter_tp_team_paint_targets
+        APP.iter_tp_team_paint_targets = lambda team_id, mapping_path=None: targets
+        self.addCleanup(setattr, APP, "iter_tp_team_paint_targets", original)
+        http = _ScriptedHttp(always={BACKUP: requests.exceptions.SSLError("handshake failure")})
+        self._use(http)
+        files, _logs = APP.fetch_tp_team_all_paint_files(77, retries=2, retry_backoff_seconds=0.0)
+        self.assertEqual(files, [])
+        # 30 car directories are two batches of 24; both answered (empty) by the primary.
+        self.assertEqual(http.calls, [PRIMARY, PRIMARY])
+
+
 class _ReloadSdk:
     is_initialized = True
     is_connected = True
