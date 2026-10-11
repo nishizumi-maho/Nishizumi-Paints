@@ -18451,11 +18451,17 @@ def remember_previous_paint_file(destination: Path, session_id: SessionId, downl
             return False
     return True
 
-def paint_history_entries_for_user_kind(session: Session, user: SessionUser, kind: str) -> list[dict[str, object]]:
+def paint_history_entries_for_user_kind(
+    session: Session,
+    user: SessionUser,
+    kind: str,
+    index: dict[str, object] | None = None,
+) -> list[dict[str, object]]:
     normalized_kind = _driver_paint_override_kind(kind)
     if session is None or user is None or not normalized_kind:
         return []
-    index = _load_paint_history_index()
+    if index is None:
+        index = _load_paint_history_index()
     entries = index.get("entries") if isinstance(index, dict) else []
     if not isinstance(entries, list):
         return []
@@ -18469,10 +18475,15 @@ def paint_history_entries_for_user_kind(session: Session, user: SessionUser, kin
     matches.sort(key=lambda entry: float(entry.get("created_at") or 0.0), reverse=True)
     return matches
 
-def paint_history_has_previous(session: Session | None, user: SessionUser | None, kind: str) -> bool:
+def paint_history_has_previous(
+    session: Session | None,
+    user: SessionUser | None,
+    kind: str,
+    index: dict[str, object] | None = None,
+) -> bool:
     if session is None or user is None:
         return False
-    return bool(paint_history_entries_for_user_kind(session, user, kind))
+    return bool(paint_history_entries_for_user_kind(session, user, kind, index=index))
 
 def restore_previous_paint_for_user_kind(
     *,
@@ -25279,8 +25290,31 @@ class DownloaderUI:
             _driver_paint_override_kind(kind),
             canonicalize_car_directory(user.directory).lower(),
         )
+    def _session_action_state_key(self, snapshot: RuntimeSnapshot, contexts: list[tuple[SessionDriverSnapshot, SessionUser]]) -> tuple:
+        busy = frozenset(getattr(self, "_driver_override_assignment_in_progress", set())) | frozenset(
+            getattr(self, "_driver_restore_in_progress", set())
+        )
+        return (
+            self._session_snapshot_signature(snapshot),
+            tuple(self._session_row_iid(row) for row, _user in contexts),
+            busy,
+            tuple(sorted(str(item.file_path) for item in snapshot.last_saved)),
+            _file_signature(default_driver_paint_overrides_path()),
+            _file_signature(default_paint_history_index_path()),
+        )
+
     def _update_session_action_state(self) -> None:
         snapshot, contexts = self._selected_session_contexts()
+        # This runs on every poll of the window. It read the overrides file and the
+        # whole paint history index per selected row and kind on the Tk thread, so a
+        # big selection stuttered the window while paints arrived.
+        try:
+            state_key = self._session_action_state_key(snapshot, contexts)
+        except Exception:
+            state_key = None
+        if state_key is not None and state_key == self.__dict__.get("_last_session_action_state_key"):
+            return
+        self._last_session_action_state_key = state_key
         enabled = bool(snapshot.current_session is not None and contexts)
         for button in getattr(self, "session_driver_action_buttons", []):
             try:
@@ -25293,16 +25327,24 @@ class DownloaderUI:
         assert snapshot.current_session is not None
         session = snapshot.current_session
         overrides = load_driver_paint_overrides()
+        history_index = _load_paint_history_index()
+        last_saved = list(snapshot.last_saved)
+        current_entry_cache: dict[tuple[int, str], dict[str, object] | None] = {}
 
         def _current_entry(row: SessionDriverSnapshot, user: SessionUser, kind: str) -> dict[str, object] | None:
+            cache_key = (id(row), kind)
+            if cache_key in current_entry_cache:
+                return current_entry_cache[cache_key]
             row_status_code = str(getattr(row, f"{kind}_status_code", "") or "")
-            return _driver_current_paint_entry_from_saved(
+            entry = _driver_current_paint_entry_from_saved(
                 session=session,
-                saved_items=list(snapshot.last_saved),
+                saved_items=last_saved,
                 user=user,
                 kind=kind,
                 allow_profile_link=row_status_code in {"downloaded", "team_paint", "driver_paint", "replay", "fallback_online"},
             )
+            current_entry_cache[cache_key] = entry
+            return entry
 
         def _can_assign_current(row: SessionDriverSnapshot, user: SessionUser, kind: str) -> bool:
             entry = _current_entry(row, user, kind)
@@ -25310,7 +25352,7 @@ class DownloaderUI:
                 return False
             current_items = _session_saved_items_for_user_kind(
                 session,
-                list(snapshot.last_saved),
+                last_saved,
                 user,
                 kind,
                 require_existing=True,
@@ -25348,7 +25390,7 @@ class DownloaderUI:
                 for index, _context in enumerate(contexts)
             )
             can_restore_previous = any(
-                paint_history_has_previous(session, contexts[index][1], kind)
+                paint_history_has_previous(session, contexts[index][1], kind, index=history_index)
                 for index in available_indices
             )
             can_start_override = bool(available_indices)
@@ -25445,12 +25487,18 @@ class DownloaderUI:
             valid_selected_iids = (selected,) + tuple(iid for iid in valid_selected_iids if iid != selected)
         if not valid_selected_iids and selected:
             valid_selected_iids = (selected,)
+        previous_selected = self._selected_session_row_iid
         self._selected_session_row_iid = selected
         self._selected_session_row_iids = valid_selected_iids
         if selected:
-            self.session_tree.selection_set(valid_selected_iids)
-            self.session_tree.focus(selected)
-            self.session_tree.see(selected)
+            # Re-selecting and scrolling to the row on every change snapped the list
+            # back while the user scrolled it, and fired a second selection event.
+            if set(self.session_tree.selection()) != set(valid_selected_iids):
+                self.session_tree.selection_set(valid_selected_iids)
+            if self.session_tree.focus() != selected:
+                self.session_tree.focus(selected)
+            if selected != previous_selected:
+                self.session_tree.see(selected)
         self._update_session_action_state()
     def on_session_driver_selected(self, _event=None) -> None:
         selection = tuple(iid for iid in self.session_tree.selection() if iid in self._session_row_lookup)
@@ -25727,18 +25775,19 @@ class DownloaderUI:
             self._append_log(f"Cannot assign unsupported paint kind: {kind}")
             return
         assert snapshot.current_session is not None
-        saved_count = 0
-        registered_count = 0
+        session = snapshot.current_session
+        busy_keys = self.__dict__.setdefault("_driver_override_assignment_in_progress", set())
+        jobs: list[tuple[SessionDriverSnapshot, SessionUser, tuple[object, int, str, str], list[SavedFile], dict[str, object]]] = []
         for row, user in contexts:
             current_items = _session_saved_items_for_user_kind(
-                snapshot.current_session,
+                session,
                 list(snapshot.last_saved),
                 user,
                 normalized_kind,
                 require_existing=True,
             )
             entry = _driver_current_paint_entry_from_saved(
-                session=snapshot.current_session,
+                session=session,
                 saved_items=list(snapshot.last_saved),
                 user=user,
                 kind=normalized_kind,
@@ -25752,49 +25801,83 @@ class DownloaderUI:
                 # link, and an override without a scheme id was refused as invalid.
                 digest = _saved_items_session_digest(current_items)
                 entry["scheme_id"] = f"current-{normalized_kind}-{digest or int(time.time())}"
-            try:
-                cache_saved_driver_paint_override(current_items, entry)
-                entry = remember_driver_paint_override(entry)
-                preserved_items = [
-                    replace(
-                        item,
-                        download_id=_download_id_with_tp_source(
-                            replace(item.download_id, preserve_on_cleanup=True),
-                            scheme_id=str(entry.get("scheme_id") or "").strip(),
-                            title=str(entry.get("title") or "").strip(),
-                            source_link=str(entry.get("source_link") or "").strip(),
-                            source=str(entry.get("source") or "current_session").strip() or "current_session",
-                        ),
-                    )
-                    for item in current_items
-                ]
-                registered = self.service.register_manual_saved_paints(
-                    snapshot.current_session,
-                    preserved_items,
-                    "override",
-                    override_entry=entry,
-                )
-            except Exception as exc:
-                logging.debug("Current driver paint assignment failed", exc_info=True)
-                self._append_log(f"Could not assign current {normalized_kind} paint for {row.display_name}: {exc}")
+            action_key = self._driver_action_key(session, user, normalized_kind)
+            if action_key in busy_keys:
+                self._append_log(f"Fixed {normalized_kind} assignment for {row.display_name} is already running.")
                 continue
-            saved_count += 1
-            if registered:
-                registered_count += 1
-            scheme_id = str(entry.get("scheme_id") or "").strip()
-            source_link = _driver_paint_entry_url(entry, user)
-            link_text = f" ({source_link})" if source_link else ""
-            if registered:
-                self._append_log(f"Current {normalized_kind} paint for {row.display_name} is now fixed as scheme {scheme_id}.{link_text}")
-            else:
-                self._append_log(f"Current {normalized_kind} paint for {row.display_name} was saved as a fixed override, but the active session table could not be updated.")
-        if not saved_count:
+            busy_keys.add(action_key)
+            jobs.append((row, user, action_key, current_items, entry))
+        if not jobs:
             self._update_session_action_state()
             return
-        self.status_var.set(f"Fixed {normalized_kind} override saved")
-        if registered_count:
-            self._last_session_snapshot_signature = None
-            self._refresh_session_tree()
+
+        def _work() -> object:
+            # Copying the paint files into the override cache and saving the overrides
+            # file ran in the click handler and froze the window for many drivers.
+            results = []
+            for row, user, _action_key, current_items, entry in jobs:
+                try:
+                    cache_saved_driver_paint_override(current_items, entry)
+                    entry = remember_driver_paint_override(entry)
+                    preserved_items = [
+                        replace(
+                            item,
+                            download_id=_download_id_with_tp_source(
+                                replace(item.download_id, preserve_on_cleanup=True),
+                                scheme_id=str(entry.get("scheme_id") or "").strip(),
+                                title=str(entry.get("title") or "").strip(),
+                                source_link=str(entry.get("source_link") or "").strip(),
+                                source=str(entry.get("source") or "current_session").strip() or "current_session",
+                            ),
+                        )
+                        for item in current_items
+                    ]
+                    registered = self.service.register_manual_saved_paints(
+                        session,
+                        preserved_items,
+                        "override",
+                        override_entry=entry,
+                    )
+                    results.append((row, user, entry, registered, None))
+                except Exception as exc:  # noqa: BLE001
+                    logging.debug("Current driver paint assignment failed", exc_info=True)
+                    results.append((row, user, entry, False, exc))
+            return results
+
+        def _done(result: object, error: BaseException | None) -> None:
+            for _row, _user, action_key, _items, _entry in jobs:
+                busy_keys.discard(action_key)
+            if error is not None:
+                self._append_log(f"Could not assign current {normalized_kind} paints: {error}")
+            saved_count = 0
+            registered_count = 0
+            for row, user, entry, registered, exc in (result or []):  # type: ignore[union-attr]
+                if exc is not None:
+                    self._append_log(f"Could not assign current {normalized_kind} paint for {row.display_name}: {exc}")
+                    continue
+                saved_count += 1
+                if registered:
+                    registered_count += 1
+                scheme_id = str(entry.get("scheme_id") or "").strip()
+                source_link = _driver_paint_entry_url(entry, user)
+                link_text = f" ({source_link})" if source_link else ""
+                if registered:
+                    self._append_log(f"Current {normalized_kind} paint for {row.display_name} is now fixed as scheme {scheme_id}.{link_text}")
+                else:
+                    self._append_log(f"Current {normalized_kind} paint for {row.display_name} was saved as a fixed override, but the active session table could not be updated.")
+            if saved_count:
+                self.status_var.set(f"Fixed {normalized_kind} override saved")
+            if registered_count:
+                self._last_session_snapshot_signature = None
+                self._refresh_session_tree()
+            self._update_session_action_state()
+
+        self._run_ui_task(
+            f"assign_current_{normalized_kind}_{len(jobs)}_{id(jobs)}",
+            f"Fixing the current {normalized_kind} paint",
+            _work,
+            _done,
+        )
         self._update_session_action_state()
     def _start_driver_override_assignment(self, kind: str, *, scheme_id: str, source_link: str, source_label: str) -> None:
         selected = self._require_selected_session_drivers()
@@ -25927,29 +26010,98 @@ class DownloaderUI:
         row: SessionDriverSnapshot,
         kind: str,
     ) -> None:
+        self._restore_original_driver_paints_after_forget(session, [(user, row)], kind)
+
+    def _restore_original_driver_paints_after_forget(
+        self,
+        session: Session,
+        jobs: list[tuple[SessionUser, SessionDriverSnapshot]],
+        kind: str,
+    ) -> None:
+        """Put back each forgotten driver's original paint, one driver after the other.
+
+        Forget used to start one download thread per selected driver, each with its
+        own SDK reader, while Restore and Random stayed enabled for the same files.
+        The drivers are now marked busy until their restore is done.
+        """
+        busy_keys = self.__dict__.setdefault("_driver_restore_in_progress", set())
+        pending: list[tuple[SessionUser, SessionDriverSnapshot, tuple[object, int, str, str]]] = []
+        for user, row in jobs:
+            action_key = self._driver_action_key(session, user, kind)
+            if action_key in busy_keys:
+                self._append_log(f"{row.display_name}'s {kind} is already being restored.")
+                continue
+            busy_keys.add(action_key)
+            pending.append((user, row, action_key))
+        if not pending:
+            return
+        for _user, row, _key in pending:
+            self._append_log(f"Checking Trading Paints for {row.display_name}'s original {kind} paint after Forget.")
+        self.status_var.set(f"Restoring original {kind}...")
+
+        def _worker() -> None:
+            try:
+                for user, row, action_key in pending:
+                    self._restore_one_original_driver_paint(session, user, row, kind)
+            finally:
+                def _release() -> None:
+                    for _user, _row, action_key in pending:
+                        busy_keys.discard(action_key)
+                    self._update_session_action_state()
+
+                try:
+                    self.root.after(0, _release)
+                except Exception:
+                    for _user, _row, action_key in pending:
+                        busy_keys.discard(action_key)
+
+        threading.Thread(target=_worker, name="NishizumiDriverForgetRestore", daemon=True).start()
+
+    def _restore_one_original_driver_paint(
+        self,
+        session: Session,
+        user: SessionUser,
+        row: SessionDriverSnapshot,
+        kind: str,
+    ) -> None:
         config = self.config
         paints_dir = default_paints_dir(config)
         temp_dir = default_temp_dir()
         retries = positive_int(config.retries, 3)
         retry_backoff_seconds = max(config.retry_backoff_seconds, 0.1)
-        self._append_log(f"Checking Trading Paints for {row.display_name}'s original {kind} paint after Forget.")
-        self.status_var.set(f"Restoring original {kind}...")
-
-        def _worker() -> None:
-            saved_items: list[SavedFile] = []
-            logs: list[str] = []
-            registered = False
-            try:
-                saved_items, logs = download_and_save_original_session_paint(
+        saved_items: list[SavedFile] = []
+        logs: list[str] = []
+        registered = False
+        try:
+            saved_items, logs = download_and_save_original_session_paint(
+                session=session,
+                user=user,
+                kind=kind,
+                paints_dir=paints_dir,
+                temp_dir=temp_dir,
+                retries=retries,
+                retry_backoff_seconds=retry_backoff_seconds,
+            )
+            if saved_items:
+                status_code = restored_paint_status_code_for_saved_items(session, user, kind, saved_items)
+                registered = self.service.register_manual_saved_paints(
+                    session,
+                    saved_items,
+                    status_code,
+                    queue_reapply=False,
+                )
+                if registered:
+                    self._trigger_incremental_texture_reload_for_saved_items(session, saved_items)
+            else:
+                history_items, history_logs = restore_previous_paint_for_user_kind(
                     session=session,
                     user=user,
                     kind=kind,
                     paints_dir=paints_dir,
-                    temp_dir=temp_dir,
-                    retries=retries,
-                    retry_backoff_seconds=retry_backoff_seconds,
                 )
-                if saved_items:
+                if history_items:
+                    logs.extend(history_logs)
+                    saved_items = history_items
                     status_code = restored_paint_status_code_for_saved_items(session, user, kind, saved_items)
                     registered = self.service.register_manual_saved_paints(
                         session,
@@ -25959,47 +26111,26 @@ class DownloaderUI:
                     )
                     if registered:
                         self._trigger_incremental_texture_reload_for_saved_items(session, saved_items)
-                else:
-                    history_items, history_logs = restore_previous_paint_for_user_kind(
-                        session=session,
-                        user=user,
-                        kind=kind,
-                        paints_dir=paints_dir,
-                    )
-                    if history_items:
-                        logs.extend(history_logs)
-                        saved_items = history_items
-                        status_code = restored_paint_status_code_for_saved_items(session, user, kind, saved_items)
-                        registered = self.service.register_manual_saved_paints(
-                            session,
-                            saved_items,
-                            status_code,
-                            queue_reapply=False,
-                        )
-                        if registered:
-                            self._trigger_incremental_texture_reload_for_saved_items(session, saved_items)
-            except Exception as exc:
-                logging.debug("Original paint restore after Forget failed", exc_info=True)
-                logs.append(f"Could not restore original {kind} paint for {row.display_name}: {exc}")
+        except Exception as exc:
+            logging.debug("Original paint restore after Forget failed", exc_info=True)
+            logs.append(f"Could not restore original {kind} paint for {row.display_name}: {exc}")
 
-            def _finish() -> None:
-                for line in logs:
-                    self._append_log(line)
-                if saved_items and registered:
-                    self._append_log(f"Original {kind} paint for {row.display_name} was applied and a texture reload was requested.")
-                    self.status_var.set(f"Restored original {kind}")
-                    self._last_session_snapshot_signature = None
-                    self._refresh_session_tree()
-                elif saved_items:
-                    self._append_log(f"Original {kind} paint for {row.display_name} was saved, but the active session changed before the table could be updated.")
-                    self.status_var.set("Watching")
-                else:
-                    self.status_var.set("Watching")
-                self._update_session_action_state()
+        def _finish() -> None:
+            for line in logs:
+                self._append_log(line)
+            if saved_items and registered:
+                self._append_log(f"Original {kind} paint for {row.display_name} was applied and a texture reload was requested.")
+                self.status_var.set(f"Restored original {kind}")
+                self._last_session_snapshot_signature = None
+                self._refresh_session_tree()
+            elif saved_items:
+                self._append_log(f"Original {kind} paint for {row.display_name} was saved, but the active session changed before the table could be updated.")
+                self.status_var.set("Watching")
+            else:
+                self.status_var.set("Watching")
+            self._update_session_action_state()
 
-            self.root.after(0, _finish)
-
-        threading.Thread(target=_worker, name="NishizumiDriverForgetRestore", daemon=True).start()
+        self.root.after(0, _finish)
     def forget_selected_driver_paint(self, kind: str) -> None:
         selected = self._require_selected_session_drivers()
         if selected is None:
@@ -26011,6 +26142,7 @@ class DownloaderUI:
             return
         overrides = load_driver_paint_overrides()
         any_unpreserved = False
+        restore_jobs: list[tuple[SessionUser, SessionDriverSnapshot]] = []
         for row, user in contexts:
             entry = _driver_paint_override_entry_for_user(overrides, user, normalized_kind)
             row_status_code = str(getattr(row, f"{normalized_kind}_status_code", "") or "")
@@ -26043,14 +26175,11 @@ class DownloaderUI:
                 if unpreserved:
                     self._append_log("Current session file is no longer protected from the normal cleanup rules.")
                 if snapshot.current_session is not None:
-                    self._restore_original_driver_paint_after_forget(
-                        snapshot.current_session,
-                        user,
-                        row,
-                        normalized_kind,
-                    )
+                    restore_jobs.append((user, row))
             else:
                 self._append_log(f"No fixed {normalized_kind} override was saved for {row.display_name} ({row.iracing_id}).")
+        if restore_jobs and snapshot.current_session is not None:
+            self._restore_original_driver_paints_after_forget(snapshot.current_session, restore_jobs, normalized_kind)
         if any_unpreserved:
             self._last_session_snapshot_signature = None
             self._refresh_session_tree()
