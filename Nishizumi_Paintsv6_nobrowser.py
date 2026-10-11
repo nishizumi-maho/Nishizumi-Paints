@@ -15087,11 +15087,18 @@ def _matches_context_manifest_entry(user: SessionUser, car: ET.Element) -> bool:
     if session_user_uses_team_target(user):
         return manifest_user == expected_user or manifest_team == expected_team
     return manifest_user == expected_user and manifest_team == expected_team
+_WINDOWS_RESERVED_FILE_NAMES = frozenset(
+    {"con", "prn", "aux", "nul"} | {f"com{i}" for i in range(1, 10)} | {f"lpt{i}" for i in range(1, 10)}
+)
 def _safe_ai_roster_folder_name(name: str, fallback: str) -> str:
+    """One folder name under airosters. The name comes from Trading Paints, so a
+    backslash, a dot-only name or a device name must not leave that folder."""
     cleaned = (name or '').strip() or fallback
-    cleaned = re.sub(r'[<>:"/\|?*]+', '_', cleaned)
-    cleaned = cleaned.rstrip(' .')
-    return cleaned or fallback
+    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', '_', cleaned)
+    cleaned = cleaned.strip(' .')
+    if not cleaned or cleaned.split('.')[0].strip().lower() in _WINDOWS_RESERVED_FILE_NAMES:
+        return fallback
+    return cleaned
 def _cleanup_ai_roster_dirs(ai_rosters_dir: Path) -> None:
     if not ai_rosters_dir.exists():
         return
@@ -15100,6 +15107,14 @@ def _cleanup_ai_roster_dirs(ai_rosters_dir: Path) -> None:
         if not child.is_dir():
             continue
         if (child / "roster.json").exists():
+            continue
+        # Only folders this app made (they carry its metadata file, or are a staging
+        # folder) or empty ones. A backup or half-built roster of the user's own stays.
+        try:
+            app_made = (child / AI_ROSTER_META_FILENAME).exists() or child.name.endswith(".building")
+            if not app_made and any(child.iterdir()):
+                continue
+        except OSError:
             continue
         try:
             shutil.rmtree(child, ignore_errors=False)
@@ -15850,7 +15865,7 @@ def sync_ai_rosters(member_id: int, ai_rosters_dir: Path, retries: int, retry_ba
                     logging.warning("AI roster sync could not validate roster %s: %s", item.name, exc)
                     continue
                 folder_name = _safe_ai_roster_folder_name(item.name, f"AI_Roster_{item.roster_id}")
-                roster_dir = ai_rosters_dir / folder_name
+                roster_dir = safe_join_under(ai_rosters_dir, folder_name)
                 _write_ai_roster_files(roster_dir, canonical_payload, drivers, item)
                 sync_ai_roster_collection_assets(
                     roster_dir=roster_dir,
@@ -15894,34 +15909,38 @@ def clone_active_ai_roster_to_local(session: Session | None, ai_rosters_dir: Pat
         return False, f"A local AI roster folder already exists for {local_name}."
     target_dir.mkdir(parents=True, exist_ok=False)
     copied_files = 0
-    for driver in drivers:
-        car_tga_name = str(driver.get('carTgaName') or '').strip()
-        helmet_tga_name = str(driver.get('helmetTgaName') or '').strip()
-        suit_tga_name = str(driver.get('suitTgaName') or '').strip()
-        for filename in (car_tga_name, helmet_tga_name, suit_tga_name):
-            if not filename:
-                continue
-            src = source_dir / filename
-            dest = target_dir / filename
-            if src.exists():
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(src, dest)
+    try:
+        for driver in drivers:
+            for field in ('carTgaName', 'helmetTgaName', 'suitTgaName'):
+                # The names come from the roster JSON, so only the bare file name is
+                # trusted, the same way the sync and the randomizer read them.
+                filename = Path(str(driver.get(field) or '').strip()).name
+                if not filename:
+                    continue
+                src = safe_join_under(source_dir, filename)
+                if not src.is_file():
+                    continue
+                shutil.copy2(src, safe_join_under(target_dir, filename))
                 copied_files += 1
                 if filename.lower().endswith('.tga'):
-                    spec_src = source_dir / filename[:-4].replace('car_', 'car_')
-                    spec_src = source_dir / f"{Path(filename).stem}_spec.mip"
-                    if spec_src.exists():
-                        shutil.copy2(spec_src, target_dir / spec_src.name)
+                    spec_name = f"{Path(filename).stem}_spec.mip"
+                    spec_src = safe_join_under(source_dir, spec_name)
+                    if spec_src.is_file():
+                        shutil.copy2(spec_src, safe_join_under(target_dir, spec_name))
                         copied_files += 1
-    _write_ai_roster_files(
-        target_dir,
-        canonical_payload,
-        drivers,
-        None,
-        is_local=True,
-        source_roster_id=session.ai_roster_id,
-        source_name=session.ai_roster_name or base_name,
-    )
+        _write_ai_roster_files(
+            target_dir,
+            canonical_payload,
+            drivers,
+            None,
+            is_local=True,
+            source_roster_id=session.ai_roster_id,
+            source_name=session.ai_roster_name or base_name,
+        )
+    except Exception as exc:  # noqa: BLE001
+        # A half-copied folder would make every retry report that the roster exists.
+        shutil.rmtree(target_dir, ignore_errors=True)
+        return False, f"Could not create local AI roster '{local_name}': {exc}"
     message = f"Created local AI roster '{local_name}' with {len(drivers)} driver(s)"
     if copied_files > 0:
         message += f" and copied {copied_files} local file(s)."
@@ -17036,6 +17055,7 @@ def apply_preloaded_team_driver_personal_fallbacks(
     cache_root: Path | None = None,
     saved_callback: Callable[[list[SavedFile], str], None] | None = None,
     cancel_event: threading.Event | None = None,
+    sync_my_livery_from_server: bool = True,
 ) -> tuple[list[SavedFile], list[str]]:
     active_slots = _normalize_team_driver_personal_fallback_slots(enabled_slots)
     if not active_slots:
@@ -17053,6 +17073,10 @@ def apply_preloaded_team_driver_personal_fallbacks(
             logs.append("Team driver personal preload fallback cancelled because the iRacing session changed or ended.")
             break
         if not session_user_uses_team_target(user):
+            continue
+        if not sync_my_livery_from_server and session_user_is_local_target(session, user):
+            # The manifest stage skipped the user's own team for the same reason: its
+            # files are the ones the user placed there.
             continue
         key = user.effective_target_key()
         current_slots = existing_slots_by_key.setdefault(key, set())
@@ -18287,12 +18311,25 @@ def clear_session_target_files(
     saved: list[SavedFile],
     paints_dir: Path,
     target_keys: Iterable[tuple[str, int, str]],
+    sync_my_livery_from_server: bool = True,
 ) -> tuple[list[SavedFile], int]:
     changed = {
         (str(kind), int(target_id), str(directory).lower())
         for kind, target_id, directory in target_keys
         if str(kind) in {"team", "user"}
     }
+    if not sync_my_livery_from_server:
+        # The sweep below removes every file a target could have, tracked or not. With
+        # sync off the user's own car and team files are theirs, and nothing would be
+        # downloaded to replace them.
+        changed = {
+            key
+            for key in changed
+            if not (
+                (key[0] == "user" and session.local_user_id is not None and key[1] == int(session.local_user_id))
+                or (key[0] == "team" and session.local_team_id is not None and key[1] == int(session.local_team_id))
+            )
+        }
     if not changed:
         return list(saved or []), 0
     kept: list[SavedFile] = []
@@ -18322,6 +18359,7 @@ def clear_changed_team_driver_target_files(
     saved: list[SavedFile],
     paints_dir: Path,
     changed_team_keys: Iterable[tuple[str, int, str]],
+    sync_my_livery_from_server: bool = True,
 ) -> tuple[list[SavedFile], int]:
     changed = {
         (str(kind), int(target_id), str(directory).lower())
@@ -18335,6 +18373,7 @@ def clear_changed_team_driver_target_files(
         saved=saved,
         paints_dir=paints_dir,
         target_keys=changed,
+        sync_my_livery_from_server=sync_my_livery_from_server,
     )
 
 def _collect_wanted_downloads(
@@ -19006,6 +19045,7 @@ def process_session(
         enabled_slots=team_driver_personal_fallback_slots,
         saved_callback=_on_fallback_saved_items,
         cancel_event=cancel_event,
+        sync_my_livery_from_server=sync_my_livery_from_server,
     )
     if preloaded_saved:
         saved.extend(preloaded_saved)
@@ -21594,6 +21634,23 @@ class DownloaderService:
                     message="iRacing UI car previews are turned off.",
                 )
             return
+        if not bool(getattr(config, "sync_my_livery_from_server", True)):
+            # The previews are the user's own car_<id>.tga files. With sync off those are
+            # the files the user races, so nothing may replace them.
+            if self._ui_preview_sync_event.is_set():
+                self._ui_preview_sync_event.clear()
+            _set_iracing_ui_preview_protected_paths([])
+            if self.get_ui_preview_status().state != "paused":
+                self._set_ui_preview_status(
+                    enabled=True,
+                    state="paused",
+                    message="paused while \"Sync my livery from server\" is off, so your own paint files are left alone.",
+                )
+            return
+        if self.get_ui_preview_status().state == "paused":
+            self._set_ui_preview_status(state="idle", message="iRacing UI car previews are enabled.")
+            with self._lock:
+                self._ui_preview_next_full_sync_at = 0.0
         manual_request = self._ui_preview_sync_event.is_set()
         now = time.monotonic()
         with self._lock:
@@ -21659,6 +21716,8 @@ class DownloaderService:
     def _reassert_ui_previews_now(self, config: AppConfig, paints_dir: Path) -> None:
         """Put the UI preview files back immediately after a cleanup pass."""
         if not bool(getattr(config, "iracing_ui_car_previews", True)):
+            return
+        if not bool(getattr(config, "sync_my_livery_from_server", True)):
             return
         member_id = int(self._ui_preview_member_id or 0)
         if member_id <= 0:
@@ -22160,6 +22219,7 @@ class DownloaderService:
                         saved=last_saved,
                         paints_dir=paints_dir,
                         changed_team_keys=changed_team_driver_keys,
+                        sync_my_livery_from_server=config.sync_my_livery_from_server,
                     )
                     if cleared_count:
                         logging.info(
@@ -22185,6 +22245,7 @@ class DownloaderService:
                         saved=last_saved,
                         paints_dir=paints_dir,
                         target_keys=[partial_target_refresh_key],
+                        sync_my_livery_from_server=config.sync_my_livery_from_server,
                     )
                     if retry_target_refresh_key == partial_target_refresh_key:
                         logging.info(
@@ -22454,12 +22515,16 @@ class DownloaderService:
         finally:
             final_config = self.get_config()
             if last_saved and final_config.delete_downloaded_livery:
-                self._cleanup_saved(
+                # After leaving a session the preserve targets are already reset, so the
+                # remembered member/team id is what keeps the user's own livery here.
+                last_saved = self._cleanup_saved(
                     saved=last_saved,
                     keep_my_livery_locally=final_config.keep_my_livery_locally,
                     preserve_targets=last_session_preserve_targets,
                     reason="Cleaning up session paints before exit",
                     paints_root=paints_dir,
+                    fallback_member_id=last_known_member_id,
+                    fallback_team_id=last_known_team_id,
                 )
             self._update_runtime_snapshot(None, last_saved if "last_saved" in locals() else [], last_known_member_id if "last_known_member_id" in locals() else None, session_rows=[])
             close_sdk_reader(sdk_reader)
@@ -25630,7 +25695,7 @@ class DownloaderUI:
             return "iRacing UI previews: off."
         if status.syncing or status.state == "syncing":
             return "iRacing UI previews: syncing your paints..."
-        if status.state in {"waiting", "warning", "error"}:
+        if status.state in {"waiting", "warning", "error", "paused"}:
             return f"iRacing UI previews: {status.message}"
         if status.state == "ok":
             parts = [f"iRacing UI previews: ready for {status.car_directories} car(s)"]
