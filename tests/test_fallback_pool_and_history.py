@@ -52,18 +52,30 @@ class ShowroomPoolTests(_Patching, unittest.TestCase):
             lambda directory, mapping_path=None: (CAR, {"mid": 264, "category": "Road", "slug": "Ferrari-296-GT3"}),
         )
 
-    def test_the_walk_stops_at_the_first_empty_page(self):
-        cars, sampled = APP._fetch_tp_showroom_pool_http(
-            mid=264,
-            category="Road",
-            slug="Ferrari-296-GT3",
-            min_unused_count=10,
-            max_pages=20,
-        )
-        self.assertEqual(len(cars), 3)
-        # Page 0 and one random page past the end, instead of all 19 empty pages.
-        self.assertEqual(len(self.page_requests), 2)
-        self.assertEqual(len(sampled), 2)
+    def test_the_walk_never_asks_for_a_page_after_an_empty_one(self):
+        for _ in range(20):  # the page order is random
+            self.page_requests.clear()
+            cars, sampled = APP._fetch_tp_showroom_pool_http(
+                mid=264,
+                category="Road",
+                slug="Ferrari-296-GT3",
+                min_unused_count=10,
+                max_pages=20,
+            )
+            self.assertEqual(len(cars), 3)
+            self.assertEqual(self.page_requests[0], 0)
+            first_empty = None
+            for page in self.page_requests[1:]:
+                if first_empty is not None:
+                    self.assertLess(page, first_empty, self.page_requests)
+                first_empty = page if first_empty is None else min(first_empty, page)
+            # It used to request every one of the 19 pages past the end.
+            self.assertLess(len(self.page_requests), 20)
+            self.assertEqual(sampled, set(self.page_requests))
+        with mock.patch.object(APP.random, "shuffle", lambda pages: None):
+            self.page_requests.clear()
+            APP._fetch_tp_showroom_pool_http(mid=264, category="Road", slug="Ferrari-296-GT3", min_unused_count=10, max_pages=20)
+        self.assertEqual(self.page_requests, [0, 1])
 
     def test_a_forced_favorite_hands_the_fetched_pool_back_unchanged(self):
         pool = [_scheme(1), _scheme(2), _scheme(3)]
