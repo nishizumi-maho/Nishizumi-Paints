@@ -61,11 +61,11 @@ Each Trading Paints showroom list page (`showroom.php`) takes a few seconds to a
 
 ## Lane modes
 
-The lane settings in the General tab control how many car groups can be processed online at the same time.
+The lane settings in the General tab control how many car models (car directories) are processed online at the same time. Inside one lane the drivers of that car are handled one after the other, so two drivers sharing a target are never filled twice.
 
 ### Safe
 
-Safe mode runs one car lane at a time. It is slower, but it keeps the public fallback stage easier to reason about.
+Safe mode runs one car lane at a time. It is slower, but it sends the fewest requests to Trading Paints at once.
 
 ### Manual
 
@@ -73,17 +73,13 @@ Manual mode runs up to the user-selected lane count.
 
 ### Session Total
 
-Session Total runs one lane per car group with no extra protective hard cap. It is the most aggressive mode.
+Session Total runs one lane per car model with no extra cap. It is the fastest mode.
+
+The log line `Trading Paints public showroom fallback: N car group(s) in M lane(s)` shows what a pass used.
 
 ## Process cars, helmets, and suits together
 
-When the advanced `process all together` option is enabled, the app can run:
-
-- car lanes
-- helmet stage
-- suit stage
-
-at the same time.
+When the advanced `process all together` option is enabled, the helmet stage and the suit stage run at the same time as the car lanes.
 
 When it is disabled, the order becomes:
 
@@ -93,9 +89,7 @@ When it is disabled, the order becomes:
 
 ## Retry policy
 
-The online fallback can give timed-out targets a final retry stage before the app gives up and falls back locally.
-
-This is separate from the normal HTTP retry loop. It is about targets that were accepted into the online fallback process but still did not finish in time.
+Each car, helmet, or suit gets up to four online picks: when a picked paint cannot be downloaded, another one is picked. With the final retry option on, a paint that still failed to download gets one more online pick after every lane has finished. A pool with nothing left to pick is not retried. Only what is still missing after that comes from the local RandomPool.
 
 ## Spec maps
 
@@ -115,7 +109,7 @@ The goal is to reduce visible repetition within the same session and across cons
 
 From the Session tab, a random fallback source can be marked as a favorite or blocked.
 
-- favorites are preferred when the same item type is randomized again
+- a favorite is used once per session: the first driver who needs a random paint of that type (and, for cars, that car) gets it, and every later driver in the session gets another paint
 - blocked sources are skipped by both public showroom fallback and Local RandomPool fallback
 - car preferences are scoped to the car directory
 - helmet and suit preferences are scoped by item type

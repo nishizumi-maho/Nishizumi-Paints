@@ -4494,26 +4494,89 @@ def _iter_random_pool_accessory_sources(accessory_kind: str, random_pool_dir: Pa
             results.append((child, source_id))
     return results
 
-def _choose_random_pool_entry(directory: str, random_pool_dir: Path, ai_livery_root: Path, used_source_ids: set[str], seed_text: str) -> tuple[RandomPoolEntry | None, bool]:
-    preferences = load_random_paint_preferences()
+class RandomPoolPassCache:
+    """What one fallback pass reads from disk once instead of once per driver.
+
+    Every pick used to reload the preferences file and walk the whole RandomPool and
+    AI livery folders again, which on a big grid and a big pool meant hundreds of
+    directory walks between the downloads and the texture reload.
+    """
+
+    def __init__(self, random_pool_dir: Path, ai_livery_root: Path, preferences: dict[str, object] | None = None) -> None:
+        self.random_pool_dir = Path(random_pool_dir)
+        self.ai_livery_root = Path(ai_livery_root)
+        self.preferences = preferences if isinstance(preferences, dict) else load_random_paint_preferences()
+        self._entries: dict[str, list[RandomPoolEntry]] = {}
+        self._accessories: dict[str, list[tuple[Path, str]]] = {}
+
+    def entries(self, directory: str) -> list[RandomPoolEntry]:
+        key = str(directory or "")
+        if key not in self._entries:
+            self._entries[key] = _iter_random_pool_entries_for_directory(key, self.random_pool_dir, self.ai_livery_root)
+        return self._entries[key]
+
+    def accessories(self, accessory_kind: str) -> list[tuple[Path, str]]:
+        key = str(accessory_kind or "").strip().lower()
+        if key not in self._accessories:
+            self._accessories[key] = _iter_random_pool_accessory_sources(key, self.random_pool_dir, self.ai_livery_root)
+        return self._accessories[key]
+
+def random_favorites_used_in_session(saved_items: Iterable[SavedFile] | None, preferences: dict[str, object] | None = None) -> set[str]:
+    """Favorite random paints already applied in this session.
+
+    A favorite is used once per session: the first driver who needs a random paint
+    gets it, and later drivers, in this pass or a later one, get other paints.
+    """
+    prefs = preferences if isinstance(preferences, dict) else load_random_paint_preferences()
+    favorites = prefs.get("favorites") if isinstance(prefs, dict) else {}
+    favorite_ids: set[str] = set()
+    for entry in (favorites.values() if isinstance(favorites, dict) else []):
+        if not isinstance(entry, dict):
+            continue
+        for field_name in ("source_id", "scheme_id"):
+            value = str(entry.get(field_name) or "").strip()
+            if value:
+                favorite_ids.add(value)
+    if not favorite_ids:
+        return set()
+    used = {str(getattr(item.download_id, "tp_scheme_id", "") or "").strip() for item in saved_items or []}
+    return favorite_ids & used
+
+def _choose_random_pool_entry(
+    directory: str,
+    random_pool_dir: Path,
+    ai_livery_root: Path,
+    used_source_ids: set[str],
+    seed_text: str,
+    pool_cache: RandomPoolPassCache | None = None,
+) -> tuple[RandomPoolEntry | None, bool]:
+    preferences = pool_cache.preferences if pool_cache is not None else load_random_paint_preferences()
     blocked_source_ids = random_paint_blocked_source_ids("car", directory, preferences)
     favorite_source_ids = random_paint_favorite_source_ids("car", directory, preferences)
+    pool_entries = (
+        pool_cache.entries(directory)
+        if pool_cache is not None
+        else _iter_random_pool_entries_for_directory(directory, random_pool_dir, ai_livery_root)
+    )
     candidates = [
         entry
-        for entry in _iter_random_pool_entries_for_directory(directory, random_pool_dir, ai_livery_root)
+        for entry in pool_entries
         if entry.car_file is not None
         and entry.car_file.exists()
         and entry.source_id not in blocked_source_ids
     ]
     if not candidates:
         return None, False
-    favorite_candidates = [entry for entry in candidates if entry.source_id in favorite_source_ids]
-    if favorite_candidates:
-        favorite_available = [entry for entry in favorite_candidates if entry.source_id not in used_source_ids] or favorite_candidates
+    # A favorite is used once per session; once every favorite was used, the normal
+    # pick below skips them like any other used source.
+    favorite_available = [
+        entry for entry in candidates if entry.source_id in favorite_source_ids and entry.source_id not in used_source_ids
+    ]
+    if favorite_available:
         rng = random.Random(seed_text + "|favorite")
         selected = favorite_available[rng.randrange(len(favorite_available))]
         used_source_ids.add(selected.source_id)
-        return selected, True
+        return selected, False
     available = [entry for entry in candidates if entry.source_id not in used_source_ids]
     if not available:
         return None, False
@@ -4557,12 +4620,17 @@ def _choose_random_accessory_pool_source(
     ai_livery_root: Path,
     used_source_ids: set[str],
     seed_text: str,
+    pool_cache: RandomPoolPassCache | None = None,
 ) -> tuple[Path | None, str | None]:
-    preferences = load_random_paint_preferences()
+    preferences = pool_cache.preferences if pool_cache is not None else load_random_paint_preferences()
     blocked_source_ids = random_paint_blocked_source_ids(accessory_kind, "", preferences)
     blocked_set_keys = _blocked_random_pool_set_keys(blocked_source_ids)
     favorite_source_ids = random_paint_favorite_source_ids(accessory_kind, "", preferences)
-    candidates = _iter_random_pool_accessory_sources(accessory_kind, random_pool_dir, ai_livery_root)
+    candidates = (
+        pool_cache.accessories(accessory_kind)
+        if pool_cache is not None
+        else _iter_random_pool_accessory_sources(accessory_kind, random_pool_dir, ai_livery_root)
+    )
     candidates = [
         (path, source_id)
         for path, source_id in candidates
@@ -4571,16 +4639,21 @@ def _choose_random_accessory_pool_source(
     ]
     if not candidates:
         return None, None
-    favorite_candidates = [(path, source_id) for path, source_id in candidates if source_id in favorite_source_ids]
-    if favorite_candidates:
-        favorite_available = [(path, source_id) for path, source_id in favorite_candidates if source_id not in used_source_ids] or favorite_candidates
+    favorite_available = [
+        (path, source_id)
+        for path, source_id in candidates
+        if source_id in favorite_source_ids and source_id not in used_source_ids
+    ]
+    if favorite_available:
         rng = random.Random(seed_text + "|favorite")
         chosen_path, chosen_id = favorite_available[rng.randrange(len(favorite_available))]
         used_source_ids.add(chosen_id)
         return chosen_path, chosen_id
     available = [(path, source_id) for path, source_id in candidates if source_id not in used_source_ids]
     if not available:
-        available = candidates
+        # Helmets and suits repeat once every one was used, but a favorite still
+        # stays at once per session while anything else is left.
+        available = [(path, source_id) for path, source_id in candidates if source_id not in favorite_source_ids] or candidates
     if not available:
         return None, None
     rng = random.Random(seed_text)
@@ -5655,6 +5728,7 @@ def assign_driver_paint_override_from_showroom_public(
     retries: int = 3,
     retry_backoff_seconds: float = 1.5,
     cancel_event: threading.Event | None = None,
+    session_saved: Iterable[SavedFile] | None = None,
 ) -> tuple[list[SavedFile], list[str], dict[str, object] | None]:
     normalized_kind = _driver_paint_override_kind(kind)
     if normalized_kind != "car":
@@ -5671,7 +5745,8 @@ def assign_driver_paint_override_from_showroom_public(
         exclude_scheme_ids = random_paint_blocked_scheme_ids("car", user.directory, random_preferences)
         favorite_entry = random_paint_favorite_online_entry("car", user.directory, random_preferences)
         favorite_scheme_id = str((favorite_entry or {}).get("scheme_id") or "").strip()
-        if favorite_scheme_id and favorite_scheme_id not in exclude_scheme_ids:
+        favorite_used = favorite_scheme_id in random_favorites_used_in_session(session_saved, random_preferences)
+        if favorite_scheme_id and favorite_scheme_id not in exclude_scheme_ids and not favorite_used:
             forced_scheme_id = favorite_scheme_id
             forced_title = str((favorite_entry or {}).get("title") or f"favorite scheme {favorite_scheme_id}").strip()
     result = choose_showroom_paint_direct(
@@ -5743,10 +5818,12 @@ def assign_driver_paint_override_from_showroom(
     retry_backoff_seconds: float = 1.5,
     cancel_event: threading.Event | None = None,
     _thread_handoff_done: bool = False,
+    session_saved: Iterable[SavedFile] | None = None,
 ) -> tuple[list[SavedFile], list[str], dict[str, object] | None]:
     normalized_kind = _driver_paint_override_kind(kind)
     if normalized_kind == "car":
         return assign_driver_paint_override_from_showroom_public(
+            session_saved=session_saved,
             session=session,
             user=user,
             kind=normalized_kind,
@@ -5775,7 +5852,10 @@ def _apply_local_tp_random_fallback_assets_for_user(
     need_car: bool,
     need_helmet: bool,
     need_suit: bool,
+    pool_cache: RandomPoolPassCache | None = None,
 ) -> tuple[list[SavedFile], list[str], bool]:
+    if pool_cache is None:
+        pool_cache = RandomPoolPassCache(random_pool_dir, ai_livery_root)
     target_is_team = session_user_uses_team_target(user)
     target_id = int(user.team_id) if target_is_team else int(user.user_id)
     label = user.display_name or (f"AI {target_id}" if user.is_ai else f"user {target_id}")
@@ -5790,7 +5870,9 @@ def _apply_local_tp_random_fallback_assets_for_user(
         # Only a driver who needs a car takes a car set. A driver who only needs a
         # helmet or suit picks from the accessory sources, which include the helmets
         # and suits of every pool set, so no car set is used up for later drivers.
-        entry, reused_existing_source = _choose_random_pool_entry(user.directory, random_pool_dir, ai_livery_root, used_source_ids, seed_text)
+        entry, reused_existing_source = _choose_random_pool_entry(
+            user.directory, random_pool_dir, ai_livery_root, used_source_ids, seed_text, pool_cache=pool_cache
+        )
 
     base_kwargs = {
         "user_id": target_id,
@@ -5826,7 +5908,9 @@ def _apply_local_tp_random_fallback_assets_for_user(
     if need_helmet:
         helmet_source = entry.helmet_file if entry is not None else None
         helmet_source_id = entry.source_id if helmet_source is not None else None
-        if _random_pool_bundled_accessory_blocked(helmet_source, helmet_source_id, random_paint_blocked_source_ids("helmet")):
+        if _random_pool_bundled_accessory_blocked(
+            helmet_source, helmet_source_id, random_paint_blocked_source_ids("helmet", "", pool_cache.preferences)
+        ):
             helmet_source = helmet_source_id = None
         if helmet_source is None or not helmet_source.exists():
             helmet_source, helmet_source_id = _choose_random_accessory_pool_source(
@@ -5835,6 +5919,7 @@ def _apply_local_tp_random_fallback_assets_for_user(
                 ai_livery_root,
                 used_source_ids,
                 seed_text + "|helmet",
+                pool_cache=pool_cache,
             )
         copied = _copy_source_file_to_saved_targets(
             helmet_source,
@@ -5856,7 +5941,9 @@ def _apply_local_tp_random_fallback_assets_for_user(
     if need_suit:
         suit_source = entry.suit_file if entry is not None else None
         suit_source_id = entry.source_id if suit_source is not None else None
-        if _random_pool_bundled_accessory_blocked(suit_source, suit_source_id, random_paint_blocked_source_ids("suit")):
+        if _random_pool_bundled_accessory_blocked(
+            suit_source, suit_source_id, random_paint_blocked_source_ids("suit", "", pool_cache.preferences)
+        ):
             suit_source = suit_source_id = None
         if suit_source is None or not suit_source.exists():
             suit_source, suit_source_id = _choose_random_accessory_pool_source(
@@ -5865,6 +5952,7 @@ def _apply_local_tp_random_fallback_assets_for_user(
                 ai_livery_root,
                 used_source_ids,
                 seed_text + "|suit",
+                pool_cache=pool_cache,
             )
         copied = _copy_source_file_to_saved_targets(
             suit_source,
@@ -5968,10 +6056,12 @@ def apply_local_tp_random_fallbacks(
     disable_random_for_local_user: bool = False,
     saved_callback: Callable[[list[SavedFile], str], None] | None = None,
     cancel_event: threading.Event | None = None,
+    session_saved: Iterable[SavedFile] | None = None,
 ) -> tuple[list[SavedFile], list[str], RandomFallbackSummary]:
     logs: list[str] = []
     fallback_saved: list[SavedFile] = []
     summary = RandomFallbackSummary()
+    pool_cache = RandomPoolPassCache(random_pool_dir, ai_livery_root)
     existing_car_targets = {
         (bool(item.download_id.is_team_paint), int(item.download_id.user_id), item.download_id.directory.lower())
         for item in saved
@@ -5987,7 +6077,10 @@ def apply_local_tp_random_fallbacks(
         for item in saved
         if item.download_id.paint_type is PaintType.SUIT
     }
-    used_source_ids: set[str] = set()
+    # Favorites already applied earlier in this session (an earlier pass) count as used.
+    used_source_ids: set[str] = random_favorites_used_in_session(
+        [*(session_saved or []), *saved], pool_cache.preferences
+    )
     matched_ai_users = 0
     skipped_team_event_targets = 0
     skipped_local_targets = 0
@@ -6037,6 +6130,7 @@ def apply_local_tp_random_fallbacks(
             need_car=need_car,
             need_helmet=need_helmet,
             need_suit=need_suit,
+            pool_cache=pool_cache,
         )
         logs.extend(item_logs)
         if reused_existing_source:
@@ -14344,6 +14438,35 @@ def apply_tp_collection_pool_fallbacks(
         logs.append("Collection pool random fallback skipped the local driver because 'Do not apply random paints to myself' is enabled.")
     return fallback_saved, logs, summary
 
+def resolve_tp_fallback_lane_count(lanes_mode: str, manual_max_lanes: int, car_group_count: int) -> int:
+    """How many car groups the online fallback works on at the same time.
+
+    Safe runs one car group at a time, Manual runs up to the chosen number, and
+    Session Total runs every car group at once.
+    """
+    groups = max(0, int(car_group_count or 0))
+    if groups <= 0:
+        return 0
+    mode = normalize_tp_fallback_lanes_mode(lanes_mode)
+    if mode == "safe":
+        return 1
+    if mode == "manual":
+        try:
+            manual = int(manual_max_lanes)
+        except (TypeError, ValueError):
+            manual = 1
+        return max(1, min(groups, manual, 100))
+    return groups
+
+
+_FALLBACK_SLOT_FOR_PAINT_TYPE = {
+    PaintType.CAR: "car",
+    PaintType.CAR_NUMBER: "car",
+    PaintType.HELMET: "helmet",
+    PaintType.SUIT: "suit",
+}
+
+
 def apply_tp_showroom_fallbacks_public(
     session: Session,
     saved: list[SavedFile],
@@ -14366,7 +14489,24 @@ def apply_tp_showroom_fallbacks_public(
     retry_backoff_seconds: float = 1.5,
     saved_callback: Callable[[list[SavedFile], str], None] | None = None,
     cancel_event: threading.Event | None = None,
+    tp_fallback_lanes_mode: str = "safe",
+    tp_manual_max_lanes: int = 1,
+    process_all_together: bool = False,
+    retry_failed_online_once: bool = False,
+    session_saved: Iterable[SavedFile] | None = None,
 ) -> tuple[list[SavedFile], list[str], RandomFallbackSummary]:
+    """Fill missing paints with random public showroom paints, then the local pool.
+
+    The work runs in stages:
+
+    1. Car lanes: one lane per car group (car directory), sequential inside a lane.
+       The lane mode sets how many lanes run at the same time.
+    2. Helmets and suits: next to the car lanes when ``process_all_together`` is
+       on, otherwise after them.
+    3. When ``retry_failed_online_once`` is on, every car, helmet, or suit whose
+       download failed gets one more online attempt.
+    4. The local random pool covers whatever is still missing.
+    """
     logs: list[str] = []
     fallback_saved: list[SavedFile] = []
     summary = RandomFallbackSummary()
@@ -14399,13 +14539,18 @@ def apply_tp_showroom_fallbacks_public(
     recent_schemes_by_directory = load_tp_recent_schemes()
     random_preferences = load_random_paint_preferences()
     recent_history_changed = False
-    used_showroom_scheme_ids: set[str] = set()
+    # Lanes run in parallel, so everything they share is read and changed under this lock.
+    state_lock = threading.RLock()
+    callback_lock = threading.Lock()
+    # A favorite is used once per session, so one already applied earlier counts as used.
+    favorites_used = random_favorites_used_in_session([*(session_saved or []), *saved], random_preferences)
+    used_showroom_scheme_ids: set[str] = set(favorites_used)
     # A favorite that could not be downloaded is not forced again for later drivers,
     # which each paid the full download retries for the same missing scheme.
     failed_favorite_scheme_ids: set[str] = set()
     random_pool_dir = default_random_pool_dir()
     ai_livery_root = default_ai_livery_dir()
-    local_fallback_used_source_ids: set[str] = set()
+    local_fallback_used_source_ids: set[str] = set(favorites_used)
     matched_ai_users = 0
     skipped_team_event_targets = 0
     skipped_local_targets = 0
@@ -14414,130 +14559,186 @@ def apply_tp_showroom_fallbacks_public(
     showroom_cache_by_accessory_kind: dict[tuple[str, str], dict[str, object]] = {}
 
     def _record_saved_items(items: list[SavedFile]) -> None:
-        for item in items:
-            key = (bool(item.download_id.is_team_paint), int(item.download_id.user_id), item.download_id.directory.lower())
-            accessory_key = (bool(item.download_id.is_team_paint), int(item.download_id.user_id))
-            if item.download_id.paint_type in PRIMARY_CAR_PAINT_TYPES:
-                existing_car_targets.add(key)
-            elif item.download_id.paint_type is PaintType.HELMET:
-                existing_helmet_targets.add(accessory_key)
-            elif item.download_id.paint_type is PaintType.SUIT:
-                existing_suit_targets.add(accessory_key)
+        with state_lock:
+            for item in items:
+                key = (bool(item.download_id.is_team_paint), int(item.download_id.user_id), item.download_id.directory.lower())
+                accessory_key = (bool(item.download_id.is_team_paint), int(item.download_id.user_id))
+                if item.download_id.paint_type in PRIMARY_CAR_PAINT_TYPES:
+                    existing_car_targets.add(key)
+                elif item.download_id.paint_type is PaintType.HELMET:
+                    existing_helmet_targets.add(accessory_key)
+                elif item.download_id.paint_type is PaintType.SUIT:
+                    existing_suit_targets.add(accessory_key)
 
-    def _apply_public_accessory_fallback_for_user(
+    def _notify_saved(items: list[SavedFile], status_code: str) -> None:
+        # The callback updates the session rows and the reload debouncer; one lane at a time.
+        if saved_callback is None or _cancel_requested(cancel_event):
+            return
+        with callback_lock:
+            try:
+                saved_callback(items, status_code)
+            except Exception:
+                logging.debug("Public showroom fallback save callback failed", exc_info=True)
+
+    def _claim_favorite(favorite_scheme_id: str, blocked_scheme_ids: set[str]) -> str:
+        if not favorite_scheme_id or favorite_scheme_id in blocked_scheme_ids:
+            return ""
+        with state_lock:
+            if favorite_scheme_id in used_showroom_scheme_ids or favorite_scheme_id in failed_favorite_scheme_ids:
+                return ""
+            used_showroom_scheme_ids.add(favorite_scheme_id)
+        return favorite_scheme_id
+
+    def _apply_online_pick(
         *,
         user: SessionUser,
         label: str,
-        accessory_kind: str,
+        kind: str,
         applied_items_for_target: list[SavedFile],
-    ) -> bool:
+        lane_logs: list[str],
+        attempts: int,
+        allow_favorite: bool,
+    ) -> str:
+        """One car, helmet, or suit from the public showroom.
+
+        Returns "applied", "no_choice" (no usable paint left to pick), "failed"
+        (picked paints could not be downloaded), or "cancelled".
+        """
         nonlocal recent_history_changed
-        normalized_kind = str(accessory_kind or "").strip().lower()
-        if normalized_kind not in {"helmet", "suit"}:
-            return False
         showroom_source = choose_tp_showroom_source(showroom_source_keys)
-        accessory_cache_key = (normalized_kind, showroom_source)
-        accessory_cache = showroom_cache_by_accessory_kind.setdefault(
-            accessory_cache_key,
-            {"cars": [], "sampled_pages": set(), "detected_total_pages": 0},
-        )
-        recent_key = f"driver:{normalized_kind}"
-        recent_scheme_ids = {
-            str(item).strip()
-            for item in recent_schemes_by_directory.get(recent_key, [])
-            if str(item).strip()
-        }
-        blocked_scheme_ids = random_paint_blocked_scheme_ids(normalized_kind, "", random_preferences)
-        favorite_entry = random_paint_favorite_online_entry(normalized_kind, "", random_preferences)
-        favorite_scheme_id = str((favorite_entry or {}).get("scheme_id") or "").strip()
+        where = f" on {user.directory}" if kind == "car" else ""
+        if kind == "car":
+            recent_key = canonicalize_car_directory(user.directory).lower()
+            cache_store = showroom_cache_by_directory
+            blocked_scheme_ids = random_paint_blocked_scheme_ids("car", user.directory, random_preferences)
+            favorite_entry = random_paint_favorite_online_entry("car", user.directory, random_preferences) if allow_favorite else None
+        else:
+            recent_key = f"driver:{kind}"
+            cache_store = showroom_cache_by_accessory_kind
+            blocked_scheme_ids = random_paint_blocked_scheme_ids(kind, "", random_preferences)
+            favorite_entry = random_paint_favorite_online_entry(kind, "", random_preferences) if allow_favorite else None
+        with state_lock:
+            cache = cache_store.setdefault(
+                (recent_key if kind == "car" else kind, showroom_source),
+                {"cars": [], "sampled_pages": set(), "detected_total_pages": 0},
+            )
+            recent_scheme_ids = {
+                str(item).strip()
+                for item in recent_schemes_by_directory.get(recent_key, [])
+                if str(item).strip()
+            }
+        favorite_scheme_id = _claim_favorite(str((favorite_entry or {}).get("scheme_id") or "").strip(), set(blocked_scheme_ids))
         favorite_title = str((favorite_entry or {}).get("title") or "").strip()
-        if favorite_scheme_id in blocked_scheme_ids or favorite_scheme_id in failed_favorite_scheme_ids:
-            favorite_scheme_id = ""
-        for _attempt in range(1, 5):
+        for attempt in range(1, max(1, int(attempts)) + 1):
             if _cancel_requested(cancel_event):
-                break
-            forced_scheme_id = favorite_scheme_id if _attempt == 1 else ""
-            attempt_excluded_scheme_ids = set(used_showroom_scheme_ids) | set(blocked_scheme_ids)
+                return "cancelled"
+            forced_scheme_id = favorite_scheme_id if attempt == 1 else ""
+            with state_lock:
+                attempt_excluded_scheme_ids = set(used_showroom_scheme_ids) | set(blocked_scheme_ids)
+                cached_cars = list(cache.get("cars") or [])
+                cached_pages = set(cache.get("sampled_pages") or set())
+                cached_total_pages = int(cache.get("detected_total_pages") or 0)
             if forced_scheme_id:
                 attempt_excluded_scheme_ids.discard(forced_scheme_id)
-            result = choose_showroom_accessory_direct(
-                accessory_kind=normalized_kind,
+            choice_kwargs = dict(
                 pages=TP_SHOWROOM_MAX_PAGES,
                 prefer_official=False,
                 choice_mode="random",
                 showroom_sources=[showroom_source],
                 exclude_scheme_ids=attempt_excluded_scheme_ids,
                 exclude_recent_scheme_ids=recent_scheme_ids,
-                showroom_cars=list(accessory_cache.get("cars") or []),
-                showroom_sampled_pages=set(accessory_cache.get("sampled_pages") or set()),
-                detected_total_pages=int(accessory_cache.get("detected_total_pages") or 0),
+                showroom_cars=cached_cars,
+                showroom_sampled_pages=cached_pages,
+                detected_total_pages=cached_total_pages,
                 detect_total_pages=detect_showroom_total_pages,
                 minimum_unused_choices=1,
                 allow_reuse_existing_scheme=False,
                 forced_scheme_id=forced_scheme_id,
                 forced_scheme_title=favorite_title,
-                log=logs.append,
+                log=lane_logs.append,
                 cancel_event=cancel_event,
             )
-            if result.showroom_cars:
-                accessory_cache["cars"] = list(result.showroom_cars)
-            if result.showroom_sampled_pages:
-                accessory_cache["sampled_pages"] = set(int(item) for item in result.showroom_sampled_pages)
-            if int(result.detected_total_pages or 0) > 0:
-                accessory_cache["detected_total_pages"] = int(result.detected_total_pages or 0)
+            if kind == "car":
+                result = choose_showroom_paint_direct(directory=user.directory, mapping_path=mapping_path, **choice_kwargs)
+            else:
+                result = choose_showroom_accessory_direct(accessory_kind=kind, **choice_kwargs)
+            with state_lock:
+                if result.showroom_cars:
+                    cache["cars"] = list(result.showroom_cars)
+                if result.showroom_sampled_pages:
+                    cache["sampled_pages"] = set(int(item) for item in result.showroom_sampled_pages)
+                if int(result.detected_total_pages or 0) > 0:
+                    cache["detected_total_pages"] = int(result.detected_total_pages or 0)
             if not result.ok:
-                logs.append(f"Public showroom random {normalized_kind} fallback could not select a paint for {label}: {result.message}")
-                break
+                lane_logs.append(f"Public showroom random {kind} fallback could not select a paint for {label}{where}: {result.message}")
+                if _cancel_requested(cancel_event):
+                    return "cancelled"
+                # Nothing to pick on the first try means a retry has nothing to pick
+                # either; after failed downloads it is still a failed download.
+                return "no_choice" if attempt == 1 else "failed"
             chosen_scheme_id = str(result.chosen_scheme_id or "").strip()
             if chosen_scheme_id:
-                used_showroom_scheme_ids.add(chosen_scheme_id)
+                with state_lock:
+                    used_showroom_scheme_ids.add(chosen_scheme_id)
             try:
-                saved_items = _download_and_save_direct_showroom_accessory_result(
-                    session=session,
-                    user=user,
-                    result=result,
-                    accessory_kind=normalized_kind,
-                    temp_dir=temp_root,
-                    paints_dir=paints_dir,
-                    retries=retries,
-                    retry_backoff_seconds=retry_backoff_seconds,
-                    source_label="fallback_online",
-                    preserve_on_cleanup=False,
-                    log=logs.append,
-                    cancel_event=cancel_event,
-                )
+                if kind == "car":
+                    saved_items = _download_and_save_direct_showroom_car_result(
+                        session=session,
+                        user=user,
+                        result=result,
+                        temp_dir=temp_root,
+                        paints_dir=paints_dir,
+                        retries=retries,
+                        retry_backoff_seconds=retry_backoff_seconds,
+                        source_label="fallback_online",
+                        preserve_on_cleanup=False,
+                        log=lane_logs.append,
+                        cancel_event=cancel_event,
+                    )
+                else:
+                    saved_items = _download_and_save_direct_showroom_accessory_result(
+                        session=session,
+                        user=user,
+                        result=result,
+                        accessory_kind=kind,
+                        temp_dir=temp_root,
+                        paints_dir=paints_dir,
+                        retries=retries,
+                        retry_backoff_seconds=retry_backoff_seconds,
+                        source_label="fallback_online",
+                        preserve_on_cleanup=False,
+                        log=lane_logs.append,
+                        cancel_event=cancel_event,
+                    )
             except Exception as exc:  # noqa: BLE001
                 # A disk or file-lock error is one failed paint, not a failed session pass.
-                logs.append(f"Public showroom {normalized_kind} for {label} could not be saved: {exc}")
+                lane_logs.append(f"Public showroom {kind} for {label}{where} could not be saved: {exc}")
                 saved_items = []
             if not saved_items:
                 if forced_scheme_id:
-                    failed_favorite_scheme_ids.add(forced_scheme_id)
-                logs.append(
-                    f"Public showroom paint {chosen_scheme_id or '(unknown)'} for {label} {normalized_kind} was unavailable or could not be saved; trying another paint."
+                    with state_lock:
+                        failed_favorite_scheme_ids.add(forced_scheme_id)
+                lane_logs.append(
+                    f"Public showroom paint {chosen_scheme_id or '(unknown)'} for {label} {kind}{where} was unavailable or could not be saved; trying another paint."
                 )
                 continue
             applied_items_for_target.extend(saved_items)
-            fallback_saved.extend(saved_items)
+            with state_lock:
+                fallback_saved.extend(saved_items)
+                if chosen_scheme_id:
+                    remember_tp_recent_scheme(recent_schemes_by_directory, recent_key, chosen_scheme_id)
+                    recent_history_changed = True
+                if result.reused_previous_scheme:
+                    summary.repeated_source_uses += 1
             _record_saved_items(saved_items)
-            if saved_callback is not None and not _cancel_requested(cancel_event):
-                try:
-                    saved_callback(saved_items, "fallback_online")
-                except Exception:
-                    logging.debug("Public showroom accessory fallback save callback failed", exc_info=True)
-            if chosen_scheme_id:
-                remember_tp_recent_scheme(recent_schemes_by_directory, recent_key, chosen_scheme_id)
-                recent_history_changed = True
-            if result.reused_previous_scheme:
-                summary.repeated_source_uses += 1
+            _notify_saved(saved_items, "fallback_online")
             title = str(result.chosen_title or "").strip()
             source_label = tp_showroom_source_label(result.showroom_source or showroom_source)
-            logs.append(
-                f"Public showroom random {normalized_kind} fallback applied to {'AI' if user.is_ai else 'driver'} {label}: scheme {chosen_scheme_id}{f' - {title}' if title else ''} [{source_label}]."
+            lane_logs.append(
+                f"Public showroom random {kind} fallback applied to {'AI' if user.is_ai else 'driver'} {label}{where}: scheme {chosen_scheme_id}{f' - {title}' if title else ''} [{source_label}]."
             )
-            return True
-        logs.append(f"Public showroom {normalized_kind} fallback could not cover {label}; using the local random pool backup if available.")
-        return False
+            return "applied"
+        return "cancelled" if _cancel_requested(cancel_event) else "failed"
 
     def _fallback_needs(user: SessionUser) -> tuple[str, bool, bool, bool]:
         """(skip reason, need car, need helmet, need suit) for one session target."""
@@ -14558,23 +14759,52 @@ def apply_tp_showroom_fallbacks_public(
             return "local", False, False, False
         if is_local_target and not sync_my_livery_from_server:
             return "disabled", False, False, False
-        target_is_team = session_user_uses_team_target(user)
-        target_id = int(user.team_id) if target_is_team else int(user.user_id)
-        target_key = (target_is_team, target_id, user.directory.lower())
-        accessory_target_key = (target_is_team, target_id)
-        need_car = car_enabled_for_user and target_key not in existing_car_targets
-        need_helmet = bool(random_helmets) and helmet_enabled_for_user and accessory_target_key not in existing_helmet_targets
-        need_suit = bool(random_suits) and suit_enabled_for_user and accessory_target_key not in existing_suit_targets
+        need_car = car_enabled_for_user and not _covered(user, "car")
+        need_helmet = bool(random_helmets) and helmet_enabled_for_user and not _covered(user, "helmet")
+        need_suit = bool(random_suits) and suit_enabled_for_user and not _covered(user, "suit")
         return "", need_car, need_helmet, need_suit
 
+    def _covered(user: SessionUser, slot: str) -> bool:
+        target_is_team = session_user_uses_team_target(user)
+        target_id = int(user.team_id) if target_is_team else int(user.user_id)
+        with state_lock:
+            if slot == "car":
+                return (target_is_team, target_id, user.directory.lower()) in existing_car_targets
+            existing = existing_helmet_targets if slot == "helmet" else existing_suit_targets
+            return (target_is_team, target_id) in existing
+
     ordered_users = sorted(session.users, key=lambda u: (u.is_ai, u.directory.lower(), u.user_id, u.team_id or 0))
-    prefetch_pools: set[tuple[int, str, str]] = set()
+    targets: list[dict[str, Any]] = []
     for user in ordered_users:
-        reason, need_car, need_helmet, need_suit = _fallback_needs(user)
-        if reason:
+        if user.is_ai:
+            matched_ai_users += 1
+        skip_reason, need_car, need_helmet, need_suit = _fallback_needs(user)
+        if skip_reason == "team":
+            skipped_team_event_targets += 1
             continue
-        if need_car:
-            mapping = _tp_showroom_mapping_entry_for_directory(str(user.directory or "").strip(), mapping_path)
+        if skip_reason == "local":
+            skipped_local_targets += 1
+            continue
+        if skip_reason or not (need_car or need_helmet or need_suit):
+            continue
+        target_is_team = session_user_uses_team_target(user)
+        target_id = int(user.team_id) if target_is_team else int(user.user_id)
+        targets.append(
+            {
+                "user": user,
+                "label": user.display_name or (f"AI {target_id}" if user.is_ai else f"user {target_id}"),
+                "needed": [slot for slot, needed in (("car", need_car), ("helmet", need_helmet), ("suit", need_suit)) if needed],
+                "done": set(),
+                "retry": set(),
+                "items": [],
+                "tried": False,
+            }
+        )
+
+    prefetch_pools: set[tuple[int, str, str]] = set()
+    for target in targets:
+        if "car" in target["needed"]:
+            mapping = _tp_showroom_mapping_entry_for_directory(str(target["user"].directory or "").strip(), mapping_path)
             if mapping is not None:
                 entry = mapping[1]
                 mid = int(entry.get("mid") or 0)
@@ -14584,9 +14814,9 @@ def apply_tp_showroom_fallbacks_public(
                         str(entry.get("category") or "Road").strip() or "Road",
                         str(entry.get("slug") or f"car-{mid}").strip() or f"car-{mid}",
                     ))
-        if need_helmet:
+        if "helmet" in target["needed"]:
             prefetch_pools.add((118, "Driver", "Helmets"))
-        if need_suit:
+        if "suit" in target["needed"]:
             prefetch_pools.add((119, "Driver", "Suits"))
     if prefetch_pools:
         prefetch_started = time.monotonic()
@@ -14598,183 +14828,145 @@ def apply_tp_showroom_fallbacks_public(
             time.monotonic() - prefetch_started,
         )
 
+    def _run_online_slot(slot_targets: list[dict[str, Any]], slot: str, lane_logs: list[str], *, attempts: int, allow_favorite: bool, only_retry: bool = False) -> None:
+        try:
+            for target in slot_targets:
+                if _cancel_requested(cancel_event):
+                    return
+                if slot not in target["needed"] or slot in target["done"]:
+                    continue
+                if only_retry and slot not in target["retry"]:
+                    continue
+                if _covered(target["user"], slot):
+                    # Another session user with the same target got it in this pass.
+                    target["done"].add(slot)
+                    continue
+                target["tried"] = True
+                outcome = _apply_online_pick(
+                    user=target["user"],
+                    label=target["label"],
+                    kind=slot,
+                    applied_items_for_target=target["items"],
+                    lane_logs=lane_logs,
+                    attempts=attempts,
+                    allow_favorite=allow_favorite,
+                )
+                if outcome == "applied":
+                    target["done"].add(slot)
+                    target["retry"].discard(slot)
+                elif outcome == "failed":
+                    target["retry"].add(slot)
+                else:
+                    target["retry"].discard(slot)
+        except Exception as exc:  # noqa: BLE001
+            # One lane failing leaves its drivers to the local pool, not the whole pass.
+            lane_logs.append(f"Public showroom {slot} fallback lane stopped after an error: {exc}")
+            logging.debug("Public showroom fallback lane traceback\n%s", traceback.format_exc())
+
+    car_groups: dict[str, list[dict[str, Any]]] = {}
+    for target in targets:
+        if "car" in target["needed"]:
+            car_groups.setdefault(canonicalize_car_directory(target["user"].directory).lower(), []).append(target)
+    accessory_slots = [slot for slot in ("helmet", "suit") if any(slot in target["needed"] for target in targets)]
+    lane_count = resolve_tp_fallback_lane_count(tp_fallback_lanes_mode, tp_manual_max_lanes, len(car_groups))
+    car_logs = {key: [] for key in car_groups}
+    accessory_logs = {slot: [] for slot in accessory_slots}
+    retry_logs: list[str] = []
+    if car_groups:
+        logs.append(
+            f"Trading Paints public showroom fallback: {len(car_groups)} car group(s) in {lane_count} lane(s) "
+            f"[{tp_fallback_lanes_mode_label(tp_fallback_lanes_mode)}]"
+            + ("; helmets and suits run alongside the cars." if process_all_together and accessory_slots else ".")
+        )
+
     try:
-        for user in ordered_users:
+        accessory_executor: concurrent.futures.ThreadPoolExecutor | None = None
+        accessory_futures: list[concurrent.futures.Future] = []
+        if process_all_together and accessory_slots:
+            accessory_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=len(accessory_slots), thread_name_prefix="NishizumiFallbackAccessory"
+            )
+            accessory_futures = [
+                accessory_executor.submit(_run_online_slot, targets, slot, accessory_logs[slot], attempts=4, allow_favorite=True)
+                for slot in accessory_slots
+            ]
+        try:
+            if car_groups:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=lane_count, thread_name_prefix="NishizumiFallbackLane") as car_executor:
+                    car_futures = [
+                        car_executor.submit(_run_online_slot, group, "car", car_logs[key], attempts=4, allow_favorite=True)
+                        for key, group in car_groups.items()
+                    ]
+                    for future in car_futures:
+                        future.result()
+        finally:
+            if accessory_executor is not None:
+                for future in accessory_futures:
+                    future.result()
+                accessory_executor.shutdown(wait=True)
+        if not process_all_together:
+            for slot in accessory_slots:
+                _run_online_slot(targets, slot, accessory_logs[slot], attempts=4, allow_favorite=True)
+        for key in car_groups:
+            logs.extend(car_logs[key])
+        for slot in accessory_slots:
+            logs.extend(accessory_logs[slot])
+
+        retry_targets = [target for target in targets if target["retry"]]
+        if retry_failed_online_once and retry_targets and not _cancel_requested(cancel_event):
+            retry_count = sum(len(target["retry"]) for target in retry_targets)
+            retry_logs.append(f"Trading Paints public showroom fallback: one final online try for {retry_count} paint(s) whose download failed.")
+            for slot in ("car", "helmet", "suit"):
+                _run_online_slot(retry_targets, slot, retry_logs, attempts=1, allow_favorite=False, only_retry=True)
+            logs.extend(retry_logs)
+
+        pool_cache = RandomPoolPassCache(random_pool_dir, ai_livery_root, random_preferences)
+        for target in targets:
             if _cancel_requested(cancel_event):
                 logs.append("Trading Paints public showroom fallback cancelled because the iRacing session changed or ended.")
                 break
-            if user.is_ai:
-                matched_ai_users += 1
-            skip_reason, need_car, need_helmet, need_suit = _fallback_needs(user)
-            if skip_reason == "team":
-                skipped_team_event_targets += 1
+            user = target["user"]
+            missing = [slot for slot in target["needed"] if slot not in target["done"] and not _covered(user, slot)]
+            for slot in target["needed"]:
+                if slot not in target["done"] and slot not in missing:
+                    target["done"].add(slot)
+            if not missing:
                 continue
-            if skip_reason == "local":
-                skipped_local_targets += 1
-                continue
-            if skip_reason or not (need_car or need_helmet or need_suit):
-                continue
+            target["tried"] = True
+            for slot in missing:
+                where = f" on {user.directory}" if slot == "car" else ""
+                logs.append(f"Public showroom {slot} fallback could not cover {target['label']}{where}; using the local random pool backup if available.")
+            local_saved, item_logs, reused_existing_source = _apply_local_tp_random_fallback_assets_for_user(
+                session=session,
+                user=user,
+                paints_dir=paints_dir,
+                random_pool_dir=random_pool_dir,
+                ai_livery_root=ai_livery_root,
+                used_source_ids=local_fallback_used_source_ids,
+                need_car="car" in missing,
+                need_helmet="helmet" in missing,
+                need_suit="suit" in missing,
+                pool_cache=pool_cache,
+            )
+            logs.extend(item_logs)
+            if reused_existing_source:
+                summary.repeated_source_uses += 1
+            if local_saved:
+                target["items"].extend(local_saved)
+                fallback_saved.extend(local_saved)
+                _record_saved_items(local_saved)
+                _notify_saved(local_saved, "fallback_local")
+                for item in local_saved:
+                    slot = _FALLBACK_SLOT_FOR_PAINT_TYPE.get(item.download_id.paint_type)
+                    if slot is not None:
+                        target["done"].add(slot)
 
-            target_is_team = session_user_uses_team_target(user)
-            target_id = int(user.team_id) if target_is_team else int(user.user_id)
-
+        # One count per driver: applied when every paint it needed was covered.
+        for target in targets:
+            if not target["tried"]:
+                continue
             summary.attempted_targets += 1
-            label = user.display_name or (f"AI {target_id}" if user.is_ai else f"user {target_id}")
-            applied_items_for_target: list[SavedFile] = []
-            car_still_needs_local = bool(need_car)
-            helmet_still_needs_local = bool(need_helmet)
-            suit_still_needs_local = bool(need_suit)
-
-            if need_car:
-                directory_key = canonicalize_car_directory(user.directory).lower()
-                showroom_source = choose_tp_showroom_source(showroom_source_keys)
-                showroom_cache_key = (directory_key, showroom_source)
-                showroom_cache = showroom_cache_by_directory.setdefault(
-                    showroom_cache_key,
-                    {"cars": [], "sampled_pages": set(), "detected_total_pages": 0},
-                )
-                recent_scheme_ids = {
-                    str(item).strip()
-                    for item in recent_schemes_by_directory.get(directory_key, [])
-                    if str(item).strip()
-                }
-                blocked_scheme_ids = random_paint_blocked_scheme_ids("car", user.directory, random_preferences)
-                favorite_entry = random_paint_favorite_online_entry("car", user.directory, random_preferences)
-                favorite_scheme_id = str((favorite_entry or {}).get("scheme_id") or "").strip()
-                favorite_title = str((favorite_entry or {}).get("title") or "").strip()
-                if favorite_scheme_id in blocked_scheme_ids or favorite_scheme_id in failed_favorite_scheme_ids:
-                    favorite_scheme_id = ""
-                for _attempt in range(1, 5):
-                    if _cancel_requested(cancel_event):
-                        break
-                    forced_scheme_id = favorite_scheme_id if _attempt == 1 else ""
-                    attempt_excluded_scheme_ids = set(used_showroom_scheme_ids) | set(blocked_scheme_ids)
-                    if forced_scheme_id:
-                        attempt_excluded_scheme_ids.discard(forced_scheme_id)
-                    result = choose_showroom_paint_direct(
-                        directory=user.directory,
-                        mapping_path=mapping_path,
-                        pages=TP_SHOWROOM_MAX_PAGES,
-                        prefer_official=False,
-                        choice_mode="random",
-                        showroom_sources=[showroom_source],
-                        exclude_scheme_ids=attempt_excluded_scheme_ids,
-                        exclude_recent_scheme_ids=recent_scheme_ids,
-                        showroom_cars=list(showroom_cache.get("cars") or []),
-                        showroom_sampled_pages=set(showroom_cache.get("sampled_pages") or set()),
-                        detected_total_pages=int(showroom_cache.get("detected_total_pages") or 0),
-                        detect_total_pages=detect_showroom_total_pages,
-                        minimum_unused_choices=1,
-                        allow_reuse_existing_scheme=False,
-                        forced_scheme_id=forced_scheme_id,
-                        forced_scheme_title=favorite_title,
-                        log=logs.append,
-                        cancel_event=cancel_event,
-                    )
-                    if result.showroom_cars:
-                        showroom_cache["cars"] = list(result.showroom_cars)
-                    if result.showroom_sampled_pages:
-                        showroom_cache["sampled_pages"] = set(int(item) for item in result.showroom_sampled_pages)
-                    if int(result.detected_total_pages or 0) > 0:
-                        showroom_cache["detected_total_pages"] = int(result.detected_total_pages or 0)
-                    if not result.ok:
-                        logs.append(f"Public showroom random car fallback could not select a paint for {label} on {user.directory}: {result.message}")
-                        break
-                    chosen_scheme_id = str(result.chosen_scheme_id or "").strip()
-                    if chosen_scheme_id:
-                        used_showroom_scheme_ids.add(chosen_scheme_id)
-                    try:
-                        saved_items = _download_and_save_direct_showroom_car_result(
-                            session=session,
-                            user=user,
-                            result=result,
-                            temp_dir=temp_root,
-                            paints_dir=paints_dir,
-                            retries=retries,
-                            retry_backoff_seconds=retry_backoff_seconds,
-                            source_label="fallback_online",
-                            preserve_on_cleanup=False,
-                            log=logs.append,
-                            cancel_event=cancel_event,
-                        )
-                    except Exception as exc:  # noqa: BLE001
-                        logs.append(f"Public showroom car for {label} on {user.directory} could not be saved: {exc}")
-                        saved_items = []
-                    if not saved_items:
-                        if forced_scheme_id:
-                            failed_favorite_scheme_ids.add(forced_scheme_id)
-                        logs.append(
-                            f"Public showroom paint {chosen_scheme_id or '(unknown)'} for {label} on {user.directory} was unavailable or could not be saved; trying another paint."
-                        )
-                        continue
-                    applied_items_for_target.extend(saved_items)
-                    fallback_saved.extend(saved_items)
-                    _record_saved_items(saved_items)
-                    if saved_callback is not None and not _cancel_requested(cancel_event):
-                        try:
-                            saved_callback(saved_items, "fallback_online")
-                        except Exception:
-                            logging.debug("Public showroom fallback save callback failed", exc_info=True)
-                    if chosen_scheme_id:
-                        remember_tp_recent_scheme(recent_schemes_by_directory, directory_key, chosen_scheme_id)
-                        recent_history_changed = True
-                    if result.reused_previous_scheme:
-                        summary.repeated_source_uses += 1
-                    car_still_needs_local = False
-                    title = str(result.chosen_title or "").strip()
-                    source_label = tp_showroom_source_label(result.showroom_source or showroom_source)
-                    logs.append(
-                        f"Public showroom random car fallback applied to {'AI' if user.is_ai else 'driver'} {label} on {user.directory}: scheme {chosen_scheme_id}{f' - {title}' if title else ''} [{source_label}]."
-                    )
-                    break
-                if car_still_needs_local:
-                    logs.append(f"Public showroom car fallback could not cover {label} on {user.directory}; using the local random pool backup if available.")
-
-            if helmet_still_needs_local:
-                helmet_still_needs_local = not _apply_public_accessory_fallback_for_user(
-                    user=user,
-                    label=label,
-                    accessory_kind="helmet",
-                    applied_items_for_target=applied_items_for_target,
-                )
-
-            if suit_still_needs_local:
-                suit_still_needs_local = not _apply_public_accessory_fallback_for_user(
-                    user=user,
-                    label=label,
-                    accessory_kind="suit",
-                    applied_items_for_target=applied_items_for_target,
-                )
-
-            if _cancel_requested(cancel_event):
-                logs.append("Trading Paints public showroom fallback cancelled because the iRacing session changed or ended.")
-                break
-            if car_still_needs_local or helmet_still_needs_local or suit_still_needs_local:
-                local_saved, item_logs, reused_existing_source = _apply_local_tp_random_fallback_assets_for_user(
-                    session=session,
-                    user=user,
-                    paints_dir=paints_dir,
-                    random_pool_dir=random_pool_dir,
-                    ai_livery_root=ai_livery_root,
-                    used_source_ids=local_fallback_used_source_ids,
-                    need_car=car_still_needs_local,
-                    need_helmet=helmet_still_needs_local,
-                    need_suit=suit_still_needs_local,
-                )
-                logs.extend(item_logs)
-                if reused_existing_source:
-                    summary.repeated_source_uses += 1
-                if local_saved:
-                    applied_items_for_target.extend(local_saved)
-                    fallback_saved.extend(local_saved)
-                    _record_saved_items(local_saved)
-                    if saved_callback is not None and not _cancel_requested(cancel_event):
-                        try:
-                            saved_callback(local_saved, "fallback_local")
-                        except Exception:
-                            logging.debug("Local fallback save callback failed after public showroom fallback", exc_info=True)
-
-            if applied_items_for_target:
+            if all(slot in target["done"] for slot in target["needed"]):
                 summary.applied_targets += 1
             else:
                 summary.missing_source_targets += 1
@@ -14826,7 +15018,10 @@ def apply_tp_showroom_fallbacks(
     saved_callback: Callable[[list[SavedFile], str], None] | None = None,
     cancel_event: threading.Event | None = None,
     _thread_handoff_done: bool = False,
+    session_saved: Iterable[SavedFile] | None = None,
 ) -> tuple[list[SavedFile], list[str], RandomFallbackSummary]:
+    # The lane settings used to stop here: the public path ran one driver at a time
+    # whatever the Downloads settings said.
     return apply_tp_showroom_fallbacks_public(
         session=session,
         saved=saved,
@@ -14849,6 +15044,11 @@ def apply_tp_showroom_fallbacks(
         retry_backoff_seconds=retry_backoff_seconds,
         saved_callback=saved_callback,
         cancel_event=cancel_event,
+        tp_fallback_lanes_mode=tp_fallback_lanes_mode,
+        tp_manual_max_lanes=tp_manual_max_lanes,
+        process_all_together=process_all_together,
+        retry_failed_online_once=retry_timed_out_fallbacks_indefinitely,
+        session_saved=session_saved,
     )
 
     if sync_playwright is not None and not _thread_handoff_done:
@@ -19379,6 +19579,7 @@ def process_session(
             showroom_sources=tp_showroom_sources,
             saved_callback=_on_fallback_saved_items,
             cancel_event=cancel_event,
+            session_saved=prior_saved,
         )
     elif fallback_mode == "online":
         fallback_saved, fallback_logs, fallback_summary = [], [
@@ -19404,6 +19605,7 @@ def process_session(
             disable_random_for_local_user=disable_random_for_local_user,
             saved_callback=_on_fallback_saved_items,
             cancel_event=cancel_event,
+            session_saved=prior_saved,
         )
     if collection_saved or collection_logs:
         collection_misses_for_summary = (
@@ -23765,7 +23967,7 @@ class DownloaderUI:
             variable=self.tp_retry_timed_out_fallbacks_indefinitely_var,
             command=self.on_setting_changed,
         ).grid(row=10, column=0, columnspan=2, sticky="w", pady=(8, 0))
-        ttk.Label(perf, text="Safe = one online car lane at a time. Session Total = one car lane per active car group. Manual = cap the concurrent car lanes yourself. The retry option keeps timed-out online paints in one last online recovery pass before the app falls back to the local pool.", foreground="#666666", wraplength=320, justify="left").grid(row=11, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        ttk.Label(perf, text="A lane fills the missing paints of one car model online. Safe = one car model at a time. Session Total = every car model at once. Manual = up to the number you set. Together = helmets and suits are fetched while the cars are, instead of after them. The retry option gives a paint whose download failed one more online try before the app uses the local pool.", foreground="#666666", wraplength=320, justify="left").grid(row=11, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
         ui_previews = ttk.LabelFrame(general_page, text="iRacing UI car previews", padding=10)
         ui_previews.grid(row=2, column=0, sticky="ew", pady=(10, 0))
@@ -25340,7 +25542,8 @@ class DownloaderUI:
 
         def _worker() -> None:
             results: list[tuple[tuple[object, int, str, str], SessionDriverSnapshot, list[SavedFile], bool, list[str]]] = []
-            used_local_random_source_ids: set[str] = set()
+            # A favorite already on a car in this session is not picked again.
+            used_local_random_source_ids: set[str] = random_favorites_used_in_session(snapshot.last_saved)
             for row, user, action_key_for_assignment in jobs:
                 saved_items: list[SavedFile] = []
                 logs: list[str] = []
@@ -25373,6 +25576,7 @@ class DownloaderUI:
                             showroom_sources=getattr(config, "tp_showroom_sources", TP_SHOWROOM_DEFAULT_SOURCES),
                             retries=positive_int(config.retries, 3),
                             retry_backoff_seconds=max(config.retry_backoff_seconds, 0.1),
+                            session_saved=list(snapshot.last_saved) + [item for result in results for item in result[2]],
                         )
                     if saved_items:
                         if entry is None:

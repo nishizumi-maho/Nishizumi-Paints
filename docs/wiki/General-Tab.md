@@ -91,26 +91,28 @@ Use it when absolute throughput matters more than caution.
 
 ## Online fallback lanes
 
-This section is separate from the main worker mode. It controls how many public showroom car lanes can run at once when the app is filling missing paints online.
+This section is separate from the main worker mode. It controls how many car models the online fallback works on at the same time. A lane is one car model (car directory): the drivers of that car are handled one after the other inside it.
 
 ### Safe
 
-One car lane at a time.
+One car model at a time.
 
 ### Manual
 
-Use the configured manual lane cap.
+Up to the configured number of car models at once.
 
 ### Session Total
 
-One lane per car group with no extra hard cap. This is the fastest lane mode.
+Every car model in the session at once. This is the fastest lane mode. In a single-make race there is only one car model, so every mode behaves the same.
 
 ## Online accessory behavior
 
-The General tab also holds the advanced online-fallback toggles for:
+The section also holds two online-fallback toggles:
 
-- processing cars, helmets, and suits together online
-- giving timed-out online fallbacks one final retry stage before local fallback
+- **Process cars, helmets, and suits together online**: helmets and suits are fetched while the car lanes run, instead of after them.
+- **Give timed-out online fallbacks one final online retry before local fallback**: a car, helmet, or suit whose download failed gets one more online try after the lanes finish. Only what is still missing after that comes from the local pool.
+
+Before 7.3.6 these four settings were saved but not used: the online fallback handled one driver at a time.
 
 Those settings work together with the Random tab. The Random tab decides who is eligible for fallback; the General tab decides how aggressively the online engine runs.
 

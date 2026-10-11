@@ -41,7 +41,7 @@ When the collection pool is active and normal public showroom coverage is turned
 
 Random fallback now keeps a local preference file for sources you explicitly mark from the Session tab.
 
-- `Favorite` makes that source preferred the next time the same item type is randomized.
+- `Favorite` makes that source the first pick the next time the same item type is randomized. It is used once per session: later drivers in the same session get other paints.
 - `Block` removes that source from future random choices.
 - Car preferences are scoped to the car directory.
 - Helmet and suit preferences are scoped by item type.
