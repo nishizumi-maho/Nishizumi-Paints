@@ -26031,7 +26031,13 @@ class DownloaderUI:
                 pass
             self.root.destroy()
         finally:
-            os.execv(argv[0], argv)
+            # os.execv does not quote its arguments on Windows, so an install path with a
+            # space ("Programs\Nishizumi Paints") reached the new process split
+            # in two, it exited on the unknown argument, and the app never came back.
+            try:
+                subprocess.Popen(argv, cwd=str(Path(sys.executable).resolve().parent), close_fds=True)
+            finally:
+                os._exit(0)
 
     def on_random_fallback_targets_changed(self) -> None:
         self._update_tp_fallback_ui(force=True)
@@ -26170,6 +26176,9 @@ class DownloaderUI:
                 self._headless_controller_mode = False
                 self._update_headless_ui()
                 if not self.service.is_running():
+                    # In controller mode setting changes only went to the headless
+                    # process, so the embedded service still has the startup settings.
+                    self.service.update_config(self.config)
                     self.service.start()
         self._refresh_monitor_ui()
         self._refresh_random_pool_summary()
@@ -26192,6 +26201,11 @@ class DownloaderUI:
         if not self._exiting:
             self.root.after(750, self._poll_service)
     def _on_service_status(self, value: str) -> None:
+        # Called on the service thread. root.after from another thread waits for the Tk
+        # thread, which is blocked joining this very thread while the app exits, so every
+        # exit would hang for the full join timeout.
+        if self._exiting:
+            return
         self.root.after(0, lambda: self.status_var.set(value))
     def _attach_to_existing_headless_if_available(self) -> bool:
         response = send_headless_control_command("status")
@@ -26968,6 +26982,10 @@ class DownloaderUI:
         if self.verbose_var.get() and not self.show_activity_var.get():
             self.show_activity_var.set(True)
         old_collection_ids = set(parse_tp_collection_ids_from_text(getattr(self.config, "tp_collection_pool_sources", "")))
+        old_update_settings = (
+            bool(getattr(self.config, "check_updates_automatically", True)),
+            bool(getattr(self.config, "auto_install_updates", False)),
+        )
         if self.keep_tp_pool_var.get() and not self._random_pool_opt_in_notified:
             try:
                 self.messagebox.showinfo(
@@ -27021,7 +27039,14 @@ class DownloaderUI:
         self._update_tp_lane_mode_ui()
         self._update_tp_fallback_ui(force=True)
         self._refresh_random_pool_summary(force=True)
-        self._schedule_update_check(initial=True)
+        new_update_settings = (
+            bool(getattr(self.config, "check_updates_automatically", True)),
+            bool(getattr(self.config, "auto_install_updates", False)),
+        )
+        if new_update_settings != old_update_settings:
+            # Any other setting would otherwise send a GitHub request 1.2 s later and
+            # restart the 6-hour timer, which burns the 60 requests/hour API limit.
+            self._schedule_update_check(initial=True)
         if self.config.verbose:
             logging.debug("Verbose logging is enabled from the UI")
     def _apply_autostart(self, enabled: bool) -> None:
