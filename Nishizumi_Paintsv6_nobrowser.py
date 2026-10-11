@@ -6386,6 +6386,9 @@ _TP_CAR_TEMPLATE_PATH_RE = re.compile(
 _TP_CAR_TEMPLATE_DIRECTORY_RE = re.compile(
     r'Documents/iRacing/paint/(?P<directory>.+)$', flags=re.IGNORECASE
 )
+# The template download is named after the iRacing car whose template it is, so cars
+# that share a template link the same file.
+_TP_CAR_TEMPLATE_ZIP_RE = re.compile(r'car_templates/(?P<template>\d+)_template_', flags=re.IGNORECASE)
 _TP_SHOWROOM_MAKE_LINK_RE = re.compile(
     r'/showroom/(?P<category>[A-Za-z]+)/(?P<mid>\d+)/(?P<slug>[^"\'?#\s<]+)'
 )
@@ -6455,6 +6458,27 @@ def _parse_tp_car_template_rows(page_html: str) -> list[tuple[str, str]]:
         if directory:
             rows.append((name, directory))
     return rows
+
+
+def _parse_tp_car_template_ids(page_html: str) -> dict[str, str]:
+    """Read which iRacing template each paint directory uses."""
+    template_ids: dict[str, str] = {}
+    for block in _TP_CAR_TEMPLATE_BLOCK_SPLIT_RE.split(str(page_html or "")):
+        if not _TP_CAR_TEMPLATE_BLOCK_START_RE.match(block):
+            continue
+        path_match = _TP_CAR_TEMPLATE_PATH_RE.search(block)
+        template_match = _TP_CAR_TEMPLATE_ZIP_RE.search(block)
+        if not path_match or not template_match:
+            continue
+        directory_match = _TP_CAR_TEMPLATE_DIRECTORY_RE.search(
+            _tp_flatten_template_path(path_match.group("path"))
+        )
+        if not directory_match:
+            continue
+        key = _canonicalize_tp_mapping_key(directory_match.group("directory"))
+        if key:
+            template_ids.setdefault(key, template_match.group("template"))
+    return template_ids
 
 
 def _parse_tp_showroom_make_index(page_html: str) -> dict[int, dict[str, str]]:
@@ -6610,6 +6634,9 @@ def _match_tp_template_rows_to_makes(
                 "mid": int(mid),
                 "tp_name": name,
                 "iracing_name": name,
+                # The showroom's name for the list this car is in ("Dirt Sprint Cars"),
+                # which is the vehicle name a showroom paint page shows.
+                "tp_make_name": str(index.get(mid, {}).get("name") or ""),
                 "directory": directory,
                 "slug": _tp_vehicle_slug(name, mid),
                 "category": str(index.get(mid, {}).get("category") or "Road"),
@@ -6644,6 +6671,21 @@ def _build_tp_car_identity_doc(entries: Iterable[dict[str, Any]]) -> dict[str, A
         entry["status"] = "mapped"
         grouped.setdefault(key, []).append(entry)
 
+    # Trading Paints lists some cars under one showroom ID. Most of them share one
+    # iRacing template, so their paints fit each other. When the templates differ
+    # (Super Formula SF23 Honda and Toyota), a paint from that list only fits the car it
+    # was made for, so those lists are marked and their members recorded.
+    family_names: dict[int, dict[str, str]] = {}
+    family_templates: dict[int, set[str]] = {}
+    for key, variants in grouped.items():
+        for item in variants:
+            family_mid = int(item["mid"])
+            family_names.setdefault(family_mid, {}).setdefault(key, str(item.get("tp_name") or ""))
+            template_id = str(item.get("template_id") or "").strip()
+            if template_id:
+                family_templates.setdefault(family_mid, set()).add(template_id)
+    mixed_mids = {family_mid for family_mid, templates in family_templates.items() if len(templates) > 1}
+
     cars: dict[str, dict[str, Any]] = {}
     for key, variants in grouped.items():
         has_directory_variants = len(variants) > 1
@@ -6655,6 +6697,13 @@ def _build_tp_car_identity_doc(entries: Iterable[dict[str, Any]]) -> dict[str, A
                     or _tp_template_is_superspeedway_variant(item.get("tp_name"))
                 )
             )
+            item["family_directory"] = key
+            if int(item["mid"]) in mixed_mids:
+                item["mid_mixes_templates"] = True
+                item["template_family"] = [
+                    {"directory": member_key, "tp_name": member_name}
+                    for member_key, member_name in sorted(family_names[int(item["mid"])].items())
+                ]
         ordered = sorted(
             variants,
             key=lambda item: (
@@ -6700,8 +6749,14 @@ def _fetch_tp_car_identity_doc(timeout: float = 25.0) -> dict[str, Any]:
         raise RuntimeError(
             "Trading Paints showroom returned no vehicle links, so no car ID could be resolved."
         )
-    rows = _parse_tp_car_template_rows(_fetch_tp_page(TP_CAR_TEMPLATES_URL, timeout))
+    templates_page = _fetch_tp_page(TP_CAR_TEMPLATES_URL, timeout)
+    rows = _parse_tp_car_template_rows(templates_page)
     entries = _match_tp_template_rows_to_makes(rows, make_index)
+    template_ids = _parse_tp_car_template_ids(templates_page)
+    for entry in entries:
+        template_id = template_ids.get(_canonicalize_tp_mapping_key(entry.get("directory")))
+        if template_id:
+            entry["template_id"] = template_id
     unmatched = len(rows) - len(entries)
     if unmatched > 0:
         logging.info(
@@ -6899,6 +6954,7 @@ def _tp_identity_match_for_name(
     if not wanted:
         return None
     exact: list[tuple[str, dict[str, Any]]] = []
+    list_matches: list[tuple[str, dict[str, Any]]] = []
     scored_by_vehicle: dict[tuple[str, int], tuple[float, str, dict[str, Any]]] = {}
     for directory_key, entry in _tp_identity_variants(mapping_doc):
         candidate_names = (
@@ -6911,6 +6967,9 @@ def _tp_identity_match_for_name(
         if wanted in candidate_keys:
             exact.append((directory_key, entry))
             continue
+        if wanted == _tp_identity_name_key(entry.get("tp_make_name")):
+            list_matches.append((directory_key, entry))
+            continue
         best_entry_score = 0.0
         for candidate_key in candidate_keys:
             score = SequenceMatcher(None, wanted, candidate_key).ratio()
@@ -6922,8 +6981,21 @@ def _tp_identity_match_for_name(
         if current is None or best_entry_score > current[0]:
             scored_by_vehicle[vehicle_key] = (best_entry_score, directory_key, entry)
     if exact:
+        exact_directories = {str(entry.get("family_directory") or key) for key, entry in exact}
+        if len(exact_directories) > 1 and any(entry.get("mid_mixes_templates") for _key, entry in exact):
+            return None
         exact.sort(key=lambda item: (bool(item[1].get("is_superspeedway_variant")), int(item[1].get("mid") or 0)))
         return exact[0]
+    if list_matches:
+        # The name of a showroom list such as "Dirt Sprint Cars". Its cars share one
+        # template, so any of them takes the paint, unless the list mixes templates;
+        # then the name cannot tell which car the paint is for.
+        if any(entry.get("mid_mixes_templates") for _key, entry in list_matches):
+            return None
+        list_matches.sort(
+            key=lambda item: (bool(item[1].get("is_superspeedway_variant")), int(item[1].get("mid") or 0), str(item[0]))
+        )
+        return list_matches[0]
     scored = list(scored_by_vehicle.values())
     if not scored:
         return None
@@ -6933,6 +7005,69 @@ def _tp_identity_match_for_name(
     if best_score < 0.94 or best_score - next_score < 0.03:
         return None
     return directory_key, entry
+
+
+_TP_FAMILY_CAR_MAKES_LOCK = threading.Lock()
+# showroom ID -> Trading Paints' own ID for one car of that list (an item's car_make)
+# -> the catalog directory of that car
+_TP_FAMILY_CAR_MAKES: dict[int, dict[str, str]] = {}
+
+
+def _tp_family_car_makes(entry: dict[str, Any], cars: Iterable[dict] = ()) -> dict[str, str]:
+    """Which car of a mixed showroom list each of Trading Paints' per-car IDs is.
+
+    Most paints in the list only carry the list's name, but now and then one names its
+    car ("Super Formula SF23 - Honda"). Its per-car ID then identifies every paint of
+    that car, so it is remembered.
+    """
+    family_mid = int(entry.get("mid") or 0)
+    directories_by_name: dict[str, str] = {}
+    for member in entry.get("template_family") or []:
+        if isinstance(member, dict):
+            name_key = _tp_identity_name_key(member.get("tp_name"))
+            if name_key:
+                directories_by_name[name_key] = str(member.get("directory") or "")
+    learned: dict[str, str] = {}
+    for car in cars or ():
+        if not isinstance(car, dict):
+            continue
+        car_make = str(car.get("car_make") or "").strip()
+        directory = directories_by_name.get(_tp_identity_name_key(car.get("car_make_name")))
+        if car_make and directory:
+            learned[car_make] = directory
+    with _TP_FAMILY_CAR_MAKES_LOCK:
+        known = _TP_FAMILY_CAR_MAKES.setdefault(family_mid, {})
+        known.update(learned)
+        return dict(known)
+
+
+def _tp_showroom_cars_for_entry(cars: list[dict], directory_key: str, entry: dict[str, Any]) -> list[dict]:
+    """The paints of a showroom list that fit this car.
+
+    A list whose cars share one template is returned as it is. From a list of cars with
+    different templates, only the paints known to be for this car: any other may be
+    painted for the other template and would not line up on this car.
+    """
+    if not entry.get("mid_mixes_templates"):
+        return cars
+    owners = _tp_family_car_makes(entry, cars)
+    wanted = str(entry.get("family_directory") or _canonicalize_tp_mapping_key(directory_key))
+    return [
+        car
+        for car in cars
+        if isinstance(car, dict) and owners.get(str(car.get("car_make") or "").strip()) == wanted
+    ]
+
+
+def _tp_mixed_template_family_entry(mid: int, mapping_path: Path | None = None) -> dict[str, Any] | None:
+    """A catalog entry of this showroom ID when it lists cars with different templates."""
+    wanted_mid = _to_int_or_none(mid) or 0
+    if wanted_mid <= 0:
+        return None
+    for _directory_key, entry in _tp_identity_variants(_load_tp_showroom_mapping(mapping_path)):
+        if (_to_int_or_none(entry.get("mid")) or 0) == wanted_mid and entry.get("mid_mixes_templates"):
+            return entry
+    return None
 
 
 def _tp_learn_observed_iracing_alias(
@@ -7190,7 +7325,11 @@ def _tp_showroom_mapping_entry_for_directory(directory: str, mapping_path: Path 
     return None
 
 
-def _tp_showroom_mapping_entry_for_mid(mid: int, mapping_path: Path | None = None) -> tuple[str, dict] | None:
+def _tp_showroom_mapping_entry_for_mid(
+    mid: int,
+    mapping_path: Path | None = None,
+    car: dict | None = None,
+) -> tuple[str, dict] | None:
     try:
         wanted_mid = int(mid)
     except Exception:
@@ -7198,10 +7337,20 @@ def _tp_showroom_mapping_entry_for_mid(mid: int, mapping_path: Path | None = Non
     if wanted_mid <= 0:
         return None
     mapping_doc = _load_tp_showroom_mapping(mapping_path)
+    owner: str | None = None
     for directory_key, raw_entry in _tp_identity_variants(mapping_doc):
         entry_mid = _to_int_or_none(raw_entry.get("mid")) or 0
         if entry_mid != wanted_mid:
             continue
+        if raw_entry.get("mid_mixes_templates"):
+            # Cars with different templates share this ID: only the paint's own car ID
+            # tells which of them it is for. The first car of the list was used before,
+            # so a Toyota paint went into the Honda's pool.
+            if owner is None:
+                car_make = str(car.get("car_make") or "").strip() if isinstance(car, dict) else ""
+                owner = _tp_family_car_makes(raw_entry, [car] if car_make else []).get(car_make, "") if car_make else ""
+            if not owner or str(raw_entry.get("family_directory") or directory_key) != owner:
+                continue
         entry = dict(raw_entry)
         entry["mid"] = wanted_mid
         entry["category"] = str(entry.get("category") or "Road").strip() or "Road"
@@ -7253,6 +7402,10 @@ TP_SHOWROOM_PREFETCH_WORKERS = 8
 # so pages are kept for the whole session instead of for one fallback pass.
 _TP_SHOWROOM_PAGE_CACHE: dict[tuple[int, str, int], tuple[float, list[dict]]] = {}
 _TP_SHOWROOM_PAGE_CACHE_LOCK = threading.Lock()
+# (car, sort) -> (when, first page Trading Paints answered empty). Pages past the end
+# took seconds each and were asked for again by every pass and every driver who joined.
+TP_SHOWROOM_PAGE_END_CACHE_SECONDS = 300.0
+_TP_SHOWROOM_PAGE_END: dict[tuple[int, str], tuple[float, int]] = {}
 
 
 def _tp_fetch_showroom_page_batch_http(
@@ -7265,14 +7418,19 @@ def _tp_fetch_showroom_page_batch_http(
     showroom_source: str = TP_SHOWROOM_DEFAULT_SOURCE,
 ) -> list[dict]:
     start_url = f"https://www.tradingpaints.com/showroom/{category}/{mid}/{slug}"
-    pos = max(0, int(page_index)) * TP_SHOWROOM_FETCH_PAGE_SIZE
+    page_number = max(0, int(page_index))
+    pos = page_number * TP_SHOWROOM_FETCH_PAGE_SIZE
     showroom_params = tp_showroom_params_for_source(showroom_source)
     cache_key = (int(mid), showroom_params, pos)
+    end_key = (int(mid), showroom_params)
     now = time.monotonic()
     with _TP_SHOWROOM_PAGE_CACHE_LOCK:
         cached = _TP_SHOWROOM_PAGE_CACHE.get(cache_key)
+        known_end = _TP_SHOWROOM_PAGE_END.get(end_key)
     if cached is not None and now - cached[0] < TP_SHOWROOM_PAGE_CACHE_SECONDS:
         return [dict(item) for item in cached[1]]
+    if known_end is not None and now - known_end[0] < TP_SHOWROOM_PAGE_END_CACHE_SECONDS and page_number >= known_end[1]:
+        return []
     showroom_url = f"https://www.tradingpaints.com/js/showroom.php?mid={mid}&{showroom_params}&pos={pos}&ts={int(time.time()*1000)}"
     headers = {
         "X-Requested-With": "XMLHttpRequest",
@@ -7298,6 +7456,15 @@ def _tp_fetch_showroom_page_batch_http(
             for key in [key for key, (fetched_at, _) in _TP_SHOWROOM_PAGE_CACHE.items() if now - fetched_at >= TP_SHOWROOM_PAGE_CACHE_SECONDS]:
                 _TP_SHOWROOM_PAGE_CACHE.pop(key, None)
             _TP_SHOWROOM_PAGE_CACHE[cache_key] = (now, [dict(item) for item in cars])
+    elif page_number > 0:
+        # Only a real empty answer gets here; a failed request returned above. An empty
+        # first page is never kept, because it would hide every paint of the car.
+        with _TP_SHOWROOM_PAGE_CACHE_LOCK:
+            for key in [key for key, (seen_at, _) in _TP_SHOWROOM_PAGE_END.items() if now - seen_at >= TP_SHOWROOM_PAGE_END_CACHE_SECONDS]:
+                _TP_SHOWROOM_PAGE_END.pop(key, None)
+            previous = _TP_SHOWROOM_PAGE_END.get(end_key)
+            if previous is None or page_number < previous[1]:
+                _TP_SHOWROOM_PAGE_END[end_key] = (now, page_number)
     return cars
 
 
@@ -7409,6 +7576,7 @@ def _fetch_tp_showroom_pool_http(
     exclude_scheme_ids: set[str] | None = None,
     exclude_recent_scheme_ids: set[str] | None = None,
     log: Callable[[str], None] | None = None,
+    car_filter: Callable[[list[dict]], list[dict]] | None = None,
 ) -> tuple[list[dict], set[int]]:
     page_limit = max(1, min(int(max_pages or TP_SHOWROOM_MAX_PAGES), 50))
     minimum_page_count = max(1, min(int(min_random_pages or 1), page_limit))
@@ -7434,7 +7602,7 @@ def _fetch_tp_showroom_pool_http(
         page_choices = [0]
     while (
         _showroom_available_count(
-            cars,
+            car_filter(cars) if car_filter is not None else cars,
             prefer_official=prefer_official,
             exclude_scheme_ids=exclude_scheme_ids,
             exclude_recent_scheme_ids=exclude_recent_scheme_ids,
@@ -7516,12 +7684,17 @@ def choose_showroom_paint_direct(
     page_limit = max(1, min(int(pages or TP_SHOWROOM_MAX_PAGES), 50))
     showroom_source = choose_tp_showroom_source(showroom_sources)
     forced_id = str(forced_scheme_id or "").strip()
+
+    def fits_this_car(cars: list[dict]) -> list[dict]:
+        return _tp_showroom_cars_for_entry(cars, directory_key, entry)
+
     if forced_id:
         title = str(forced_scheme_title or f"scheme {forced_id}").strip()
         chosen = {"id": forced_id, "title": title, "type": "paint", "hasnumber": "0", "pro_user": False}
         # Hand the caller's pool back unchanged: it stores showroom_cars in its per-car
         # cache, and a one-item pool hid every fetched scheme from later drivers.
         showroom_cars = list(showroom_cars or [])
+        usable_cars = showroom_cars
         sampled_pages: set[int] = set(int(page) for page in (showroom_sampled_pages or ()))
         reused_previous_scheme = False
         reused_recent_history = False
@@ -7552,18 +7725,32 @@ def choose_showroom_paint_direct(
             exclude_scheme_ids=exclude_scheme_ids,
             exclude_recent_scheme_ids=exclude_recent_scheme_ids,
             log=log,
+            car_filter=fits_this_car,
         )
         if _cancel_requested(cancel_event):
             return TPShowroomSyncResult(ok=False, message="Trading Paints public showroom selection cancelled.")
+        usable_cars = fits_this_car(showroom_cars)
+        if entry.get("mid_mixes_templates") and not usable_cars:
+            return TPShowroomSyncResult(
+                ok=False,
+                showroom_count=0,
+                showroom_cars=showroom_cars,
+                showroom_sampled_pages=sorted(sampled_pages),
+                showroom_source=showroom_source,
+                message=(
+                    f"Trading Paints lists {directory_key} together with cars that use a different paint template, "
+                    "and none of the sampled paints is known to be for this car."
+                ),
+            )
         if not allow_reuse_existing_scheme and _showroom_available_count(
-            showroom_cars,
+            usable_cars,
             prefer_official=prefer_official,
             exclude_scheme_ids=exclude_scheme_ids,
             exclude_recent_scheme_ids=None,
         ) <= 0:
             return TPShowroomSyncResult(
                 ok=False,
-                showroom_count=len(showroom_cars),
+                showroom_count=len(usable_cars),
                 showroom_cars=showroom_cars,
                 showroom_sampled_pages=sorted(sampled_pages),
                 showroom_source=showroom_source,
@@ -7571,7 +7758,7 @@ def choose_showroom_paint_direct(
             )
         try:
             chosen, reused_previous_scheme, reused_recent_history = _pick_showroom_scheme(
-                showroom_cars,
+                usable_cars,
                 choice_mode,
                 prefer_official,
                 exclude_scheme_ids=exclude_scheme_ids,
@@ -7596,7 +7783,7 @@ def choose_showroom_paint_direct(
         ok=True,
         chosen_scheme_id=scheme_id,
         chosen_title=title,
-        showroom_count=_showroom_available_count(showroom_cars, prefer_official=prefer_official),
+        showroom_count=_showroom_available_count(usable_cars, prefer_official=prefer_official),
         source_car=TRADING_PAINTS_SHOWROOM_COMPRESSED_URL.format(asset_id=scheme_id),
         message=f"Selected public showroom paint {scheme_id} for {directory_key}.",
         direct_items=direct_items,
@@ -8060,7 +8247,14 @@ def _tp_random_pool_candidate_from_collection_item(
         directory = "driver"
     else:
         mid = _tp_collection_item_mid(item)
-        mapping = _tp_showroom_mapping_entry_for_mid(int(mid or 0), mapping_path) if mid else None
+        mapping = _tp_showroom_mapping_entry_for_mid(int(mid or 0), mapping_path, car=item) if mid else None
+        if mapping is None and mid and _tp_mixed_template_family_entry(int(mid), mapping_path) is not None:
+            if log:
+                log(
+                    f"Skipped collection paint {scheme_id}: Trading Paints car ID {mid} covers cars with different paint templates, "
+                    "and this paint does not say which one it is for."
+                )
+            return None
         if mapping is None:
             car_name = str(item.get("car_make_name") or item.get("make_name") or item.get("vehicle") or "").strip()
             mapping = _tp_showroom_mapping_entry_for_name(car_name, mapping_path)
@@ -8392,6 +8586,7 @@ def download_showroom_paints_to_random_pool(
     if target_mid <= 0:
         raise ValueError("Trading Paints car ID must be greater than zero.")
     mapping = _tp_showroom_mapping_entry_for_mid(target_mid, mapping_path)
+    family_entry = _tp_mixed_template_family_entry(target_mid, mapping_path) if mapping is None else None
     if mapping is not None:
         mapped_directory, entry = mapping
         if not str(directory or "").strip():
@@ -8400,8 +8595,29 @@ def download_showroom_paints_to_random_pool(
             category = str(entry.get("category") or "Road").strip()
         if not str(slug or "").strip():
             slug = str(entry.get("slug") or f"car-{target_mid}").strip()
+    elif family_entry is not None:
+        if not str(category or "").strip():
+            category = str(family_entry.get("category") or "Road").strip()
+        if not str(slug or "").strip():
+            slug = str(family_entry.get("slug") or f"car-{target_mid}").strip()
     directory = str(directory or "").strip()
-    if not directory:
+    wanted_family_directory = _canonicalize_tp_mapping_key(directory) if directory else ""
+
+    def owner_directory(car: dict, owners: dict[str, str]) -> str:
+        # The car a paint of a mixed list is for: it goes into that car's pool, and a
+        # paint whose car is unknown is left out.
+        owner = owners.get(str(car.get("car_make") or "").strip(), "")
+        if not owner or (wanted_family_directory and owner != wanted_family_directory):
+            return ""
+        return directory or owner
+
+    def known_car_paints(cars: list[dict]) -> list[dict]:
+        if family_entry is None:
+            return cars
+        owners = _tp_family_car_makes(family_entry, cars)
+        return [car for car in cars if isinstance(car, dict) and owner_directory(car, owners)]
+
+    if not directory and family_entry is None:
         directory = f"tp_car_{target_mid}"
         write(f"Car ID {target_mid} is not in the live Trading Paints car catalog yet; using RandomPool bucket {directory}.")
     category = str(category or "Road").strip() or "Road"
@@ -8427,8 +8643,24 @@ def download_showroom_paints_to_random_pool(
             max_pages=page_limit,
             prefer_official=False,
             log=write,
+            car_filter=known_car_paints if family_entry is not None else None,
         )
         candidates = _tp_showroom_candidate_pool(pool, prefer_official=False)
+        candidate_directories: dict[str, str] = {}
+        if family_entry is not None:
+            owners = _tp_family_car_makes(family_entry, pool)
+            for candidate in candidates:
+                candidate_directory = owner_directory(candidate, owners)
+                if candidate_directory:
+                    candidate_directories[str(candidate.get("id") or "").strip()] = candidate_directory
+            write(
+                f"Car ID {target_mid} covers cars with different paint templates; "
+                f"{len(candidate_directories)} of {len(candidates)} paint(s) are known to be for "
+                f"{directory or 'one of them'} and can be imported."
+            )
+            candidates = [
+                candidate for candidate in candidates if str(candidate.get("id") or "").strip() in candidate_directories
+            ]
         random.shuffle(candidates)
         write(f"Found {len(candidates)} usable non-PRO paint(s) across {len(sampled_pages)} sampled page(s).")
         for candidate in candidates:
@@ -8440,7 +8672,7 @@ def download_showroom_paints_to_random_pool(
             title = str(candidate.get("title") or candidate.get("name") or "").strip()
             candidate_items = _tp_build_public_showroom_car_direct_items(
                 user_id=int(scheme_id),
-                directory=directory,
+                directory=candidate_directories.get(scheme_id, directory),
                 scheme_id=scheme_id,
                 title=title,
                 source_link=_tp_showroom_link_from_car(candidate),
@@ -11117,6 +11349,7 @@ def _fetch_tp_showroom_pool(
     exclude_scheme_ids: set[str] | None = None,
     exclude_recent_scheme_ids: set[str] | None = None,
     log: Callable[[str], None] | None = None,
+    car_filter: Callable[[list[dict]], list[dict]] | None = None,
 ) -> tuple[list[dict], set[int]]:
     api = context.request
     start_url = f"https://www.tradingpaints.com/showroom/{category}/{mid}/{slug}"
@@ -11150,7 +11383,7 @@ def _fetch_tp_showroom_pool(
     # pages for better variety instead of stopping at the first page that happens to have enough schemes.
     while (
         _showroom_available_count(
-            cars,
+            car_filter(cars) if car_filter is not None else cars,
             prefer_official=prefer_official,
             exclude_scheme_ids=exclude_scheme_ids,
             exclude_recent_scheme_ids=exclude_recent_scheme_ids,
@@ -11548,8 +11781,11 @@ def choose_and_sync_showroom_paint(
                 write(
                     f"Trading Paints showroom total page detection will be used as the random-page universe for {category}/{mid}/{slug}: choosing 1 random page out of {detected_total_pages_value} detected total page(s)."
                 )
+            def fits_this_car(pool: list[dict]) -> list[dict]:
+                return _tp_showroom_cars_for_entry(pool, matched_key, entry)
+
             current_available = _showroom_available_count(
-                cars,
+                fits_this_car(cars),
                 prefer_official=prefer_official,
                 exclude_scheme_ids=effective_exclude_scheme_ids,
                 exclude_recent_scheme_ids=exclude_recent_scheme_ids,
@@ -11569,8 +11805,17 @@ def choose_and_sync_showroom_paint(
                     exclude_scheme_ids=effective_exclude_scheme_ids,
                     exclude_recent_scheme_ids=exclude_recent_scheme_ids,
                     log=write,
+                    car_filter=fits_this_car,
                 )
-            if not cars:
+            usable_cars = fits_this_car(cars)
+            if not usable_cars:
+                if cars and entry.get("mid_mixes_templates"):
+                    empty_message = (
+                        f"Trading Paints lists {raw_directory or matched_key} together with cars that use a different paint template, "
+                        "and none of the sampled paints is known to be for this car."
+                    )
+                else:
+                    empty_message = f"No public showroom paints were returned for '{raw_directory or matched_key}'."
                 return TPShowroomSyncResult(
                     ok=False,
                     original_scheme_id=captured_original_scheme_id,
@@ -11581,10 +11826,10 @@ def choose_and_sync_showroom_paint(
                     baseline_manifest_urls=dict(baseline_url_map),
                     original_scheme_link=captured_original_scheme_link,
                     original_scheme_title=captured_original_scheme_title,
-                    message=f"No public showroom paints were returned for '{raw_directory or matched_key}'.",
+                    message=empty_message,
                 )
             chosen, reused_previous_scheme, reused_recent_history = _pick_showroom_scheme(
-                cars,
+                usable_cars,
                 choice_mode=choice_mode,
                 prefer_official=prefer_official,
                 exclude_scheme_ids=effective_exclude_scheme_ids,
@@ -14024,11 +14269,11 @@ def _tp_collection_candidates_for_car(items: list[dict], directory: str, mapping
     mapping = _tp_showroom_mapping_entry_for_directory(directory, mapping_path)
     if mapping is None:
         return []
-    _directory_key, entry = mapping
+    directory_key, entry = mapping
     wanted_mid = _to_int_or_none(entry.get("mid"))
     if wanted_mid is None or wanted_mid <= 0:
         return []
-    return [
+    candidates = [
         item
         for item in items
         if isinstance(item, dict)
@@ -14036,6 +14281,7 @@ def _tp_collection_candidates_for_car(items: list[dict], directory: str, mapping
         and _tp_collection_item_mid(item) == wanted_mid
         and _tp_showroom_scheme_usable_for_online_fallback(item)
     ]
+    return _tp_showroom_cars_for_entry(candidates, directory_key, entry)
 
 def _tp_collection_candidates_for_accessory(items: list[dict], kind: str) -> list[dict]:
     normalized_kind = str(kind or "").strip().lower()
