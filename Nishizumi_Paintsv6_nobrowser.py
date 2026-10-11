@@ -39,7 +39,6 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
 import requests
-import yaml
 from requests.adapters import HTTPAdapter
 
 # Browserless copy: Trading Paints browser automation is intentionally disabled.
@@ -3124,39 +3123,35 @@ def parse_args() -> argparse.Namespace:
             "and install them in your local iRacing paint folder."
         )
     )
-    parser.add_argument(
-        "--session-yaml",
-        default=None,
-        help="Path to iRacing session_info YAML dump file.",
-    )
-    parser.add_argument(
-        "--iracing-sdk",
-        action="store_true",
-        help=(
-            "Read live session data from the iRacing SDK instead of a file. "
-            "If --session-yaml is omitted, SDK mode is used by default."
-        ),
-    )
-    parser.add_argument(
-        "--watch",
-        action="store_true",
-        help="Keep running and process each new session ID in the YAML file.",
-    )
+    # The app always reads the live iRacing session. These three are still accepted so
+    # an old shortcut keeps starting the app, and a warning says they are ignored.
+    parser.add_argument("--session-yaml", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--iracing-sdk", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--watch", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument(
         "--poll-seconds",
         type=float,
         default=0.8,
-        help="Polling interval in seconds when --watch is enabled.",
+        help="How often the iRacing session is checked, in seconds (default: 0.8).",
     )
     parser.add_argument(
+        "--iracing-documents-dir",
         "--paints-dir",
+        dest="paints_dir",
         default=None,
-        help="Override iRacing paint directory (default: ~/Documents/iRacing/paint).",
+        help=(
+            "Your iRacing documents folder (the one with paint, replay and airosters), or its paint folder. "
+            "Paints always go into its paint folder, because that is the only place iRacing reads them from "
+            "(default: the iRacing folder in your Documents)."
+        ),
     )
     parser.add_argument(
         "--temp-dir",
         default=None,
-        help="Override temp folder (default: system temp + /NishizumiPaints).",
+        help=(
+            "Folder for downloads in progress. The app works in a NishizumiPaints folder inside it "
+            "(default: the system temp folder)."
+        ),
     )
     parser.add_argument(
         "--keep-session-paints",
@@ -3517,8 +3512,24 @@ def normalize_random_pool_category_caps(
 
 def random_pool_limit_bytes(max_gb: float) -> int:
     return int(clamp_random_pool_gb(max_gb) * (1024 ** 3))
+_TEMP_DIR_OVERRIDE: Path | None = None
+
+
 def default_temp_dir() -> Path:
+    if _TEMP_DIR_OVERRIDE is not None:
+        return _TEMP_DIR_OVERRIDE
     return Path(tempfile.gettempdir()) / "NishizumiPaints"
+
+
+def apply_command_line_overrides(args: argparse.Namespace) -> None:
+    global _TEMP_DIR_OVERRIDE
+    temp_dir = str(getattr(args, "temp_dir", None) or "").strip()
+    if temp_dir:
+        # A folder of its own inside the one given: old files in the temp folder are
+        # cleaned up, and that must never reach the user's own files.
+        _TEMP_DIR_OVERRIDE = Path(temp_dir).expanduser() / "NishizumiPaints"
+    if getattr(args, "session_yaml", None) or getattr(args, "watch", False):
+        logging.warning("--session-yaml and --watch are no longer supported and were ignored. The app reads the live iRacing session.")
 def cleanup_stale_temp_dirs(temp_dir: Path, older_than_hours: float = 24.0) -> None:
     if not temp_dir.exists():
         return
@@ -3932,24 +3943,6 @@ def _build_session_from_parts(
         ai_roster_id=ai_roster_id,
         ai_roster_name=ai_roster_name,
         ai_drivers=tuple(ai_drivers),
-    )
-def parse_session_yaml(yaml_text: str) -> Session | None:
-    try:
-        doc = yaml.safe_load(yaml_text)
-    except yaml.YAMLError as exc:
-        logging.error("Failed to parse session YAML: %s", exc)
-        return None
-    if not isinstance(doc, dict):
-        return None
-    load_num_textures = False
-    for key in ("LoadNumTextures", "load_num_textures"):
-        if key in doc:
-            load_num_textures = _to_boolish(doc.get(key), default=False)
-            break
-    return _build_session_from_parts(
-        doc.get('WeekendInfo'),
-        doc.get('DriverInfo'),
-        load_num_textures=load_num_textures,
     )
 def _parse_fetch_user_manifest_xml(user_id: int, xml_text: str) -> list[DownloadFile]:
     root = ET.fromstring(xml_text)
@@ -20108,8 +20101,6 @@ def process_session(
         except Exception:
             logging.debug("Session progress callback failed during final stage", exc_info=True)
     return saved, monitor_snapshot, final_rows
-def should_use_sdk(args: argparse.Namespace) -> bool:
-    return args.iracing_sdk or args.session_yaml is None
 def create_sdk_reader() -> IracingSdkReader | None:
     try:
         import irsdk as irsdk_module
@@ -30311,6 +30302,7 @@ def _running_instance_is_headless() -> bool:
 
 def main() -> int:
     args = parse_args()
+    apply_command_line_overrides(args)
     config_store = ConfigStore()
     # Look for a running copy before anything else, so opening the app again while it
     # sits in the tray brings it forward instead of showing the startup selector.
