@@ -21254,6 +21254,40 @@ def iracing_ui_preview_protected_paths() -> set[str]:
         return set(_IRACING_UI_PREVIEW_PROTECTED_PATHS)
 
 
+def _files_have_same_bytes(first: Path, second: Path) -> bool:
+    try:
+        if first.stat().st_size != second.stat().st_size:
+            return False
+        with first.open("rb") as left, second.open("rb") as right:
+            while True:
+                left_chunk = left.read(1024 * 1024)
+                if left_chunk != right.read(1024 * 1024):
+                    return False
+                if not left_chunk:
+                    return True
+    except OSError:
+        return False
+
+
+def _remember_replaced_preview_file(destination: Path, paints_root: Path) -> None:
+    parsed = _parse_saved_paint_filename(destination, paints_root)
+    if parsed is None:
+        return
+    paint_type, directory, target_id, is_team, is_ss = parsed
+    download_id = DownloadId(
+        user_id=target_id,
+        directory="" if directory == "__accessories__" else directory,
+        paint_type=paint_type,
+        is_team_paint=is_team,
+        is_superspeedway_variant=is_ss,
+    )
+    if remember_previous_paint_file(destination, SessionId(0, None), download_id):
+        logging.info(
+            "Replaced %s with your Trading Paints paint for the iRacing UI preview; the previous file is kept in paint history.",
+            destination.name,
+        )
+
+
 def install_iracing_ui_car_previews(
     *,
     member_id: int,
@@ -21302,6 +21336,10 @@ def install_iracing_ui_car_previews(
             if signature is not None and expected_size > 0 and signature == (expected_size, expected_mtime):
                 present += 1
                 continue
+            if signature is not None and not _files_have_same_bytes(destination, cache_path):
+                # Not the file the app installed and not the same paint: keep it in
+                # paint history, so "Restore previous" can bring it back.
+                _remember_replaced_preview_file(destination, paints_root)
             if not _install_iracing_ui_preview_file(cache_path, destination):
                 continue
             new_signature = _file_signature(destination)
@@ -22278,16 +22316,25 @@ class DownloaderService:
             status = self.get_ui_preview_status()
             if status.enabled or status.state != "disabled":
                 _set_iracing_ui_preview_protected_paths([])
-                removed_installed = 0
-                if not session_active:
-                    try:
-                        removed_installed, _removed_cached = clear_iracing_ui_car_previews(
-                            paints_dir=paints_dir,
-                            cache_dir=default_iracing_ui_preview_cache_dir(),
-                            remove_cache=False,
+                if session_active:
+                    # The files are removed once the session is over. Marking the
+                    # previews "disabled" here meant the removal never ran at all.
+                    if status.state != "disabling":
+                        self._set_ui_preview_status(
+                            enabled=False,
+                            state="disabling",
+                            message="iRacing UI car previews are turned off. Their files are removed when the session ends.",
                         )
-                    except Exception as exc:  # noqa: BLE001
-                        logging.debug("Could not remove installed iRacing UI car previews: %s", exc)
+                    return
+                removed_installed = 0
+                try:
+                    removed_installed, _removed_cached = clear_iracing_ui_car_previews(
+                        paints_dir=paints_dir,
+                        cache_dir=default_iracing_ui_preview_cache_dir(),
+                        remove_cache=False,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logging.debug("Could not remove installed iRacing UI car previews: %s", exc)
                 if removed_installed:
                     logging.info(
                         "iRacing UI car previews turned off. Removed %s preview file(s) from the iRacing paint folder.",
@@ -22330,12 +22377,28 @@ class DownloaderService:
             return
         if not self.get_ui_preview_status().enabled:
             self._set_ui_preview_status(enabled=True, state="idle", message="iRacing UI car previews are enabled.")
+        if session_active and not manual_request:
+            # Nothing is installed during a session. Resolving the member ID here read
+            # and parsed the preview state file on every poll for the whole session.
+            live_id = normalize_tp_member_id(live_member_id)
+            if live_id > 0 and live_id != getattr(self, "_ui_preview_remembered_live_member_id", 0):
+                remember_iracing_ui_preview_member_id(live_id, "iRacing session")
+                self._ui_preview_remembered_live_member_id = live_id
+            with self._lock:
+                self._ui_preview_next_reassert_at = now + IRACING_UI_PREVIEW_REASSERT_SECONDS
+                self._ui_preview_next_full_sync_at = max(
+                    self._ui_preview_next_full_sync_at, now + IRACING_UI_PREVIEW_REASSERT_SECONDS
+                )
+            return
         member_id, member_id_source = resolve_iracing_ui_preview_member_id(config, live_member_id)
         if member_id <= 0:
             if manual_request:
                 self._ui_preview_sync_event.clear()
             with self._lock:
                 self._ui_preview_next_reassert_at = now + IRACING_UI_PREVIEW_REASSERT_SECONDS
+                # Without an ID there is nothing to sync; checking again every poll
+                # only re-read the state file.
+                self._ui_preview_next_full_sync_at = now + IRACING_UI_PREVIEW_REASSERT_SECONDS
             self._set_ui_preview_status(
                 state="waiting",
                 message=(

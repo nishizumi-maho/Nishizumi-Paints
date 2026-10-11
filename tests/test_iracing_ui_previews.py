@@ -16,6 +16,24 @@ SPEC.loader.exec_module(APP)
 MEMBER_ID = 654321
 OTHER_MEMBER_ID = 111222
 
+_HISTORY_DIR = None
+_ORIGINAL_HISTORY_PATHS = None
+
+
+def setUpModule():
+    # Replacing a preview over another file snapshots it into paint history; keep
+    # that history in a temp folder, never in the real %APPDATA%.
+    global _HISTORY_DIR, _ORIGINAL_HISTORY_PATHS
+    _HISTORY_DIR = Path(tempfile.mkdtemp(prefix="nishizumi-preview-history-"))
+    _ORIGINAL_HISTORY_PATHS = (APP.default_paint_history_dir, APP.default_paint_history_index_path)
+    APP.default_paint_history_dir = lambda: _HISTORY_DIR
+    APP.default_paint_history_index_path = lambda: _HISTORY_DIR / "history.json"
+
+
+def tearDownModule():
+    APP.default_paint_history_dir, APP.default_paint_history_index_path = _ORIGINAL_HISTORY_PATHS
+    shutil.rmtree(_HISTORY_DIR, ignore_errors=True)
+
 
 def _car_item(directory, paint_type, url, user_id=MEMBER_ID, is_team_paint=False, superspeedway=False):
     return APP.DownloadFile(
@@ -210,6 +228,23 @@ class IracingUiPreviewInstallTests(unittest.TestCase):
         (self.paints_dir / "ferrari296gt3" / f"car_{MEMBER_ID}.tga").write_bytes(b"session-paint")
         self._install()
         self.assertEqual((self.paints_dir / "ferrari296gt3" / f"car_{MEMBER_ID}.tga").read_bytes(), b"my-car-paint")
+
+    def test_replacing_a_file_the_app_did_not_install_keeps_it_in_paint_history(self):
+        target = self.paints_dir / "ferrari296gt3" / f"car_{MEMBER_ID}.tga"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"hand-made paint")
+        self._install()
+        self.assertEqual(target.read_bytes(), b"my-car-paint")
+        backups = [path for path in _HISTORY_DIR.rglob("*.tga") if path.read_bytes() == b"hand-made paint"]
+        self.assertEqual(len(backups), 1)
+
+    def test_the_same_paint_already_in_place_is_not_snapshotted(self):
+        target = self.paints_dir / "ferrari296gt3" / f"car_{MEMBER_ID}.tga"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"my-car-paint")
+        before = len(list(_HISTORY_DIR.rglob("*.tga")))
+        self._install()
+        self.assertEqual(len(list(_HISTORY_DIR.rglob("*.tga"))), before)
 
     def test_installed_previews_are_published_as_protected_paths(self):
         self._install()
@@ -532,6 +567,32 @@ class IracingUiPreviewServiceTests(unittest.TestCase):
         service._maintain_ui_previews(config, self.paints_dir, live_member_id=MEMBER_ID, session_active=False)
         self.assertEqual(len(self.clear_calls), 1)
         self.assertEqual(service.get_ui_preview_status().state, "disabled")
+        self.assertEqual(self.sync_calls, [])
+
+    def test_turning_previews_off_during_a_session_removes_them_after_it(self):
+        service = APP.DownloaderService(APP.AppConfig(iracing_ui_car_previews=False))
+        config = service.get_config()
+        service._maintain_ui_previews(config, self.paints_dir, live_member_id=MEMBER_ID, session_active=True)
+        self.assertEqual(self.clear_calls, [])
+        self.assertNotEqual(service.get_ui_preview_status().state, "disabled")
+        service._maintain_ui_previews(config, self.paints_dir, live_member_id=MEMBER_ID, session_active=False)
+        self.assertEqual(len(self.clear_calls), 1)
+        self.assertEqual(service.get_ui_preview_status().state, "disabled")
+
+    def test_a_session_does_not_read_the_preview_state_on_every_poll(self):
+        resolves = []
+        APP.resolve_iracing_ui_preview_member_id = lambda *_args, **_kwargs: resolves.append(1) or (MEMBER_ID, "iRacing session")
+        remembered = []
+        APP.remember_iracing_ui_preview_member_id = lambda member_id, source="": remembered.append(member_id) or member_id
+        service = APP.DownloaderService(APP.AppConfig(iracing_ui_car_previews=True))
+        config = service.get_config()
+        for _ in range(10):
+            with service._lock:
+                service._ui_preview_next_reassert_at = 0.0
+                service._ui_preview_next_full_sync_at = 0.0
+            service._maintain_ui_previews(config, self.paints_dir, live_member_id=MEMBER_ID, session_active=True)
+        self.assertEqual(resolves, [])
+        self.assertEqual(remembered, [MEMBER_ID])
         self.assertEqual(self.sync_calls, [])
 
     def test_session_cleanup_keeps_preview_files_and_restores_them(self):
