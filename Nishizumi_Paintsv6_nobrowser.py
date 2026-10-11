@@ -17674,6 +17674,16 @@ def move_or_extract(
     retries = max(1, int(retries))
     retry_backoff_seconds = max(0.05, float(retry_backoff_seconds))
     last_exc: Exception | None = None
+    # One history snapshot per destination: a retry after a locked file used to add
+    # another copy of the same old file, and after the primary was already replaced it
+    # snapshotted the new paint as the "previous" one.
+    history_taken: set[Path] = set()
+
+    def _remember_once(destination: Path) -> None:
+        if destination not in history_taken:
+            history_taken.add(destination)
+            remember_previous_paint_file(destination, downloaded.session_id, downloaded.download_id)
+
     try:
         for attempt in range(1, retries + 1):
             if _cancel_requested(cancel_event):
@@ -17687,7 +17697,7 @@ def move_or_extract(
                         shutil.copyfileobj(decompressor, out)
                 else:
                     shutil.copy2(src, temp_primary_dest)
-                remember_previous_paint_file(primary_dest, downloaded.session_id, downloaded.download_id)
+                _remember_once(primary_dest)
                 os.replace(temp_primary_dest, primary_dest)
                 saved_paths = [primary_dest]
                 for extra_dest in dest_paths[1:]:
@@ -17695,7 +17705,7 @@ def move_or_extract(
                     temp_extra_dest = extra_dest.with_name(extra_dest.name + ".tmp")
                     temp_extra_dest.unlink(missing_ok=True)
                     shutil.copy2(primary_dest, temp_extra_dest)
-                    remember_previous_paint_file(extra_dest, downloaded.session_id, downloaded.download_id)
+                    _remember_once(extra_dest)
                     os.replace(temp_extra_dest, extra_dest)
                     saved_paths.append(extra_dest)
                 src.unlink(missing_ok=True)
@@ -17898,9 +17908,12 @@ def _save_paint_history_index(index: dict[str, object], path: Path | None = None
     if not isinstance(entries, list):
         entries = []
     safe = {"version": 1, "entries": entries}
-    temp = resolved.with_name(resolved.name + ".tmp")
-    temp.write_text(json.dumps(safe, indent=2, sort_keys=True), encoding="utf-8")
-    os.replace(temp, resolved)
+    temp = resolved.with_name(f"{resolved.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temp.write_text(json.dumps(safe, indent=2, sort_keys=True), encoding="utf-8")
+        os.replace(temp, resolved)
+    finally:
+        temp.unlink(missing_ok=True)
 
 def _prune_paint_history_entries(entries: list[dict[str, object]]) -> list[dict[str, object]]:
     sorted_entries = sorted(
@@ -17925,6 +17938,11 @@ def _prune_paint_history_entries(entries: list[dict[str, object]]) -> list[dict[
         except Exception:
             logging.debug("Could not prune paint history backup %s", backup_path, exc_info=True)
     return kept
+
+# Save workers run in parallel, and each one read, extended and rewrote the whole
+# index: concurrent saves dropped each other's entries, and the backups of the dropped
+# entries were never pruned.
+_PAINT_HISTORY_LOCK = threading.Lock()
 
 def remember_previous_paint_file(destination: Path, session_id: SessionId, download_id: DownloadId) -> bool:
     try:
@@ -17967,17 +17985,19 @@ def remember_previous_paint_file(destination: Path, session_id: SessionId, downl
         "previous_size": int(stat.st_size),
         "previous_mtime": float(stat.st_mtime),
     }
-    index = _load_paint_history_index()
-    entries = index.get("entries") if isinstance(index, dict) else []
-    if not isinstance(entries, list):
-        entries = []
-    entries.insert(0, entry)
-    index["entries"] = _prune_paint_history_entries(entries)
-    try:
-        _save_paint_history_index(index)
-    except Exception:
-        logging.debug("Could not save paint history index", exc_info=True)
-        return False
+    with _PAINT_HISTORY_LOCK:
+        index = _load_paint_history_index()
+        entries = index.get("entries") if isinstance(index, dict) else []
+        if not isinstance(entries, list):
+            entries = []
+        entries.insert(0, entry)
+        index["entries"] = _prune_paint_history_entries(entries)
+        try:
+            _save_paint_history_index(index)
+        except Exception:
+            logging.debug("Could not save paint history index", exc_info=True)
+            backup_path.unlink(missing_ok=True)
+            return False
     return True
 
 def paint_history_entries_for_user_kind(session: Session, user: SessionUser, kind: str) -> list[dict[str, object]]:
@@ -21914,8 +21934,17 @@ class DownloaderService:
         with self._lock:
             self._ui_preview_next_reassert_at = time.monotonic() + IRACING_UI_PREVIEW_REASSERT_SECONDS
     def start(self) -> None:
-        if self.is_running():
-            return
+        thread = self._thread
+        if thread is not None and thread.is_alive():
+            if not self._stop_event.is_set():
+                return
+            # A loop that outlived stop()'s join is still finishing. Clearing the stop
+            # event now would let it carry on next to the new one, two loops saving to
+            # and deleting from the same paint folder.
+            thread.join(timeout=1.0)
+            if thread.is_alive():
+                logging.warning("The service is still stopping; it starts again once the current step ends.")
+                return
         self._stop_event.clear()
         self._thread = threading.Thread(target=self._run_forever, name="NishizumiPaintsService", daemon=True)
         self._thread.start()
@@ -21924,7 +21953,8 @@ class DownloaderService:
         thread = self._thread
         if thread is not None and thread.is_alive():
             thread.join(timeout=join_timeout)
-        self._thread = None
+        if thread is None or not thread.is_alive():
+            self._thread = None
         self._set_status("Stopped")
     def _install_logging(self) -> None:
         config = self.get_config()
@@ -22478,7 +22508,9 @@ class DownloaderService:
                         session_rows=session_rows,
                         replay_mode_active=replay_mode_active,
                     )
-                    if not added_user_keys:
+                    # A team whose paints the swap block above just cleared has to be
+                    # processed in this pass too, the same as in the partial-refresh branch.
+                    if not added_user_keys and not changed_team_driver_keys:
                         last_session = session.session_id
                         last_processed_session = session
                         last_session_fingerprint = current_fingerprint
@@ -22490,7 +22522,11 @@ class DownloaderService:
                         self._set_status(f"Watching • {session.session_id.folder_name()}")
                         self._stop_event.wait(max(config.poll_seconds, 0.2))
                         continue
-                    session_to_process = replace(session, users={current_user_map[key] for key in added_user_keys})
+                    session_to_process = replace(
+                        session,
+                        users={current_user_map[key] for key in added_user_keys}
+                        | {current_user_map[key] for key in changed_team_driver_keys},
+                    )
                 else:
                     self._update_runtime_snapshot(current_session, last_saved, last_known_member_id, session_rows=base_session_rows, replay_mode_active=replay_mode_active)
                     session_rows = base_session_rows
@@ -25216,6 +25252,11 @@ class DownloaderUI:
             if entry is None or not current_items:
                 self._append_log(f"No current {normalized_kind} paint file is available yet for {row.display_name}.")
                 continue
+            if not str(entry.get("scheme_id") or "").strip():
+                # A driver's own Trading Paints paint carries no scheme id, only a profile
+                # link, and an override without a scheme id was refused as invalid.
+                digest = _saved_items_session_digest(current_items)
+                entry["scheme_id"] = f"current-{normalized_kind}-{digest or int(time.time())}"
             try:
                 cache_saved_driver_paint_override(current_items, entry)
                 entry = remember_driver_paint_override(entry)
