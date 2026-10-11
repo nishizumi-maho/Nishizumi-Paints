@@ -2265,7 +2265,10 @@ class TextureReloadDebouncer:
 
     def _fire(self, car_idx: int) -> None:
         with self._lock:
-            self._timers.pop(int(car_idx), None)
+            # Only remove this timer. A newer one for the same car may already be
+            # registered, and dropping it meant flush() never fired that car's last reload.
+            if self._timers.get(int(car_idx)) is threading.current_thread():
+                self._timers.pop(int(car_idx), None)
             if self._closed:
                 return
         try:
@@ -3331,12 +3334,26 @@ def auto_detect_iracing_documents_dir(search_depth: int = 3) -> Path | None:
     return None
 
 
+_IRACING_DOCUMENTS_DIR_CACHE: tuple[float, Path] | None = None
+IRACING_DOCUMENTS_DIR_CACHE_SECONDS = 60.0
+
+
 def default_iracing_documents_dir() -> Path:
+    # The service loop asks for the paint and replay folders on every poll, and each
+    # answer searched the Documents folders again.
+    global _IRACING_DOCUMENTS_DIR_CACHE
+    now = time.monotonic()
+    cached = _IRACING_DOCUMENTS_DIR_CACHE
+    if cached is not None and now - cached[0] < IRACING_DOCUMENTS_DIR_CACHE_SECONDS:
+        return cached[1]
     detected = auto_detect_iracing_documents_dir()
     if detected is not None:
-        return detected
-    docs_root = _windows_documents_root() or (Path.home() / "Documents")
-    return docs_root / "iRacing"
+        result = detected
+    else:
+        docs_root = _windows_documents_root() or (Path.home() / "Documents")
+        result = docs_root / "iRacing"
+    _IRACING_DOCUMENTS_DIR_CACHE = (now, result)
+    return result
 
 def normalize_optional_path(value: str | Path | None) -> str:
     text = str(value or '').strip().strip('"')
@@ -3769,6 +3786,7 @@ def _resolve_local_driver_identity(
     local_team_id: int | None = None
     if driver_car_idx is None and local_user_id is None:
         return None, None
+    car_match: tuple[int | None, int | None] | None = None
     for driver in drivers:
         if not isinstance(driver, dict):
             continue
@@ -3779,8 +3797,13 @@ def _resolve_local_driver_identity(
             team_id = None
         if local_user_id is not None and user_id == local_user_id:
             return local_user_id, team_id
-        if driver_car_idx is not None and car_idx == driver_car_idx and user_id is not None and user_id > 0:
-            return user_id, team_id
+        if car_match is None and driver_car_idx is not None and car_idx == driver_car_idx and user_id is not None and user_id > 0:
+            # In a team event this entry shows whoever drives the car. It gives the
+            # team; the user stays DriverUserID, or it flipped to the teammate's ID
+            # at every stint.
+            car_match = (local_user_id if local_user_id is not None else user_id, team_id)
+    if car_match is not None:
+        return car_match
     return local_user_id, local_team_id
 
 def _read_sdk_local_user_id(sdk: object) -> int | None:
@@ -20264,26 +20287,25 @@ def _read_replay_mode_active(reader: IracingSdkReader) -> bool:
         sdk.freeze_var_buffer_latest()
     except Exception:
         pass
+    # iRacing reports SimMode "replay" while a saved replay is open and "full" in a
+    # live session, including while the live session's replay is watched. The replay
+    # frame number, session number and session time used before also move during a
+    # live race, so a live session that had a replay pack was taken for a replay and
+    # new drivers got no paints.
     try:
-        replay_playing = sdk["IsReplayPlaying"]
-        if replay_playing is not None and bool(replay_playing):
-            return True
+        weekend_info = sdk["WeekendInfo"]
     except Exception:
-        pass
-    for key in ("ReplayFrameNum", "ReplayFrameNumEnd", "ReplaySessionNum", "ReplaySessionTime"):
-        try:
-            value = sdk[key]
-        except Exception:
-            continue
-        if value is None:
-            continue
-        try:
-            numeric = float(value)
-        except Exception:
-            continue
-        if numeric not in (0.0, -1.0):
-            return True
-    return False
+        weekend_info = None
+    sim_mode = str(weekend_info.get("SimMode") or "").strip().lower() if isinstance(weekend_info, dict) else ""
+    if sim_mode:
+        return sim_mode == "replay"
+    # Without SimMode: a replay that is playing well behind the live edge.
+    try:
+        playing = bool(sdk["IsReplayPlaying"])
+        frames_from_end = int(sdk["ReplayFrameNumEnd"] or 0)
+    except Exception:
+        return False
+    return playing and frames_from_end > 1
 def _read_ok_to_reload_textures(reader: IracingSdkReader) -> bool | None:
     sdk = reader.sdk
     try:
@@ -20672,9 +20694,39 @@ class ConfigStore:
             raw = {}
         raw["launch_mode_preference"] = normalize_launch_mode_preference(mode)
         self._write_raw(raw)
+    _backed_up_unreadable: set[tuple[str, int, int]] = set()
+
+    def _keep_unreadable_settings(self) -> None:
+        """Copy a settings.json that cannot be read before defaults replace it.
+
+        The next setting saved would otherwise overwrite every setting of the user
+        with defaults, without a trace of the old file.
+        """
+        try:
+            stat_result = self.path.stat()
+        except OSError:
+            return
+        if stat_result.st_size <= 0:
+            return
+        key = (str(self.path), int(stat_result.st_mtime_ns), int(stat_result.st_size))
+        if key in ConfigStore._backed_up_unreadable:
+            return
+        ConfigStore._backed_up_unreadable.add(key)
+        backup = self.path.with_name(f"{self.path.name}.unreadable-{time.strftime('%Y%m%d-%H%M%S')}")
+        try:
+            shutil.copy2(self.path, backup)
+        except OSError as exc:
+            logging.warning("settings.json could not be read and could not be copied aside: %s", exc)
+            return
+        logging.warning(
+            "settings.json could not be read, so the app starts with default settings. The old file was kept as %s.",
+            backup.name,
+        )
+
     def load(self) -> AppConfig:
         raw = self._read_raw()
         if raw is None:
+            self._keep_unreadable_settings()
             return apply_installer_autostart_default(AppConfig())
         config = AppConfig()
         for key, value in raw.items():
@@ -23023,7 +23075,7 @@ class DownloaderService:
                         session_rows=session_rows,
                         replay_mode_active=replay_mode_active,
                     )
-                elif roster_changed_same_session:
+                elif roster_changed_same_session and not forced_refresh:
                     logging.info(
                         "Session roster changed inside the same session %s: +%s target(s), -%s target(s). The paint sync will only fetch the new targets now.",
                         session.session_id.folder_name(),
@@ -23060,6 +23112,10 @@ class DownloaderService:
                 else:
                     self._update_runtime_snapshot(current_session, last_saved, last_known_member_id, session_rows=base_session_rows, replay_mode_active=replay_mode_active)
                     session_rows = base_session_rows
+                    if forced_refresh:
+                        # "Refresh now" asked for every driver; a swap or a join seen on
+                        # the same poll used to shrink it to those cars only.
+                        session_to_process = session
                 if forced_refresh:
                     self._force_refresh_event.clear()
                     with self._lock:
@@ -23304,6 +23360,7 @@ class WindowsTrayIcon:
         self._NOTIFYICONDATAW = None
         self._shell32 = None
         self._user32 = None
+        self._wm_taskbar_created = 0
     def is_supported(self) -> bool:
         return sys.platform == "win32"
     def start(self) -> bool:
@@ -23438,8 +23495,22 @@ class WindowsTrayIcon:
                 return int(command or 0)
             finally:
                 user32.DestroyMenu(menu)
+        try:
+            user32.RegisterWindowMessageW.argtypes = [wintypes.LPCWSTR]
+            user32.RegisterWindowMessageW.restype = wintypes.UINT
+            self._wm_taskbar_created = int(user32.RegisterWindowMessageW("TaskbarCreated") or 0)
+        except Exception:
+            self._wm_taskbar_created = 0
         WNDPROCTYPE = ctypes.WINFUNCTYPE(LRESULT_T, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, LPARAM_T)
         def wndproc(hwnd, msg, wparam, lparam):
+            if self._wm_taskbar_created and msg == self._wm_taskbar_created:
+                # Explorer restarted and dropped every tray icon. Without adding it
+                # again, a window hidden in the tray could only be reached by opening
+                # the app once more.
+                if self._visible:
+                    self._visible = False
+                    self._add_icon()
+                return 0
             if msg == self._wm_trayicon and lparam == self._wm_lbuttondblclk:
                 try:
                     self.on_restore()
