@@ -23238,7 +23238,12 @@ class WindowsTrayIcon:
     def _post_close(self) -> None:
         self._user32.PostMessageW(self._hwnd, self._WM_CLOSE, 0, 0)
 class DownloaderUI:
-    def __init__(self, launched_from_autostart: bool = False) -> None:
+    def __init__(self, launched_from_autostart: bool = False, holds_instance_lock: bool = True) -> None:
+        # A window opened as the controller of a running headless service does not
+        # own the single-instance lock; it takes it before running its own service.
+        self._holds_instance_lock = bool(holds_instance_lock)
+        self._owned_instance_lock: SingleInstanceLock | None = None
+        self._instance_blocked_logged = False
         import tkinter as tk
         from tkinter import filedialog, messagebox, scrolledtext, simpledialog, ttk
         self.tk = tk
@@ -26493,9 +26498,12 @@ class DownloaderUI:
                 self.request_exit_for_update()
                 return
             if response and response.get('ok'):
-                previous_release_tag = (self._last_headless_status_response or {}).get("latest_release_tag")
+                previous_response = self._last_headless_status_response or {}
                 self._last_headless_status_response = response
-                if response.get("latest_release_tag") != previous_release_tag:
+                if (
+                    response.get("latest_release_tag") != previous_response.get("latest_release_tag")
+                    or response.get("current_session") != previous_response.get("current_session")
+                ):
                     self._update_headless_ui(response)
                 session_label = str(response.get('current_session') or '').strip()
                 status_label = str(response.get('service_status') or "Watching").strip() or "Watching"
@@ -26507,7 +26515,7 @@ class DownloaderUI:
                 self._append_log("Lost connection to the headless service. Returning to the embedded GUI service.")
                 self._headless_controller_mode = False
                 self._update_headless_ui()
-                if not self.service.is_running():
+                if not self.service.is_running() and self._claim_single_instance():
                     # In controller mode setting changes only went to the headless
                     # process, so the embedded service still has the startup settings.
                     self.service.update_config(self.config)
@@ -26528,10 +26536,43 @@ class DownloaderUI:
                 self._maybe_autofill_ai_roster_member_id_from_session(runtime_snapshot)
                 self._refresh_session_tree(runtime_snapshot)
         if not self._exiting and not self._headless_controller_mode and not self.service.is_running():
-            self._append_log("Service stopped unexpectedly. Restarting...")
-            self.service.start()
+            if self._claim_single_instance():
+                self._append_log("Service stopped unexpectedly. Restarting...")
+                self.service.update_config(self.config)
+                self.service.start()
+            elif self._attach_to_existing_headless_if_available():
+                self._append_log("Attached to a running headless service. This window is acting as a controller only.")
+                self._update_headless_ui()
+            elif not self._instance_blocked_logged:
+                self._instance_blocked_logged = True
+                self._append_log(
+                    "Another copy of Nishizumi Paints is running the downloader, so this window does not start a second one."
+                )
         if not self._exiting:
             self.root.after(750, self._poll_service)
+
+    def _claim_single_instance(self) -> bool:
+        """Own the single-instance lock before this window runs its own downloader.
+
+        A window that attached to a headless service never took the lock. When that
+        service went away it started its own downloader without it, so opening the
+        app again started a second full copy on the same paint folder, each one
+        deleting the paints the other had saved.
+        """
+        if self._holds_instance_lock:
+            return True
+        lock = SingleInstanceLock(INSTANCE_MUTEX_NAME)
+        if not lock.acquire():
+            return False
+        self._owned_instance_lock = lock
+        self._holds_instance_lock = True
+        self._instance_blocked_logged = False
+        try:
+            # The headless copy owned the signal port until now.
+            self.instance_signal_server.start()
+        except Exception:
+            logging.debug("Could not start the single-instance signal server", exc_info=True)
+        return True
     def _on_service_status(self, value: str) -> None:
         # Called on the service thread. root.after from another thread waits for the Tk
         # thread, which is blocked joining this very thread while the app exits, so every
@@ -26910,6 +26951,10 @@ class DownloaderUI:
                     APP_NAME,
                     f"Could not download the update.\n\n{error}\n\nYou can still install it manually from the release page.",
                 )
+            elif not self._exiting:
+                # An automatic install is not tried again for this version, and later
+                # checks did not prompt either, so the update was never offered again.
+                self._prompt_for_update(release)
             return
         self._append_log(f"Update {release.tag_name} verified against the published SHA-256 digest.")
         self.update_status_var.set(f"Installing update {release.tag_name}...")
@@ -29136,9 +29181,15 @@ class DownloaderUI:
         self.instance_signal_server.stop()
         self.tray_icon.stop()
         self.service.stop()
+        if self._owned_instance_lock is not None:
+            self._owned_instance_lock.release()
         self.root.destroy()
     def run(self) -> None:
         self.root.mainloop()
+
+
+class _UpdateCancelled(Exception):
+    """The service is stopping, so the update download or install is abandoned."""
 
 
 class HeadlessUpdateManager:
@@ -29244,6 +29295,11 @@ class HeadlessUpdateManager:
         """Ask GitHub for the latest release and act on it. False when the check failed."""
         with self._lock:
             self._checked_once = True
+            installing = self._installing
+        if installing:
+            # The running install reports its own progress; a check would turn
+            # "downloading" back into "available" and announce the update again.
+            return True
         self._set_state("checking", "Checking GitHub for updates.")
         try:
             release = self._fetch_release()
@@ -29346,8 +29402,16 @@ class HeadlessUpdateManager:
             installer = self._download_installer(release, progress_cb=self._download_progress_logger(tag))
             self._clean_workspace(keep=installer)
             logging.info("Update %s verified against the published SHA-256 digest.", tag)
+            if self._stop_event.is_set():
+                # The user quit during the download. Starting the installer now would
+                # reopen the app they just closed.
+                raise _UpdateCancelled()
             self._set_state("installing", f"Installing update {tag}")
             self._start_installer(installer, relaunch_args=("--nogui",))
+        except _UpdateCancelled:
+            self._set_state("idle", f"Update {tag} was not installed because the service is stopping.")
+            logging.info("Update %s was not installed because the service is stopping.", tag)
+            return False
         except Exception as exc:
             self._set_state("failed", f"Update {tag} could not be installed: {exc}")
             logging.error("Update %s could not be installed: %s", tag, exc)
@@ -29415,6 +29479,8 @@ class HeadlessUpdateManager:
 
         def report(downloaded: int, total: int) -> None:
             nonlocal last_step
+            if self._stop_event.is_set():
+                raise _UpdateCancelled()
             if total <= 0:
                 return
             step = min(100, int(downloaded * 100 / total)) // 25 * 25
@@ -29514,6 +29580,18 @@ def run_headless(args: argparse.Namespace | None = None, instance_lock: SingleIn
         service.stop()
     signal.signal(signal.SIGINT, _sig_handler)
     signal.signal(signal.SIGTERM, _sig_handler)
+    if hasattr(signal, "SIGBREAK"):
+        signal.signal(signal.SIGBREAK, _sig_handler)
+    shutdown_done = threading.Event()
+
+    def _on_console_close() -> None:
+        logging.warning("The console is closing. Cleaning up session paints before exit.")
+        stop_event.set()
+        service.stop(join_timeout=3.5)
+        shutdown_done.wait(1.0)
+
+    # Kept referenced for as long as the handler is installed.
+    console_close_handler = install_console_close_handler(_on_console_close)
     service.start()
     update_manager.start()
     try:
@@ -29523,13 +29601,62 @@ def run_headless(args: argparse.Namespace | None = None, instance_lock: SingleIn
                 service.start()
             time.sleep(0.5)
     finally:
+        # The service goes first: its cleanup is what must finish before Windows ends
+        # the process after the console is closed.
+        service.stop()
         update_manager.stop()
         control_server.stop()
         tray_icon.stop()
         instance_signal_server.stop()
-        service.stop()
         instance_lock.release()
+        shutdown_done.set()
+    del console_close_handler
     return 0
+
+
+CONSOLE_CLOSE_EVENTS = (2, 5, 6)  # CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT
+
+
+def install_console_close_handler(on_close: Callable[[], None], kernel32: object | None = None) -> object | None:
+    """Run ``on_close`` when the console window is closed, or Windows logs off or shuts down.
+
+    Python maps none of these to a signal, and Windows ends the process a few
+    seconds after them, so without a handler the session paints were never cleaned
+    up. Returns the callback, which the caller must keep referenced.
+    """
+    if kernel32 is None:
+        if sys.platform != "win32":
+            return None
+        try:
+            import ctypes
+
+            kernel32 = ctypes.windll.kernel32
+        except Exception:
+            return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        handler_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.DWORD)
+    except Exception:
+        return None
+
+    def _handler(event: int) -> bool:
+        if int(event) not in CONSOLE_CLOSE_EVENTS:
+            return False
+        try:
+            on_close()
+        except Exception:
+            logging.debug("Console close cleanup failed", exc_info=True)
+        return True
+
+    callback = handler_type(_handler)
+    try:
+        if not kernel32.SetConsoleCtrlHandler(callback, True):
+            return None
+    except Exception:
+        return None
+    return callback
 # Returned when the app is already running and nothing asked for a particular mode:
 # the running copy is brought forward instead of asking how to start a second one.
 LAUNCH_MODE_RUNNING_INSTANCE = "running"
@@ -29585,7 +29712,7 @@ def main() -> int:
         if not lock_acquired:
             if launch_mode == "gui" and _running_instance_is_headless():
                 # The window attaches to the running headless service as its controller.
-                app = DownloaderUI(launched_from_autostart=args.autostart_launched)
+                app = DownloaderUI(launched_from_autostart=args.autostart_launched, holds_instance_lock=False)
                 app.run()
                 return 0
             SingleInstanceSignalServer.notify_existing_instance()
