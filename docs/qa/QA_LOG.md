@@ -8,7 +8,8 @@
 | G1 | `test_download_install_safety.py` (13 tests): good install, truncated/empty bz2, empty tga, dropped stream, 404 no retry, retry budget, permanent/short lock, disk full, history snapshot, path escape, team/user names. F-008 fixed | 339 pass, 0 fail | dac127c |
 | G2 | Gap tests on the real service loop: repeated update with no change, driver leaves (others keep paints), driver returns (not refetched), new session (new roster fetched, old cleared); cancel after download installs nothing. No defects; 3/3 repeat runs stable | 344 pass | 1f4a86c |
 | G3 | Existing coverage of hosts/outage/recovery/paging/pool was already dense. Added: well-formed HTML from primary, malformed HTML from every host. F-010 fixed | 346 pass | 43b49bb |
-| G4 | Updater/launch/single-instance already covered (~95 tests). Added: non-object settings.json, out-of-range numbers clamped. No defects | 348 pass | see git log |
+| G4 | Updater/launch/single-instance already covered (~95 tests). Added: non-object settings.json, out-of-range numbers clamped. No defects | 348 pass | 7ded441 |
+| G5 (partial) | Live, 2026-10-14, spectating an online NASCAR Next Gen race (38 drivers, headless mode, `--verbose`). L2 passed: 38 manifests, 87/87 TP files downloaded and saved in ~15 s, online random fallback filled 22 targets (54 files, 0 misses), local driver skipped as configured, 0 WARNING/ERROR/Traceback in 1431 log lines. Paint folder after: 141 files written this session, no 0-byte paint, no `.tmp`. L1 partly (started headless, settings kept). L3-L8 not run | - | - |
 
 Baseline before G0: `origin/main` + rescued diff = 321 tests, 4 failures (test harness: tests called `_poll_service` on a `MagicMock`, so the new `_poll_service_once` was never run).
 
@@ -28,6 +29,7 @@ Status: `fixed` (with regression test), `open`, `hypothesis` (not reproduced).
 
 | F-008 | Downloads | High | An empty HTTP 200 body for a `.tga` replaced a good paint with a zero-byte file (`move_or_extract` had no size check; empty `.bz2` was already refused) | fixed (G1); test failed before the fix | `test_an_empty_tga_body_keeps_the_old_paint` |
 | F-010 | Manifests | Med | Well-formed HTML (proxy/challenge page) with HTTP 200 parsed as an empty manifest: driver treated as having no paint, backup host never asked. Same for the AI roster list (would read as "no rosters") | fixed (G3): `_parse_tp_manifest_xml` raises a parse error for an `<html>` root; test failed before the fix | `test_an_html_page_from_the_primary_moves_to_the_backup` |
+| O-001 | Texture reload | Info | Live: some cars got 2-3 SDK texture reloads (car files spread over >1 s debounce, then fallback helmet/suit). Cosmetic cost only | observation, not changed | - |
 | F-009 | Downloads | Low | A 200 reply with an HTML/error page for a raw `.tga` URL would be installed (no content check for uncompressed paints). Most paint URLs are `.bz2`, which fail to decompress | hypothesis, not fixed | - |
 
 F-001..F-007 were found and fixed in an earlier session (uncommitted in `H:\New folder (5)\PAINTS-bugsweep`); G0 verified them.

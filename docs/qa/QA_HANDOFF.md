@@ -1,7 +1,7 @@
 # QA handoff
 
 - Branch: `qa/campaign` (base `origin/main` 6dedd45). Commit per group.
-- Phase: G0-G4 done. Next: **G5 live check in iRacing** (user runs the game), then G6.
+- Phase: G0-G4 done; G5 partial (L2 passed live, spectating a race). Still to run live: L3-L8. Next: **G6** (or finish G5 when the user can).
 - Last verified: `python -m unittest discover -s tests` -> 348 tests OK (~35 s, ~80 s wall).
 - Plan and rules: `docs/qa/QA_PLAN.md`. Findings: `docs/qa/QA_LOG.md` (F-001..F-010).
 
