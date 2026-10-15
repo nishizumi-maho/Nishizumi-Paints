@@ -132,6 +132,7 @@ GITHUB_UPDATE_CHECK_INTERVAL_SECONDS = 6 * 60 * 60
 # race the network coming up, and retries sooner than the normal interval after a failure.
 HEADLESS_UPDATE_FIRST_CHECK_DELAY_SECONDS = 20.0
 HEADLESS_UPDATE_RETRY_SECONDS = 15 * 60
+HEADLESS_AUTO_INSTALL_RETRY_SECONDS = 60 * 60
 # Installer downloads are only ever fetched from GitHub's own release hosts, and only
 # after the published SHA-256 digest matches, because the file is executed afterwards.
 GITHUB_RELEASE_ASSET_HOSTS = (
@@ -3944,8 +3945,20 @@ def _build_session_from_parts(
         ai_roster_name=ai_roster_name,
         ai_drivers=tuple(ai_drivers),
     )
-def _parse_fetch_user_manifest_xml(user_id: int, xml_text: str) -> list[DownloadFile]:
+def _parse_tp_manifest_xml(xml_text: str) -> ET.Element:
+    """Parse a Trading Paints manifest; an HTML page is a parse error, not an empty manifest.
+
+    A proxy or challenge page answered with well-formed HTML parsed fine, had no <Car>
+    nodes, and read as "this driver has no paint", so the backup host was never asked.
+    """
     root = ET.fromstring(xml_text)
+    if str(root.tag).lower().rsplit("}", 1)[-1] == "html":
+        raise ET.ParseError("Trading Paints answered with an HTML page instead of a manifest.")
+    return root
+
+
+def _parse_fetch_user_manifest_xml(user_id: int, xml_text: str) -> list[DownloadFile]:
+    root = _parse_tp_manifest_xml(xml_text)
     files: list[DownloadFile] = []
     for car in root.findall(".//Car"):
         file_url = (car.findtext("file") or '').strip()
@@ -6400,6 +6413,7 @@ _TP_IDENTITY_MATCH_STOPWORDS = {"legacy"}
 # that never appear in the iRacing template name or directory.
 _TP_MAKE_OPTIONAL_QUALIFIERS = {"asphalt"}
 _TP_CAR_IDENTITY_CACHE_LOCK = threading.RLock()
+_TP_CAR_IDENTITY_FETCH_LOCK = threading.Lock()
 _TP_CAR_IDENTITY_CACHE_DOC: dict[str, Any] | None = None
 _TP_CAR_IDENTITY_CACHE_AT = 0.0
 _TP_CAR_IDENTITY_LAST_ATTEMPT_AT = 0.0
@@ -6831,55 +6845,60 @@ def _load_tp_showroom_mapping(
     global _TP_CAR_IDENTITY_CACHE_AT
     global _TP_CAR_IDENTITY_LAST_ATTEMPT_AT
     global _TP_CAR_IDENTITY_LAST_ERROR
-    now = time.monotonic()
-    with _TP_CAR_IDENTITY_CACHE_LOCK:
-        cache_is_fresh = (
-            _TP_CAR_IDENTITY_CACHE_DOC is not None
-            and now - _TP_CAR_IDENTITY_CACHE_AT < TP_CAR_IDENTITY_CACHE_TTL_SECONDS
-        )
-        retry_is_throttled = (
-            _TP_CAR_IDENTITY_LAST_ATTEMPT_AT > 0
-            and now - _TP_CAR_IDENTITY_LAST_ATTEMPT_AT < TP_CAR_IDENTITY_RETRY_SECONDS
-        )
-        if cache_is_fresh and not force_refresh:
-            return _TP_CAR_IDENTITY_CACHE_DOC
-        if retry_is_throttled and not force_refresh:
-            return _TP_CAR_IDENTITY_CACHE_DOC or {
-                "schema_version": 2,
-                "source": TP_CAR_TEMPLATES_URL,
-                "cars": {},
-                "unsupported": {},
-            }
-        _TP_CAR_IDENTITY_LAST_ATTEMPT_AT = now
+    empty_doc = {
+        "schema_version": 2,
+        "source": TP_CAR_TEMPLATES_URL,
+        "cars": {},
+        "unsupported": {},
+    }
+    # One refresh at a time, but the network fetch (two pages, up to about a minute)
+    # runs outside the cache lock: the window reads the catalog status under that lock
+    # and froze for the whole fetch.
+    with _TP_CAR_IDENTITY_FETCH_LOCK:
+        now = time.monotonic()
+        with _TP_CAR_IDENTITY_CACHE_LOCK:
+            cache_is_fresh = (
+                _TP_CAR_IDENTITY_CACHE_DOC is not None
+                and now - _TP_CAR_IDENTITY_CACHE_AT < TP_CAR_IDENTITY_CACHE_TTL_SECONDS
+            )
+            retry_is_throttled = (
+                _TP_CAR_IDENTITY_LAST_ATTEMPT_AT > 0
+                and now - _TP_CAR_IDENTITY_LAST_ATTEMPT_AT < TP_CAR_IDENTITY_RETRY_SECONDS
+            )
+            if cache_is_fresh and not force_refresh:
+                return _TP_CAR_IDENTITY_CACHE_DOC
+            if retry_is_throttled and not force_refresh:
+                return _TP_CAR_IDENTITY_CACHE_DOC or empty_doc
+            _TP_CAR_IDENTITY_LAST_ATTEMPT_AT = now
         try:
             refreshed = _fetch_tp_car_identity_doc()
         except Exception as exc:
-            _TP_CAR_IDENTITY_LAST_ERROR = str(exc) or exc.__class__.__name__
-            if _TP_CAR_IDENTITY_CACHE_DOC is not None:
-                logging.warning(
-                    "Trading Paints automatic car catalog refresh failed; using the last in-memory catalog: %s",
-                    exc,
-                )
-                return _TP_CAR_IDENTITY_CACHE_DOC
+            with _TP_CAR_IDENTITY_CACHE_LOCK:
+                _TP_CAR_IDENTITY_LAST_ERROR = str(exc) or exc.__class__.__name__
+                if _TP_CAR_IDENTITY_CACHE_DOC is not None:
+                    logging.warning(
+                        "Trading Paints automatic car catalog refresh failed; using the last in-memory catalog: %s",
+                        exc,
+                    )
+                    return _TP_CAR_IDENTITY_CACHE_DOC
             cached = load_tp_car_identity_cache()
-            if cached is not None:
-                logging.warning(
-                    "Trading Paints automatic car catalog refresh failed; using the catalog saved on disk: %s",
-                    exc,
-                )
-                _TP_CAR_IDENTITY_CACHE_DOC = cached
-                _TP_CAR_IDENTITY_CACHE_AT = time.monotonic()
-                return cached
+            with _TP_CAR_IDENTITY_CACHE_LOCK:
+                if cached is not None:
+                    logging.warning(
+                        "Trading Paints automatic car catalog refresh failed; using the catalog saved on disk: %s",
+                        exc,
+                    )
+                    _TP_CAR_IDENTITY_CACHE_DOC = cached
+                    # The saved catalog may be weeks old: it stands in until a refresh
+                    # works (tried again after the retry pause), not for a whole TTL.
+                    _TP_CAR_IDENTITY_CACHE_AT = time.monotonic() - TP_CAR_IDENTITY_CACHE_TTL_SECONDS
+                    return cached
             logging.warning("Trading Paints automatic car catalog is unavailable: %s", exc)
-            return {
-                "schema_version": 2,
-                "source": TP_CAR_TEMPLATES_URL,
-                "cars": {},
-                "unsupported": {},
-            }
-        _TP_CAR_IDENTITY_CACHE_DOC = refreshed
-        _TP_CAR_IDENTITY_CACHE_AT = time.monotonic()
-        _TP_CAR_IDENTITY_LAST_ERROR = ""
+            return empty_doc
+        with _TP_CAR_IDENTITY_CACHE_LOCK:
+            _TP_CAR_IDENTITY_CACHE_DOC = refreshed
+            _TP_CAR_IDENTITY_CACHE_AT = time.monotonic()
+            _TP_CAR_IDENTITY_LAST_ERROR = ""
         save_tp_car_identity_cache(refreshed)
         return refreshed
 
@@ -7116,9 +7135,14 @@ def _refresh_tp_car_identity_after_unknown() -> dict[str, Any]:
             _TP_CAR_IDENTITY_LAST_UNKNOWN_REFRESH_AT > 0
             and now - _TP_CAR_IDENTITY_LAST_UNKNOWN_REFRESH_AT < TP_CAR_IDENTITY_UNKNOWN_REFRESH_SECONDS
         )
-        if fetched_recently or refreshed_recently:
-            return _TP_CAR_IDENTITY_CACHE_DOC or _load_tp_showroom_mapping()
-        _TP_CAR_IDENTITY_LAST_UNKNOWN_REFRESH_AT = now
+        cached_doc = _TP_CAR_IDENTITY_CACHE_DOC
+        if not (fetched_recently or refreshed_recently):
+            _TP_CAR_IDENTITY_LAST_UNKNOWN_REFRESH_AT = now
+    # _load_tp_showroom_mapping takes the fetch lock and then the cache lock; calling
+    # it with the cache lock held took them in the opposite order and could deadlock
+    # with a catalog download already in progress.
+    if fetched_recently or refreshed_recently:
+        return cached_doc or _load_tp_showroom_mapping()
     return _load_tp_showroom_mapping(force_refresh=True)
 
 
@@ -9046,7 +9070,7 @@ def _parse_tp_team_fetch_manifest_root(root: ET.Element, target: TPTeamPaintTarg
 
 
 def _parse_tp_team_fetch_manifest(xml_text: str, target: TPTeamPaintTarget) -> list[DownloadFile]:
-    return _parse_tp_team_fetch_manifest_root(ET.fromstring(xml_text), target)
+    return _parse_tp_team_fetch_manifest_root(_parse_tp_manifest_xml(xml_text), target)
 
 
 def _dedupe_tp_team_download_items(items: Iterable[DownloadFile]) -> list[DownloadFile]:
@@ -9612,7 +9636,7 @@ def fetch_tp_team_all_paint_files(
                     http = get_thread_http_session()
                     resp = http.post(endpoint, data=payload, timeout=25)
                     resp.raise_for_status()
-                    root = ET.fromstring(resp.text)
+                    root = _parse_tp_manifest_xml(resp.text)
                     _note_tp_fetch_url_result(endpoint, None)
                     batch_answered = True
                     for target in batch_targets:
@@ -16609,7 +16633,7 @@ def fetch_ai_roster_list(member_id: int, retries: int, retry_backoff_seconds: fl
             session = get_thread_http_session()
             response = session.get(url, timeout=30)
             response.raise_for_status()
-            root = ET.fromstring(response.text)
+            root = _parse_tp_manifest_xml(response.text)
             rosters: list[AIWebRosterItem] = []
             for item in root.findall(".//Collection"):
                 roster_id = (item.findtext("ID") or '').strip()
@@ -17284,7 +17308,7 @@ def fetch_context_files(
                 http = get_thread_http_session()
                 resp = http.post(url, data=payload, timeout=30)
                 resp.raise_for_status()
-                root = ET.fromstring(resp.text)
+                root = _parse_tp_manifest_xml(resp.text)
                 _note_tp_fetch_url_result(url, None)
                 files: list[DownloadFile] = []
                 for car in root.findall(".//Car"):
@@ -18449,6 +18473,10 @@ def move_or_extract(
                         _copy_bz2_capped(src, out)
                 else:
                     shutil.copy2(src, temp_primary_dest)
+                if temp_primary_dest.stat().st_size <= 0:
+                    # An empty reply (HTTP 200, no body) replaced a good paint with a
+                    # zero-byte file. No paint is empty: keep the one in place.
+                    raise RuntimeError(f"{src.name} is empty; keeping the current paint.")
                 _remember_once(primary_dest)
                 os.replace(temp_primary_dest, primary_dest)
                 saved_paths = [primary_dest]
@@ -19290,14 +19318,23 @@ def clear_session_target_files(
         else:
             kept.append(item)
     deleted_paths: set[str] = set()
+    preserved_paths: set[str] = set()
     if tracked_to_delete:
-        delete_saved(tracked_to_delete, keep_targets=set(), paints_root=paints_dir)
-        deleted_paths.update(str(item.file_path).lower() for item in tracked_to_delete)
+        # delete_saved keeps files marked preserve_on_cleanup (driver overrides). They
+        # stay tracked and are not counted, and the sweep below must not delete them.
+        preserved = delete_saved(tracked_to_delete, keep_targets=set(), paints_root=paints_dir)
+        kept.extend(preserved)
+        preserved_paths.update(str(item.file_path).lower() for item in preserved)
+        deleted_paths.update(
+            str(item.file_path).lower()
+            for item in tracked_to_delete
+            if str(item.file_path).lower() not in preserved_paths
+        )
     for kind, target_id, directory in changed:
         target_is_team = kind == "team"
         for path in _expected_session_target_paths(paints_dir, target_is_team, int(target_id), directory):
             key = str(path).lower()
-            if key in deleted_paths:
+            if key in deleted_paths or key in preserved_paths:
                 continue
             if path.exists() and _hard_delete_file(path, paints_root=paints_dir):
                 deleted_paths.add(key)
@@ -20904,6 +20941,31 @@ def apply_installer_autostart_default(config: AppConfig) -> AppConfig:
     return config
 
 
+def _settings_value_or_default(default: object, value: object) -> object:
+    """A value read from settings.json, or the default when it has the wrong type.
+
+    A hand-edited or damaged file with "retries": null or "poll_seconds": "fast"
+    made the conversions below raise, and the app no longer started.
+    """
+    if isinstance(default, bool):
+        return value if isinstance(value, (bool, int)) and not isinstance(value, float) else default
+    if isinstance(default, (int, float)):
+        if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+            return default
+        try:
+            number = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return default
+        if not math.isfinite(number):
+            return default
+        return int(number) if isinstance(default, int) else number
+    if isinstance(default, str):
+        return value if isinstance(value, str) else default
+    if isinstance(default, (list, dict, tuple)):
+        return value if isinstance(value, type(default)) else default
+    return value
+
+
 class ConfigStore:
     def __init__(self) -> None:
         self.path = self._default_path()
@@ -21007,7 +21069,7 @@ class ConfigStore:
         config = AppConfig()
         for key, value in raw.items():
             if hasattr(config, key):
-                setattr(config, key, value)
+                setattr(config, key, _settings_value_or_default(getattr(config, key), value))
         if "auto_start" not in raw:
             apply_installer_autostart_default(config)
         config.ui_mode = normalize_ui_mode_preference(raw.get("ui_mode", getattr(config, "ui_mode", "advanced")))
@@ -22465,12 +22527,15 @@ class DownloaderService:
                     current_user.user_id,
                 )
             stable_seconds = now - float(candidate.first_seen_monotonic)
+            # A confirmed swap stays a candidate until it is processed; the caller drops
+            # it once the change is no longer seen. While another team's swap is still
+            # pending nothing is processed, and dropping it here started it over, so two
+            # swaps one poll apart took turns being pending and neither was ever handled.
+            self._team_driver_swap_candidates[key] = candidate
             if int(candidate.seen_count) >= TEAM_DRIVER_SWAP_CONFIRM_POLLS or stable_seconds >= TEAM_DRIVER_SWAP_CONFIRM_SECONDS:
                 confirmed.append(key)
-                self._team_driver_swap_candidates.pop(key, None)
             else:
                 pending.append(key)
-                self._team_driver_swap_candidates[key] = candidate
         return confirmed, pending
 
     def _schedule_team_driver_swap_retries(
@@ -27273,19 +27338,38 @@ class DownloaderUI:
                 self._pool_stats_refresh_in_progress = False
         threading.Thread(target=_worker, name="NishizumiRandomPoolStats", daemon=True).start()
     def _poll_service(self) -> None:
+        # One failing refresh used to end the polling for good: the status, the session
+        # list and the service restart below all stopped until the window was reopened.
+        keep_polling = True
+        try:
+            keep_polling = self._poll_service_once()
+        except Exception:
+            logging.exception("The window's service poll failed; trying again.")
+        if keep_polling and not self._exiting:
+            self.root.after(750, self._poll_service)
+
+    def _poll_service_once(self) -> bool:
         if self._headless_controller_mode:
             previous_update_state = str((self._last_headless_status_response or {}).get("update_state") or "")
             response = send_headless_control_command("status")
             update_state = str((response or {}).get("update_state") or "")
+            status_ok = bool(response and response.get('ok'))
+            self._headless_status_failures = 0 if status_ok else int(getattr(self, "_headless_status_failures", 0)) + 1
+            # While the service downloads an update, one missed status reply is not the
+            # service closing for the install: it takes three in a row.
             if update_state == "installing" or (
-                not (response and response.get('ok')) and previous_update_state in {"downloading", "installing"}
+                not status_ok
+                and (
+                    previous_update_state == "installing"
+                    or (previous_update_state == "downloading" and self._headless_status_failures >= 3)
+                )
             ):
                 # The headless service is closing for an update. This window must close
                 # too, or the installer could not replace the files it has open.
                 self._append_log("The headless service is installing an update. Closing this window so the installer can finish.")
                 self.request_exit_for_update()
-                return
-            if response and response.get('ok'):
+                return False
+            if status_ok:
                 previous_response = self._last_headless_status_response or {}
                 self._last_headless_status_response = response
                 if (
@@ -27299,6 +27383,8 @@ class DownloaderUI:
                 detail = f"Current session: {session_label}" if session_label else "Waiting for iRacing/session..."
                 self.session_summary_var.set("Headless service is active in the background.")
                 self.session_status_summary_var.set(detail)
+            elif previous_update_state == "downloading":
+                pass
             else:
                 self._append_log("Lost connection to the headless service. Returning to the embedded GUI service.")
                 self._headless_controller_mode = False
@@ -27336,8 +27422,7 @@ class DownloaderUI:
                 self._append_log(
                     "Another copy of Nishizumi Paints is running the downloader, so this window does not start a second one."
                 )
-        if not self._exiting:
-            self.root.after(750, self._poll_service)
+        return True
 
     def _claim_single_instance(self) -> bool:
         """Own the single-instance lock before this window runs its own downloader.
@@ -30092,6 +30177,7 @@ class HeadlessUpdateManager:
         self._message = ""
         self._announced_tag: str | None = None
         self._auto_install_attempted_tag: str | None = None
+        self._auto_install_attempted_at = 0.0
 
     def start(self) -> None:
         if self._thread is not None:
@@ -30244,6 +30330,7 @@ class HeadlessUpdateManager:
             if not release.installer_is_verifiable():
                 raise RuntimeError("This release does not publish an installer with a SHA-256 digest to verify.")
             self._auto_install_attempted_tag = tag
+            self._auto_install_attempted_at = time.monotonic()
             self._set_state("downloading", f"Downloading update {tag}")
             logging.info("Downloading update %s (%s).", tag, release.asset_name)
             self._clean_workspace()
@@ -30272,7 +30359,13 @@ class HeadlessUpdateManager:
     def _should_auto_install(self, release: GitHubReleaseInfo) -> bool:
         if not self._load_config().auto_install_updates:
             return False
-        if self._auto_install_attempted_tag == release.tag_name:
+        if (
+            self._auto_install_attempted_tag == release.tag_name
+            and time.monotonic() - self._auto_install_attempted_at < HEADLESS_AUTO_INSTALL_RETRY_SECONDS
+        ):
+            # A failed download (network, GitHub, digest) is tried again after a pause;
+            # it used to block the automatic install until the service restarted. A
+            # failed installer run has its own one-day hold below.
             return False
         if self._unsupported_reason():
             return False

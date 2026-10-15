@@ -2,9 +2,9 @@
 
 All notable user-facing changes to Nishizumi Paints are documented here.
 
-## [7.3.6] - 2026-10-11 (experimental)
+## [7.3.6] - 2026-10-14
 
-Published as the experimental pre-release `v7.3.6-experimental.1`. The in-app updater does not offer pre-releases, so it has to be installed by hand.
+First published as the experimental pre-release `v7.3.6-experimental.1` on 2026-10-11. The final release adds the fixes listed first under **Fixed**.
 
 ### Changed
 
@@ -18,6 +18,15 @@ Published as the experimental pre-release `v7.3.6-experimental.1`. The in-app up
 - Command line: `--temp-dir` is used, `--iracing-documents-dir` is the new name of `--paints-dir`, and the retired `--session-yaml`, `--watch` and `--iracing-sdk` are still accepted but do nothing.
 
 ### Fixed
+
+- Fixed an empty paint download replacing the paint in place with an empty file.
+- Fixed a web page from a Trading Paints host being read as "no paint" (or "no AI rosters") instead of trying again and moving to the backup host.
+- Fixed the window freezing for good when an unlisted car showed up during the first car catalog download, and the catalog download freezing the window while it ran.
+- Fixed clearing a session deleting a driver override marked to be kept.
+- Fixed a damaged `settings.json` value (wrong type or a number too large) stopping the app from starting.
+- Fixed two team driver swaps one poll apart never being handled.
+- Fixed one error stopping the window's status refresh, and one missed reply during an update download closing the window.
+- Fixed a failed automatic update download blocking automatic installs until the service restarted.
 
 - Fixed a team download from the Teams tab sending every request to the broken backup host as well after the main host had answered, and **Download ALL team paints...** asking the backup again for every batch without paints for the team.
 - Fixed closing the app after leaving a session deleting your own car, helmet, and suit even with **Keep my livery locally** on.

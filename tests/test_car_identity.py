@@ -350,6 +350,75 @@ class TradingPaintsCarIdentityDiskCacheTests(unittest.TestCase):
         self.assertIn("ferrari296gt3", doc.get("cars") or {})
         self.assertIn("changed the page again", APP.tp_car_identity_catalog_status()["last_error"])
 
+    def test_the_catalog_lock_is_free_while_the_catalog_downloads(self):
+        # The window reads the catalog status under this lock; holding it for the
+        # whole fetch froze the window.
+        lock_was_free = []
+
+        def fake_fetch(*_args, **_kwargs):
+            def probe():
+                acquired = APP._TP_CAR_IDENTITY_CACHE_LOCK.acquire(timeout=2)
+                lock_was_free.append(acquired)
+                if acquired:
+                    APP._TP_CAR_IDENTITY_CACHE_LOCK.release()
+
+            other = APP.threading.Thread(target=probe)
+            other.start()
+            other.join()
+            return self._doc()
+
+        original_fetch = APP._fetch_tp_car_identity_doc
+        APP._fetch_tp_car_identity_doc = fake_fetch
+        self.addCleanup(setattr, APP, "_fetch_tp_car_identity_doc", original_fetch)
+        APP._load_tp_showroom_mapping(force_refresh=True)
+        self.assertEqual(lock_was_free, [True])
+
+    def test_an_unknown_car_during_a_catalog_download_does_not_deadlock(self):
+        # One thread downloads the catalog (fetch lock held, no catalog yet) while
+        # another meets an unknown car. Taking the two locks in opposite orders hung
+        # both threads and, with them, the window.
+        fetching = APP.threading.Event()
+        release_fetch = APP.threading.Event()
+
+        def slow_fetch(*_args, **_kwargs):
+            fetching.set()
+            release_fetch.wait(5)
+            return self._doc()
+
+        original_fetch = APP._fetch_tp_car_identity_doc
+        APP._fetch_tp_car_identity_doc = slow_fetch
+        self.addCleanup(setattr, APP, "_fetch_tp_car_identity_doc", original_fetch)
+        downloader = APP.threading.Thread(target=APP._load_tp_showroom_mapping, daemon=True)
+        downloader.start()
+        self.assertTrue(fetching.wait(5))
+        unknown_car = APP.threading.Thread(target=APP._refresh_tp_car_identity_after_unknown, daemon=True)
+        unknown_car.start()
+        APP.time.sleep(0.2)
+        release_fetch.set()
+        downloader.join(3)
+        unknown_car.join(3)
+        self.assertFalse(downloader.is_alive() or unknown_car.is_alive(), "catalog locks deadlocked")
+
+    def test_a_catalog_from_disk_is_replaced_once_the_retry_pause_ends(self):
+        APP.save_tp_car_identity_cache(self._doc())
+        self._install_fetch(RuntimeError("offline"))
+        APP._load_tp_showroom_mapping()
+        calls = []
+        fresh = APP._build_tp_car_identity_doc(
+            [{"mid": 1, "tp_name": "Skip Barber Formula 2000", "directory": "skipbarberfr2000"}]
+        )
+
+        def fake_fetch(*_args, **_kwargs):
+            calls.append(1)
+            return fresh
+
+        APP._fetch_tp_car_identity_doc = fake_fetch
+        with APP._TP_CAR_IDENTITY_CACHE_LOCK:
+            APP._TP_CAR_IDENTITY_LAST_ATTEMPT_AT -= APP.TP_CAR_IDENTITY_RETRY_SECONDS + 1
+        doc = APP._load_tp_showroom_mapping()
+        self.assertEqual(calls, [1])
+        self.assertIn("skipbarberfr2000", doc.get("cars") or {})
+
     def test_a_failed_refresh_without_a_disk_cache_returns_an_empty_catalog(self):
         self._install_fetch(RuntimeError("Trading Paints is unreachable"))
         self.assertEqual(APP._load_tp_showroom_mapping(force_refresh=True).get("cars"), {})

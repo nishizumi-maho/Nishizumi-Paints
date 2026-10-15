@@ -104,6 +104,34 @@ class ManifestHostFallbackTests(unittest.TestCase):
         self.assertEqual(http.calls, [PRIMARY, BACKUP])
         self.assertEqual([item.download_id.user_id for item in files], [42])
 
+    def test_an_html_page_from_the_primary_moves_to_the_backup(self):
+        # A proxy or Cloudflare page answers 200 with HTML instead of the manifest.
+        self._no_backoff()
+        http = _HttpSession({})
+        original_post = http.post
+
+        def post(url, data=None, timeout=None):
+            if url == PRIMARY:
+                http.calls.append(url)
+                return _Response("<!DOCTYPE html><html><body>Just a moment...</body></html>")
+            return original_post(url, data=data, timeout=timeout)
+
+        http.post = post
+        self._use(http)
+        files = self._fetch()
+        self.assertEqual([item.download_id.user_id for item in files], [42])
+        self.assertEqual(http.calls[-1], BACKUP)
+        self.assertLessEqual(http.calls.count(PRIMARY), 3)
+
+    def test_html_from_every_host_ends_with_an_error_not_a_loop(self):
+        self._no_backoff()
+        http = _HttpSession({})
+        http.post = lambda url, data=None, timeout=None: http.calls.append(url) or _Response("<html><body>502</body></html")
+        self._use(http)
+        with self.assertRaises(Exception):
+            self._fetch()
+        self.assertLessEqual(len(http.calls), 6)
+
     def _no_backoff(self):
         original_delay = APP.compute_retry_delay
         APP.compute_retry_delay = lambda _base, _attempt: 0.0

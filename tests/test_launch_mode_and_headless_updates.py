@@ -361,6 +361,15 @@ class HeadlessUpdateManagerTests(_TempStoreMixin, unittest.TestCase):
         self.addCleanup(manager.stop)
         return manager
 
+    def test_a_failed_download_is_installed_automatically_again_later(self):
+        self.save_settings(auto_install_updates=True)
+        manager = self.make_manager()
+        self.download.side_effect = RuntimeError("GitHub answered 502")
+        self.assertFalse(manager._install(self.release))
+        self.assertFalse(manager._should_auto_install(self.release))
+        manager._auto_install_attempted_at -= APP.HEADLESS_AUTO_INSTALL_RETRY_SECONDS + 1
+        self.assertTrue(manager._should_auto_install(self.release))
+
     def test_a_check_during_an_install_leaves_the_install_state_alone(self):
         self.save_settings(auto_install_updates=False)
         release_download = threading.Event()
@@ -608,6 +617,9 @@ class ControllerWindowUpdateTests(unittest.TestCase):
         ui._headless_controller_mode = True
         ui._last_headless_status_response = status
         ui._headless_service_handles_updates = lambda: APP.DownloaderUI._headless_service_handles_updates(ui)
+        ui._poll_service_once = lambda: APP.DownloaderUI._poll_service_once(ui)
+        ui._headless_status_failures = 0
+        ui._exiting = False
         return ui
 
     def test_the_window_leaves_automatic_installs_to_the_headless_service(self):
@@ -650,9 +662,35 @@ class ControllerWindowUpdateTests(unittest.TestCase):
     def test_the_window_closes_when_the_headless_service_leaves_to_install(self):
         ui = self._controller({"ok": True, "update_state": "downloading"})
         with mock.patch.object(APP, "send_headless_control_command", return_value=None):
+            # One or two missed replies during a download are not the service leaving.
+            APP.DownloaderUI._poll_service(ui)
+            APP.DownloaderUI._poll_service(ui)
+            ui.request_exit_for_update.assert_not_called()
             APP.DownloaderUI._poll_service(ui)
         ui.request_exit_for_update.assert_called_once()
         ui.service.start.assert_not_called()
+
+    def test_one_missed_reply_while_installing_closes_the_window(self):
+        ui = self._controller({"ok": True, "update_state": "installing"})
+        with mock.patch.object(APP, "send_headless_control_command", return_value=None):
+            APP.DownloaderUI._poll_service(ui)
+        ui.request_exit_for_update.assert_called_once()
+        ui.root.after.assert_not_called()
+
+    def test_a_reply_between_misses_starts_the_count_over(self):
+        ui = self._controller({"ok": True, "update_state": "downloading"})
+        replies = [None, None, {"ok": True, "update_state": "downloading"}, None, None]
+        with mock.patch.object(APP, "send_headless_control_command", side_effect=replies):
+            for _ in replies:
+                APP.DownloaderUI._poll_service(ui)
+        ui.request_exit_for_update.assert_not_called()
+
+    def test_a_failing_poll_keeps_polling(self):
+        ui = self._controller({"ok": True, "update_state": "idle"})
+        ui._poll_service_once = mock.Mock(side_effect=RuntimeError("boom"))
+        with self.assertLogs(level="ERROR"):
+            APP.DownloaderUI._poll_service(ui)
+        ui.root.after.assert_called_once_with(750, ui._poll_service)
 
     def test_losing_an_idle_headless_service_still_falls_back_to_the_window(self):
         ui = self._controller({"ok": True, "update_state": "idle"})

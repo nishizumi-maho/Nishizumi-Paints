@@ -286,5 +286,68 @@ class ServiceLoopRosterChangeTests(unittest.TestCase):
         self.assertEqual(self._finished_passes()[0]["users"], [1, 2, 3])
 
 
+    def test_a_repeated_update_without_changes_starts_no_new_pass(self):
+        for uid in range(1, 4):
+            self.sdk.add_driver(uid)
+        self.service.start()
+        self.assertTrue(_wait_until(lambda: len(self._finished_passes()) >= 1))
+        for _ in range(3):
+            self.sdk.change()  # SessionInfoUpdate moves, nothing else does
+            time.sleep(0.3)
+        self.assertEqual([call["users"] for call in self.calls], [[1, 2, 3]])
+        self.assertEqual(self.deleted, [])
+
+    def test_a_driver_who_leaves_keeps_the_paints_of_the_others(self):
+        for uid in range(1, 4):
+            self.sdk.add_driver(uid)
+        self.service.start()
+        self.assertTrue(_wait_until(lambda: len(self._finished_passes()) >= 1))
+        with self.sdk._lock:
+            self.sdk.drivers = [d for d in self.sdk.drivers if d["UserID"] != 2]
+            self.sdk.session_info_update += 1
+        time.sleep(1.0)
+        self.assertEqual(len(self._finished_passes()), 1)
+        paint_dir = self.tmp / "paint" / CAR
+        self.assertTrue((paint_dir / "car_1.tga").exists())
+        self.assertTrue((paint_dir / "car_3.tga").exists())
+        self.assertNotIn(1, self.deleted)
+        self.assertNotIn(3, self.deleted)
+
+    def test_a_driver_who_comes_back_is_not_fetched_twice(self):
+        for uid in range(1, 4):
+            self.sdk.add_driver(uid)
+        self.service.start()
+        self.assertTrue(_wait_until(lambda: len(self._finished_passes()) >= 1))
+        with self.sdk._lock:
+            leaving = [d for d in self.sdk.drivers if d["UserID"] == 2]
+            self.sdk.drivers = [d for d in self.sdk.drivers if d["UserID"] != 2]
+            self.sdk.session_info_update += 1
+        time.sleep(0.8)
+        with self.sdk._lock:
+            self.sdk.drivers.extend(leaving)
+            self.sdk.session_info_update += 1
+        time.sleep(1.0)
+        fetched = [uid for call in self._finished_passes() for uid in call["users"]]
+        self.assertEqual(sorted(fetched), [1, 2, 3], self.calls)
+
+    def test_a_new_session_fetches_its_roster_and_clears_the_last_one(self):
+        for uid in range(1, 4):
+            self.sdk.add_driver(uid)
+        self.service.start()
+        self.assertTrue(_wait_until(lambda: len(self._finished_passes()) >= 1))
+        with self.sdk._lock:
+            self.sdk.drivers = []
+        self.sdk.add_driver(1)
+        self.sdk.add_driver(7)
+        self.sdk.change(sub_session_id=999)
+        self.assertTrue(_wait_until(lambda: len(self._finished_passes()) >= 2))
+        time.sleep(0.6)
+        self.assertEqual(self._finished_passes()[1]["users"], [1, 7])
+        self.assertTrue(_wait_until(lambda: {2, 3} <= set(self.deleted)), self.deleted)
+        paint_dir = self.tmp / "paint" / CAR
+        self.assertTrue((paint_dir / "car_7.tga").exists())
+        self.assertTrue((paint_dir / "car_1.tga").exists())
+
+
 if __name__ == "__main__":
     unittest.main()
