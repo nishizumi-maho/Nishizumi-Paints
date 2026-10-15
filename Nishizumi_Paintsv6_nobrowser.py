@@ -3945,8 +3945,20 @@ def _build_session_from_parts(
         ai_roster_name=ai_roster_name,
         ai_drivers=tuple(ai_drivers),
     )
-def _parse_fetch_user_manifest_xml(user_id: int, xml_text: str) -> list[DownloadFile]:
+def _parse_tp_manifest_xml(xml_text: str) -> ET.Element:
+    """Parse a Trading Paints manifest; an HTML page is a parse error, not an empty manifest.
+
+    A proxy or challenge page answered with well-formed HTML parsed fine, had no <Car>
+    nodes, and read as "this driver has no paint", so the backup host was never asked.
+    """
     root = ET.fromstring(xml_text)
+    if str(root.tag).lower().rsplit("}", 1)[-1] == "html":
+        raise ET.ParseError("Trading Paints answered with an HTML page instead of a manifest.")
+    return root
+
+
+def _parse_fetch_user_manifest_xml(user_id: int, xml_text: str) -> list[DownloadFile]:
+    root = _parse_tp_manifest_xml(xml_text)
     files: list[DownloadFile] = []
     for car in root.findall(".//Car"):
         file_url = (car.findtext("file") or '').strip()
@@ -9053,7 +9065,7 @@ def _parse_tp_team_fetch_manifest_root(root: ET.Element, target: TPTeamPaintTarg
 
 
 def _parse_tp_team_fetch_manifest(xml_text: str, target: TPTeamPaintTarget) -> list[DownloadFile]:
-    return _parse_tp_team_fetch_manifest_root(ET.fromstring(xml_text), target)
+    return _parse_tp_team_fetch_manifest_root(_parse_tp_manifest_xml(xml_text), target)
 
 
 def _dedupe_tp_team_download_items(items: Iterable[DownloadFile]) -> list[DownloadFile]:
@@ -9619,7 +9631,7 @@ def fetch_tp_team_all_paint_files(
                     http = get_thread_http_session()
                     resp = http.post(endpoint, data=payload, timeout=25)
                     resp.raise_for_status()
-                    root = ET.fromstring(resp.text)
+                    root = _parse_tp_manifest_xml(resp.text)
                     _note_tp_fetch_url_result(endpoint, None)
                     batch_answered = True
                     for target in batch_targets:
@@ -16616,7 +16628,7 @@ def fetch_ai_roster_list(member_id: int, retries: int, retry_backoff_seconds: fl
             session = get_thread_http_session()
             response = session.get(url, timeout=30)
             response.raise_for_status()
-            root = ET.fromstring(response.text)
+            root = _parse_tp_manifest_xml(response.text)
             rosters: list[AIWebRosterItem] = []
             for item in root.findall(".//Collection"):
                 roster_id = (item.findtext("ID") or '').strip()
@@ -17291,7 +17303,7 @@ def fetch_context_files(
                 http = get_thread_http_session()
                 resp = http.post(url, data=payload, timeout=30)
                 resp.raise_for_status()
-                root = ET.fromstring(resp.text)
+                root = _parse_tp_manifest_xml(resp.text)
                 _note_tp_fetch_url_result(url, None)
                 files: list[DownloadFile] = []
                 for car in root.findall(".//Car"):
