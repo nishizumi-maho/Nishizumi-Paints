@@ -36,8 +36,8 @@ Tests import it as `APP` and run with `python -m unittest discover -s tests` (CI
 | ID | Scope | Risk | Existing tests | Status |
 | --- | --- | --- | --- | --- |
 | G0 | Rescue uncommitted 7.3.6 verification round, baseline | lost work | - | done |
-| G1 | File safety: download -> validate -> atomic install, user files, cleanup, disk/lock errors | data loss, wrong paint | `test_downloads` (2), `test_user_files_and_crash_safety` (18) | next |
-| G2 | Session sync: transitions, joins/leaves, duplicates, overlap with active downloads, team swaps, AI roster | wrong/missing paints, redownloads | roster, swaps, preload, randomize, ai_roster_sync | pending |
+| G1 | File safety: download -> validate -> atomic install, user files, cleanup, disk/lock errors | data loss, wrong paint | `test_downloads` (2), `test_user_files_and_crash_safety` (18) | done |
+| G2 | Session sync: transitions, joins/leaves, duplicates, overlap with active downloads, team swaps, AI roster | wrong/missing paints, redownloads | roster, swaps, preload, randomize, ai_roster_sync | next |
 | G3 | Network: gg primary -> backup host, outages, showroom paging, pool exhaustion, retry/backoff, history | stuck downloads, request storms | manifest_hosts, fallback_pool, online_fallback_lanes, showroom_lists | pending |
 | G4 | Lifecycle: first run, bad config, shutdown/restart, single instance, updater | app won't start, two downloaders | auto_update, launch_mode, sdk_and_settings | pending |
 | G5 | Live check in iRacing (user runs the game), checklist in QA_HANDOFF | real-world gaps | manual | pending |

@@ -18456,6 +18456,10 @@ def move_or_extract(
                         _copy_bz2_capped(src, out)
                 else:
                     shutil.copy2(src, temp_primary_dest)
+                if temp_primary_dest.stat().st_size <= 0:
+                    # An empty reply (HTTP 200, no body) replaced a good paint with a
+                    # zero-byte file. No paint is empty: keep the one in place.
+                    raise RuntimeError(f"{src.name} is empty; keeping the current paint.")
                 _remember_once(primary_dest)
                 os.replace(temp_primary_dest, primary_dest)
                 saved_paths = [primary_dest]
