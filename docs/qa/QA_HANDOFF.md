@@ -1,17 +1,29 @@
 # QA handoff
 
 - Branch: `qa/campaign` (base `origin/main` 6dedd45). Commit per group.
-- Phase: G0, G1 done. Next: **G2 session sync**.
-- Last verified: `python -m unittest discover -s tests` -> 339 tests OK (~30 s, ~75 s wall).
-- Plan and rules: `docs/qa/QA_PLAN.md`. Findings: `docs/qa/QA_LOG.md` (F-001..F-009).
-- Mutation-check helper pattern: replace the fix's code in the module, run the test module, restore (keep a backup copy).
+- Phase: G0-G4 done. Next: **G5 live check in iRacing** (user runs the game), then G6.
+- Last verified: `python -m unittest discover -s tests` -> 348 tests OK (~35 s, ~80 s wall).
+- Plan and rules: `docs/qa/QA_PLAN.md`. Findings: `docs/qa/QA_LOG.md` (F-001..F-010).
 
-## Next action
+## G5 live checklist
 
-G2: list what the roster, swap, preload, randomize and ai_roster_sync tests cover (test names only), then read the
-`DownloaderService` pass that reacts to a session change (grep `cancel_event`, `_on_session_change`, `RuntimeSnapshot`).
-Add tests only for gaps: session changes while downloads run (old pass cancelled, no paint for the old session
-installed after), the same roster seen twice (no second download), a driver who leaves and comes back.
+Before: close any installed copy of Nishizumi Paints (tray too); back up `Documents\iRacing\paint`.
+Run from the repo on `qa/campaign`, output to a file:
+`python -u Nishizumi_Paintsv6_nobrowser.py --verbose *> "$env:TEMP
+ishizumi_live.log"` (PowerShell)
+
+| # | Scenario | Pass if |
+| --- | --- | --- |
+| L1 | App starts, settings kept | window opens, settings as before |
+| L2 | Join an online practice | other cars show TP paints within ~1 min |
+| L3 | A driver joins mid-session | only that driver is fetched (log), paint shows |
+| L4 | Practice -> qualify/race in the same event | no full re-download (log), paints stay |
+| L5 | Leave the session | session paints cleared, your own livery files untouched |
+| L6 | AI session + "Randomize active AI roster" | AI cars get random paints, no error |
+| L7 | Close the app during downloads, reopen | no crash, no 0-byte `.tga` in paint folder, resumes |
+| L8 | (if possible) team race with a driver swap | new driver's paint applied |
+
+After: send the log path + what you saw per row. Analyse with grep (WARNING/ERROR/Traceback, "Downloading", "Saved"), not by reading the whole log.
 
 ## Notes
 

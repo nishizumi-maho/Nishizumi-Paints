@@ -61,6 +61,30 @@ class DamagedSettingsTests(unittest.TestCase):
             self.assertEqual(config.max_pool_gb, 2.5)
 
 
+class SettingsShapeTests(unittest.TestCase):
+    def _load(self, text):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        store = APP.ConfigStore()
+        store.path = Path(tmp.name) / "settings.json"
+        store.path.write_text(text, encoding="utf-8")
+        return store.load()
+
+    def test_a_settings_file_that_is_not_an_object_starts_with_defaults(self):
+        defaults = APP.AppConfig()
+        for text in ("[]", "null", '"text"', "42", ""):
+            with self.subTest(text=text):
+                config = self._load(text)
+                self.assertEqual(config.retries, defaults.retries)
+                self.assertEqual(config.poll_seconds, max(0.2, defaults.poll_seconds))
+
+    def test_out_of_range_numbers_are_clamped_to_something_that_still_works(self):
+        config = self._load(json.dumps({"retries": -3, "poll_seconds": 0, "retry_backoff_seconds": -1}))
+        self.assertGreaterEqual(config.retries, 1)
+        self.assertGreater(config.poll_seconds, 0)
+        self.assertGreater(config.retry_backoff_seconds, 0)
+
+
 class TargetCleanupTests(unittest.TestCase):
     def test_a_preserved_override_stays_tracked_and_on_disk(self):
         tmp = tempfile.TemporaryDirectory()
