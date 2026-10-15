@@ -373,6 +373,32 @@ class TradingPaintsCarIdentityDiskCacheTests(unittest.TestCase):
         APP._load_tp_showroom_mapping(force_refresh=True)
         self.assertEqual(lock_was_free, [True])
 
+    def test_an_unknown_car_during_a_catalog_download_does_not_deadlock(self):
+        # One thread downloads the catalog (fetch lock held, no catalog yet) while
+        # another meets an unknown car. Taking the two locks in opposite orders hung
+        # both threads and, with them, the window.
+        fetching = APP.threading.Event()
+        release_fetch = APP.threading.Event()
+
+        def slow_fetch(*_args, **_kwargs):
+            fetching.set()
+            release_fetch.wait(5)
+            return self._doc()
+
+        original_fetch = APP._fetch_tp_car_identity_doc
+        APP._fetch_tp_car_identity_doc = slow_fetch
+        self.addCleanup(setattr, APP, "_fetch_tp_car_identity_doc", original_fetch)
+        downloader = APP.threading.Thread(target=APP._load_tp_showroom_mapping, daemon=True)
+        downloader.start()
+        self.assertTrue(fetching.wait(5))
+        unknown_car = APP.threading.Thread(target=APP._refresh_tp_car_identity_after_unknown, daemon=True)
+        unknown_car.start()
+        APP.time.sleep(0.2)
+        release_fetch.set()
+        downloader.join(3)
+        unknown_car.join(3)
+        self.assertFalse(downloader.is_alive() or unknown_car.is_alive(), "catalog locks deadlocked")
+
     def test_a_catalog_from_disk_is_replaced_once_the_retry_pause_ends(self):
         APP.save_tp_car_identity_cache(self._doc())
         self._install_fetch(RuntimeError("offline"))

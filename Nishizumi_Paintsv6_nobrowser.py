@@ -7135,9 +7135,14 @@ def _refresh_tp_car_identity_after_unknown() -> dict[str, Any]:
             _TP_CAR_IDENTITY_LAST_UNKNOWN_REFRESH_AT > 0
             and now - _TP_CAR_IDENTITY_LAST_UNKNOWN_REFRESH_AT < TP_CAR_IDENTITY_UNKNOWN_REFRESH_SECONDS
         )
-        if fetched_recently or refreshed_recently:
-            return _TP_CAR_IDENTITY_CACHE_DOC or _load_tp_showroom_mapping()
-        _TP_CAR_IDENTITY_LAST_UNKNOWN_REFRESH_AT = now
+        cached_doc = _TP_CAR_IDENTITY_CACHE_DOC
+        if not (fetched_recently or refreshed_recently):
+            _TP_CAR_IDENTITY_LAST_UNKNOWN_REFRESH_AT = now
+    # _load_tp_showroom_mapping takes the fetch lock and then the cache lock; calling
+    # it with the cache lock held took them in the opposite order and could deadlock
+    # with a catalog download already in progress.
+    if fetched_recently or refreshed_recently:
+        return cached_doc or _load_tp_showroom_mapping()
     return _load_tp_showroom_mapping(force_refresh=True)
 
 
@@ -20949,7 +20954,7 @@ def _settings_value_or_default(default: object, value: object) -> object:
             return default
         try:
             number = float(value)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return default
         if not math.isfinite(number):
             return default

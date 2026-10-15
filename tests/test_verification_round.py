@@ -80,6 +80,7 @@ class SettingsShapeTests(unittest.TestCase):
 
     def test_out_of_range_numbers_are_clamped_to_something_that_still_works(self):
         config = self._load(json.dumps({"retries": -3, "poll_seconds": 0, "retry_backoff_seconds": -1}))
+        self.assertEqual(self._load('{"retries": 1' + "0" * 400 + "}").retries, APP.AppConfig().retries)
         self.assertGreaterEqual(config.retries, 1)
         self.assertGreater(config.poll_seconds, 0)
         self.assertGreater(config.retry_backoff_seconds, 0)
