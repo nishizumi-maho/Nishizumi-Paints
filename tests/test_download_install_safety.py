@@ -184,6 +184,15 @@ class DownloadAndInstallTests(unittest.TestCase):
         history = [p for p in APP.default_paint_history_dir().rglob("*") if p.is_file() and p.suffix == ".tga"]
         self.assertEqual([p.read_bytes() for p in history], [OLD_PAINT])
 
+    def test_a_session_change_after_the_download_installs_nothing(self):
+        self._existing_paint()
+        self.http.get.side_effect = [_Response([bz2.compress(GOOD_PAINT)])]
+        downloaded = APP.download_file(APP.SessionId(1, 2), self.temp_dir, self._item(), 3, 0.0)
+        cancel = APP.threading.Event()
+        cancel.set()
+        self.assertIsNone(APP.move_or_extract(downloaded, self.paints, cancel_event=cancel))
+        self.assertEqual(self.target.read_bytes(), OLD_PAINT)
+
 
 class SavePathTests(unittest.TestCase):
     def test_a_car_folder_cannot_escape_the_paint_folder(self):
