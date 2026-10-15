@@ -40,8 +40,8 @@ Tests import it as `APP` and run with `python -m unittest discover -s tests` (CI
 | G2 | Session sync: transitions, joins/leaves, duplicates, overlap with active downloads, team swaps, AI roster | wrong/missing paints, redownloads | roster, swaps, preload, randomize, ai_roster_sync | done |
 | G3 | Network: gg primary -> backup host, outages, showroom paging, pool exhaustion, retry/backoff, history | stuck downloads, request storms | manifest_hosts, fallback_pool, online_fallback_lanes, showroom_lists | done |
 | G4 | Lifecycle: first run, bad config, shutdown/restart, single instance, updater | app won't start, two downloaders | auto_update, launch_mode, sdk_and_settings | done |
-| G5 | Live check in iRacing (user runs the game), checklist in QA_HANDOFF | real-world gaps | manual | partial (L2 only) |
-| G6 | Coverage once, one independent review, CI check, final report, PR text (not published) | - | - | pending |
+| G5 | Live check in iRacing (user runs the game), checklist in QA_HANDOFF | real-world gaps | manual | partial (L2, L5) |
+| G6 | Coverage once, one independent review, CI check, final report, PR text (not published) | - | - | done |
 
 UI (`DownloaderUI`) is covered only where logic is testable with mocks; real UI behaviour is checked in G5.
 

@@ -1,9 +1,10 @@
 # QA handoff
 
 - Branch: `qa/campaign` (base `origin/main` 6dedd45). Commit per group.
-- Phase: G0-G4 done; G5 partial (L2 passed live, spectating a race). Still to run live: L3-L8. Next: **G6** (or finish G5 when the user can).
-- Last verified: `python -m unittest discover -s tests` -> 348 tests OK (~35 s, ~80 s wall).
-- Plan and rules: `docs/qa/QA_PLAN.md`. Findings: `docs/qa/QA_LOG.md` (F-001..F-010).
+- Phase: G0-G4 and G6 done; G5 partial (L2, L5 passed live). Campaign complete except live rows L3, L4, L6-L8.
+- Last verified: `python -m unittest discover -s tests` -> 352 tests OK, two consecutive runs (~36 s, ~80 s wall).
+- Plan and rules: `docs/qa/QA_PLAN.md`. Findings and final assessment: `docs/qa/QA_LOG.md` (F-001..F-012). PR text draft: `docs/qa/PR_DRAFT.md` (not published).
+- Next action: when the user can, run the remaining live rows below; then push `qa/campaign` and open the PR only with the user's OK.
 
 ## G5 live checklist
 
