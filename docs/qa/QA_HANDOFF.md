@@ -9,8 +9,7 @@
 
 Before: close any installed copy of Nishizumi Paints (tray too); back up `Documents\iRacing\paint`.
 Run from the repo on `qa/campaign`, output to a file:
-`python -u Nishizumi_Paintsv6_nobrowser.py --verbose *> "$env:TEMP
-ishizumi_live.log"` (PowerShell)
+`python -u Nishizumi_Paintsv6_nobrowser.py --verbose *> "$env:TEMP\nishizumi_live.log"` (PowerShell)
 
 | # | Scenario | Pass if |
 | --- | --- | --- |
