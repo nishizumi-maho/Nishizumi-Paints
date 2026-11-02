@@ -2,6 +2,29 @@
 
 All notable user-facing changes to Nishizumi Paints are documented here.
 
+## [7.4.0] - 2026-11-02 (beta)
+
+Published as the pre-release `v7.4.0-beta.1`, which the in-app updater does not offer.
+
+### Added
+
+- **TP Download** tab: browse any member's Trading Paints car paints, preview them (3-D render and TGA), view the paint for a day/night, team, series or league context, and download selected or all paints. Includes a Friends list with "download all friends' paints".
+- Showroom link preview: drag or paste a Trading Paints showroom link onto the car preview to try it; your own car's paint is copied to the iRacing paint folder (Ctrl+R in the sim reloads it).
+- Session tab preview of the selected driver's car, helmet and suit, using the driver's iRacing pattern, colours and number when they have no livery, with image export to `Pictures\iRacing`.
+- Session tab: **Forbid TP / Allow TP**, **Copy to AI**, driver/team aliases, friends and paint theme tags (with clipboard import/export).
+- League library for league decals (all drivers, per class, per driver) and per-driver league paints, applied automatically in sessions of that league.
+- Warning decals by iRating and/or safety rating (off by default).
+- Default spec maps per car, car thumbnails, a replay name template copied on the checkered flag, iRacing folder sizes and free space, and an option to pause OneDrive and Dropbox while the app runs (off by default).
+
+### Fixed
+
+- Files written by league, warning decal and default spec map features are cleaned up with the session's paints.
+- A fallback paint without a spec map no longer keeps the previous driver's spec map.
+- A damaged or error-page download no longer replaces a good paint.
+- Your own car paint is kept when session paints are cleared.
+- The member ID is not changed while watching someone else's replay.
+- Closing the app during a stuck download still runs the session cleanup.
+
 ## [7.3.6] - 2026-10-14
 
 First published as the experimental pre-release `v7.3.6-experimental.1` on 2026-10-11. The final release adds the fixes listed first under **Fixed**.

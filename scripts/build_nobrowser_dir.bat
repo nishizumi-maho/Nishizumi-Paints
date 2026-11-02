@@ -19,7 +19,7 @@ if not exist "%SCRIPT%" (
 echo [INFO] Using script: %SCRIPT%
 
 echo [INFO] Installing/updating build dependencies...
-py -m pip install --upgrade pyinstaller requests pyyaml beautifulsoup4 pyirsdk
+py -m pip install --upgrade pyinstaller requests pyyaml beautifulsoup4 pyirsdk pillow tkinterdnd2
 if errorlevel 1 (
     echo.
     echo [ERROR] Failed to install/update build dependencies.
@@ -53,7 +53,7 @@ if exist "assets\\icons\\nishizumi_paints_icon.png" (
 if exist "assets\\icons\\nishizumi_paints_icon.ico" (
     set "CMD=!CMD! --add-data assets\\icons\\nishizumi_paints_icon.ico;assets/icons"
 )
-set "CMD=!CMD! --hidden-import irsdk --hidden-import bs4 %SCRIPT%"
+set "CMD=!CMD! --hidden-import irsdk --hidden-import bs4 --collect-all tkinterdnd2 --hidden-import PIL._tkinter_finder %SCRIPT%"
 
 echo.
 echo [INFO] Building with command:
