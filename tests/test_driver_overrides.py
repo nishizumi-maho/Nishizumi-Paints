@@ -47,7 +47,7 @@ class CachedCarOverrideTests(_Patching, unittest.TestCase):
         car_dir = self.paints / CAR
         car_dir.mkdir(parents=True)
         # The driver's own Trading Paints paint, downloaded earlier in the pass.
-        for name in ("car_123.tga", "car_spec_123.mip", "decal_123.tga", "car_num_123.tga", "car_123_ss.tga", "decal_123_ss.tga"):
+        for name in ("car_123.tga", "car_spec_123.mip", "car_decal_123.tga", "car_num_123.tga", "car_123_ss.tga", "car_decal_123_ss.tga"):
             (car_dir / name).write_bytes(b"original " + name.encode())
 
     def _apply(self, superspeedway):
@@ -61,14 +61,14 @@ class CachedCarOverrideTests(_Patching, unittest.TestCase):
         self._apply(superspeedway=False)
         car_dir = self.paints / CAR
         self.assertEqual((car_dir / "car_123.tga").read_bytes(), b"override car")
-        for name in ("car_spec_123.mip", "decal_123.tga", "car_num_123.tga", "car_123_ss.tga", "decal_123_ss.tga"):
+        for name in ("car_spec_123.mip", "car_decal_123.tga", "car_num_123.tga", "car_123_ss.tga", "car_decal_123_ss.tga"):
             self.assertFalse((car_dir / name).exists(), name)
 
     def test_a_superspeedway_track_gets_the_override_as_its_ss_paint(self):
         saved = self._apply(superspeedway=True)
         car_dir = self.paints / CAR
         self.assertEqual((car_dir / "car_123_ss.tga").read_bytes(), b"override car")
-        self.assertFalse((car_dir / "decal_123_ss.tga").exists())
+        self.assertFalse((car_dir / "car_decal_123_ss.tga").exists())
         self.assertIn(car_dir / "car_123_ss.tga", [item.file_path for item in saved])
 
 

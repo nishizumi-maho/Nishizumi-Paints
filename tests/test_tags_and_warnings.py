@@ -160,14 +160,14 @@ class ThemeApplyTests(_TempFolder):
         folder.mkdir()
         (folder / "car_42.tga").write_bytes(b"TP CAR")
         (folder / "car_num_42.tga").write_bytes(b"TP NUM")
-        (folder / "decal_42.tga").write_bytes(b"TP DECAL")
+        (folder / "car_decal_42.tga").write_bytes(b"TP DECAL")
         (folder / "car_spec_42.mip").write_bytes(b"TP SPEC")
 
         written = self._apply(user, {"42": "neon"})
 
         self.assertEqual((folder / "car_42.tga").read_bytes(), b"THEME CAR")
         self.assertFalse((folder / "car_num_42.tga").exists())
-        self.assertFalse((folder / "decal_42.tga").exists())
+        self.assertFalse((folder / "car_decal_42.tga").exists())
         self.assertFalse((folder / "car_spec_42.mip").exists())
         self.assertEqual(set(written), {folder / "car_42.tga"})
 
@@ -188,7 +188,7 @@ class ThemeApplyTests(_TempFolder):
         self.assertFalse((folder / "car_42.tga").exists())
         self.assertEqual((folder / "car_num_42.tga").read_bytes(), b"THEME NUM")
         self.assertEqual((folder / "car_spec_42.mip").read_bytes(), b"THEME SPEC")
-        self.assertEqual((folder / "decal_42.tga").read_bytes(), b"THEME DECAL")
+        self.assertEqual((folder / "car_decal_42.tga").read_bytes(), b"THEME DECAL")
         self.assertEqual((self.paints / "helmet_42.tga").read_bytes(), b"THEME HELMET")
         self.assertEqual((self.paints / "suit_42.tga").read_bytes(), b"THEME SUIT")
         self.assertEqual(len(written), 5)
@@ -199,13 +199,13 @@ class ThemeApplyTests(_TempFolder):
         folder = self.paints / CAR
         folder.mkdir()
         (folder / "car_99.tga").write_bytes(b"MY CAR")
-        (folder / "decal_99.tga").write_bytes(b"MY DECAL")
+        (folder / "car_decal_99.tga").write_bytes(b"MY DECAL")
 
         written = self._apply(local, {"99": "Neon"})
 
         self.assertEqual(written, [])
         self.assertEqual((folder / "car_99.tga").read_bytes(), b"MY CAR")
-        self.assertEqual((folder / "decal_99.tga").read_bytes(), b"MY DECAL")
+        self.assertEqual((folder / "car_decal_99.tga").read_bytes(), b"MY DECAL")
 
 
 class WarningRuleTests(unittest.TestCase):
@@ -271,7 +271,7 @@ class WarningApplyTests(_TempFolder):
         (self.themes_dir / f"Warning.{CAR}.decal.tga").write_bytes(_tga_bytes((0, 255, 0)))
         folder = self.paints / CAR
         folder.mkdir()
-        decal = folder / "decal_42.tga"
+        decal = folder / "car_decal_42.tga"
         decal.write_bytes(_tga_bytes((255, 0, 0)))
 
         written = APP.apply_warning_decals(
@@ -302,7 +302,7 @@ class WarningApplyTests(_TempFolder):
             self.themes_dir,
         )
 
-        decal = self.paints / CAR / "decal_42.tga"
+        decal = self.paints / CAR / "car_decal_42.tga"
         self.assertEqual(written, [decal])
         self.assertEqual(decal.read_bytes(), payload)
 
@@ -322,8 +322,8 @@ class WarningApplyTests(_TempFolder):
         )
 
         self.assertEqual(written, [])
-        self.assertFalse((self.paints / CAR / "decal_42.tga").exists())
-        self.assertFalse((self.paints / CAR / "decal_99.tga").exists())
+        self.assertFalse((self.paints / CAR / "car_decal_42.tga").exists())
+        self.assertFalse((self.paints / CAR / "car_decal_99.tga").exists())
 
 
 class PostSaveOrderTests(_TempFolder):

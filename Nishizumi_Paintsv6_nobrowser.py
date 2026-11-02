@@ -2058,6 +2058,17 @@ class SessionId:
         if self.sub_session_id is None:
             return str(self.main_session_id)
         return f"{self.main_session_id}_{self.sub_session_id}"
+def normalize_trading_paints_number(value: object) -> str:
+    """The number Trading Paints matches: digits and dots only, like the official client."""
+    text = re.sub(r"[^0-9.]", "", str(value or "").strip())
+    return text or "0"
+def normalize_paint_extension(value: object) -> str:
+    """A safe filename suffix for CarCfgCustomPaintExt; empty means the default paint."""
+    text = str(value or "").strip().lower()
+    text = re.sub(r"[^a-z0-9]+", "_", text).strip("_")
+    if text in {"none", "default", "regular"}:
+        return ""
+    return text
 def _normalize_ss_token(value: str | None) -> str:
     return normalize_directory(value or '')
 def _is_superspeedway_track(track_name: str, track_display_name: str, track_config_name: str) -> bool:
@@ -2123,7 +2134,7 @@ class SessionUser:
         target_id = self.team_id if target_kind == "team" else self.user_id
         return (target_kind, int(target_id), self.directory.lower())
     def trading_paints_list_value(self) -> str:
-        return f"{self.user_id}={self.directory}={self.team_id or 0}={self.number or '0'}={self.paint_ext or ''}"
+        return f"{self.user_id}={self.directory}={self.team_id or 0}={normalize_trading_paints_number(self.number)}={self.paint_ext or ''}"
 
 def session_user_uses_team_target(user: SessionUser) -> bool:
     return bool((not user.is_ai) and user.team_id is not None and user.team_id > 0)
@@ -2376,12 +2387,14 @@ class DownloadId:
     tp_title: str = ""
     tp_source_link: str = ""
     tp_source: str = ""
+    ext: str = ""
 @dataclass(frozen=True)
 class DownloadFile:
     download_id: DownloadId
     url: str
     ai_roster_optional_filename: str = ""
     ai_roster_dir: Path | None = None
+    expected_size: int | None = None
 @dataclass(frozen=True)
 class DownloadedFile:
     session_id: SessionId
@@ -4577,7 +4590,7 @@ def _apply_league_library_for_user(
         return written
 
     # Use the effective target: a team livery lives on car_team_<team>.tga and
-    # decal_team_<team>.tga, not on the current driver's personal files.
+    # car_decal_team_<team>.tga, not on the current driver's personal files.
     car_path = _tag_target_path(user, paints_dir, PaintType.CAR)
     number_path = _tag_target_path(user, paints_dir, PaintType.CAR_NUMBER)
     spec_path = _tag_target_path(user, paints_dir, PaintType.CAR_SPEC)
@@ -4785,6 +4798,7 @@ def _tag_target_path(user: SessionUser, paints_dir: Path, paint_type: PaintType)
             directory=user.directory,
             paint_type=paint_type,
             is_team_paint=session_user_uses_team_target(user),
+            ext=user.paint_ext if _is_car_related_paint_type(paint_type) else "",
         ),
         paints_dir,
     )
@@ -4806,6 +4820,7 @@ def _tag_paint_variant_paths(user: SessionUser, paints_dir: Path) -> list[Path]:
                             paint_type=paint_type,
                             is_team_paint=is_team,
                             is_superspeedway_variant=superspeedway,
+                            ext=user.paint_ext,
                         ),
                         paints_dir,
                     )
@@ -5094,6 +5109,7 @@ def _user_car_paint_paths(user: SessionUser, paints_dir: Path) -> list[Path]:
                         directory=user.directory,
                         paint_type=paint_type,
                         is_team_paint=is_team,
+                        ext=user.paint_ext,
                     ),
                     paints_dir,
                 )
@@ -5126,6 +5142,7 @@ def apply_default_spec_maps(
                     directory=user.directory,
                     paint_type=PaintType.CAR_SPEC,
                     is_team_paint=is_team,
+                    ext=user.paint_ext,
                 ),
                 paints_root,
             )
@@ -5332,6 +5349,7 @@ def _saved_files_for_extra_paths(session: Session, paints_dir: Path, paths: Iter
     saved: list[SavedFile] = []
     paint_types = {
         "decal": PaintType.CAR_DECAL,
+        "car_decal": PaintType.CAR_DECAL,
         "car_num": PaintType.CAR_NUMBER,
         "car_spec": PaintType.CAR_SPEC,
         "car": PaintType.CAR,
@@ -5343,7 +5361,11 @@ def _saved_files_for_extra_paths(session: Session, paints_dir: Path, paths: Iter
         if user.team_id is not None and session_user_uses_team_target(user)
     }
     for path in paths:
-        match = re.match(r"^(decal|car_num|car_spec|car)_(team_)?(\d+)", Path(path).name, re.IGNORECASE)
+        match = re.match(
+            r"^(car_decal|decal|car_num|car_spec|car)_(team_)?(\d+)(?:_([A-Za-z0-9]+))?",
+            Path(path).name,
+            re.IGNORECASE,
+        )
         if match is None:
             continue
         target_id = int(match.group(3))
@@ -5352,6 +5374,9 @@ def _saved_files_for_extra_paths(session: Session, paints_dir: Path, paths: Iter
         if user is None:
             continue
         paint_type = paint_types[match.group(1).lower()]
+        ext = str(match.group(4) or "").lower()
+        if ext == "ss":
+            ext = ""
         saved.append(
             SavedFile(
                 session_id=session.session_id,
@@ -5360,6 +5385,7 @@ def _saved_files_for_extra_paths(session: Session, paints_dir: Path, paths: Iter
                     directory=user.directory,
                     paint_type=paint_type,
                     is_team_paint=is_team,
+                    ext=ext,
                 ),
                 file_path=Path(path),
             )
@@ -5442,7 +5468,7 @@ def tp_download_context_payload(
         "series": str(int(series_id or 0)),
         "league": str(int(league_id or 0)),
         "numbers": "True" if custom_numbers else "False",
-        "list": f"{member}={directory}={team}={number}={paint_ext}",
+        "list": f"{member}={directory}={team}={normalize_trading_paints_number(number)}={paint_ext}",
     }
 
 
@@ -5468,8 +5494,10 @@ def _build_context_download_file(member_id: int, car: ET.Element) -> DownloadFil
             paint_type=paint_type,
             is_team_paint=is_team_paint,
             is_superspeedway_variant=_manifest_file_url_is_superspeedway_variant(file_url, paint_type),
+            ext=_manifest_entry_ext(car),
         ),
         url=file_url,
+        expected_size=_manifest_entry_size(car),
     )
 
 
@@ -6750,6 +6778,15 @@ def _parse_tp_manifest_xml(xml_text: str) -> ET.Element:
     return root
 
 
+def _manifest_entry_ext(car: ET.Element) -> str:
+    return normalize_paint_extension(car.findtext("ext"))
+
+
+def _manifest_entry_size(car: ET.Element) -> int | None:
+    value = _to_int_or_none((car.findtext("filesize") or "").strip())
+    return value if value is not None and value > 0 else None
+
+
 def _parse_fetch_user_manifest_xml(user_id: int, xml_text: str) -> list[DownloadFile]:
     root = _parse_tp_manifest_xml(xml_text)
     files: list[DownloadFile] = []
@@ -6781,8 +6818,10 @@ def _parse_fetch_user_manifest_xml(user_id: int, xml_text: str) -> list[Download
                     paint_type=paint_type,
                     is_team_paint=is_team_paint,
                     is_superspeedway_variant=_manifest_file_url_is_superspeedway_variant(file_url, paint_type),
+                    ext=_manifest_entry_ext(car),
                 ),
                 url=file_url,
+                expected_size=_manifest_entry_size(car),
             )
         )
     return files
@@ -8772,6 +8811,7 @@ def _apply_cached_driver_paint_override_for_user(
         "user_id": target_id,
         "directory": user.directory,
         "is_team_paint": target_is_team,
+        "ext": user.paint_ext,
         "preserve_on_cleanup": True,
         "tp_scheme_id": str(normalized.get("scheme_id") or "").strip(),
         "tp_title": str(normalized.get("title") or "").strip(),
@@ -9256,6 +9296,7 @@ def _apply_local_tp_random_fallback_assets_for_user(
         "directory": user.directory,
         "is_team_paint": target_is_team,
         "is_superspeedway_variant": False,
+        "ext": user.paint_ext,
     }
 
     if need_car:
@@ -12287,8 +12328,10 @@ def _parse_tp_team_fetch_manifest_root(root: ET.Element, target: TPTeamPaintTarg
                     is_superspeedway_variant=_manifest_file_url_is_superspeedway_variant(file_url, paint_type),
                     preserve_on_cleanup=True,
                     tp_source="team_manual",
+                    ext=_manifest_entry_ext(car),
                 ),
                 url=file_url,
+                expected_size=_manifest_entry_size(car),
             )
         )
     return files
@@ -12996,14 +13039,14 @@ def _candidate_local_tp_paths(
             result.extend([
                 base / f"car_{uid}.tga",
                 base / f"car_spec_{uid}.mip",
-                base / f"decal_{uid}.tga",
+                base / f"car_decal_{uid}.tga",
             ])
         if local_team_id is not None and local_team_id > 0:
             tid = int(local_team_id)
             result.extend([
                 base / f"car_team_{tid}.tga",
                 base / f"car_spec_team_{tid}.mip",
-                base / f"decal_team_{tid}.tga",
+                base / f"car_decal_team_{tid}.tga",
             ])
 
     dedup: list[Path] = []
@@ -13034,8 +13077,7 @@ def _candidate_local_driver_accessory_paths(
             result.append(paints_dir / f"suit_{uid}.tga")
     if local_team_id is not None and local_team_id > 0:
         tid = int(local_team_id)
-        if wanted_all or normalized_kind == "helmet":
-            result.append(paints_dir / f"helmet_team_{tid}.tga")
+        # iRacing has no team helmet slot; the driver's helmet_<user>.tga is above.
         if wanted_all or normalized_kind == "suit":
             result.append(paints_dir / f"suit_team_{tid}.tga")
     dedup: list[Path] = []
@@ -13116,7 +13158,7 @@ def _wait_for_local_tp_sync(paths: list[Path], before: dict[str, float], timeout
             name = path.name.lower()
             if name.startswith("car_spec_") and not spec:
                 spec = str(path)
-            elif name.startswith("decal_") and not decal:
+            elif name.startswith(("car_decal_", "decal_")) and not decal:
                 decal = str(path)
             elif name.startswith("car_") and not car:
                 car = str(path)
@@ -14122,6 +14164,7 @@ def _tp_retarget_manifest_items_for_user(session: Session, user: SessionUser, it
                 url=item.url,
                 ai_roster_optional_filename=item.ai_roster_optional_filename,
                 ai_roster_dir=item.ai_roster_dir,
+                expected_size=item.expected_size,
             )
         )
     return result
@@ -20537,10 +20580,12 @@ def _parse_saved_paint_filename(path: Path, paints_root: Path | None = None) -> 
         directory = "__accessories__" if parent_name.lower() == "paint" else parent_name
     name = path.name.lower()
     patterns: list[tuple[PaintType, str]] = [
-        (PaintType.CAR, r"^car_(team_)?(\d+)(?:(_ss))?\.tga$"),
-        (PaintType.CAR_NUMBER, r"^car_num_(team_)?(\d+)(?:(_ss))?\.tga$"),
-        (PaintType.CAR_SPEC, r"^car_spec_(team_)?(\d+)(?:_spec)?(?:(_ss))?\.mip$"),
-        (PaintType.CAR_DECAL, r"^decal_(team_)?(\d+)(?:(_ss))?\.tga$"),
+        (PaintType.CAR, r"^car_(team_)?(\d+)(?:_([a-z0-9]+))?(_ss)?\.tga$"),
+        (PaintType.CAR_NUMBER, r"^car_num_(team_)?(\d+)(?:_([a-z0-9]+))?(_ss)?\.tga$"),
+        (PaintType.CAR_SPEC, r"^car_spec_(team_)?(\d+)(?:_spec)?(?:_([a-z0-9]+))?(_ss)?\.mip$"),
+        # The old app name is still recognised so leftovers can be found and migrated.
+        (PaintType.CAR_DECAL, r"^car_decal_(team_)?(\d+)(?:_([a-z0-9]+))?(_ss)?\.tga$"),
+        (PaintType.CAR_DECAL, r"^decal_(team_)?(\d+)(?:_([a-z0-9]+))?(_ss)?\.tga$"),
         (PaintType.HELMET, r"^helmet_(team_)?(\d+)\.tga$"),
         (PaintType.SUIT, r"^suit_(team_)?(\d+)\.tga$"),
     ]
@@ -20550,9 +20595,47 @@ def _parse_saved_paint_filename(path: Path, paints_root: Path | None = None) -> 
             continue
         is_team = bool(match.group(1))
         target_id = int(match.group(2))
-        is_ss = bool(match.group(3)) if match.lastindex and match.lastindex >= 3 else False
+        groups = match.groups()
+        ext_token = str(groups[2] or "").lower() if len(groups) > 2 else ""
+        is_ss = bool(groups[3]) if len(groups) > 3 else False
+        is_ss = is_ss or ext_token == "ss"
         return paint_type, directory, target_id, is_team, is_ss
     return None
+
+LEGACY_DECAL_FILENAME_RE = re.compile(r"^decal_(team_)?(\d+)(?:_([a-z0-9]+))?(_ss)?\.tga$", re.IGNORECASE)
+
+def migrate_legacy_decal_filenames(paints_dir: Path) -> tuple[int, int]:
+    """Rename this app's old ``decal_<id>.tga`` files to the name iRacing reads.
+
+    Only files matching our old decal pattern are touched. A hand-made file is
+    left alone, and a file whose new name already exists is removed as a leftover.
+    """
+    root = Path(paints_dir)
+    if not root.exists():
+        return 0, 0
+    renamed = 0
+    removed = 0
+    try:
+        candidates = list(root.rglob("*.tga"))
+    except OSError as exc:
+        logging.warning("Could not scan %s for old decal file names: %s", root, exc)
+        return 0, 0
+    for path in candidates:
+        if not path.is_file() or LEGACY_DECAL_FILENAME_RE.match(path.name) is None:
+            continue
+        target = path.with_name(f"car_{path.name}")
+        try:
+            if target.exists():
+                path.unlink()
+                removed += 1
+                logging.info("Removed old decal file %s because %s already exists", path, target.name)
+            else:
+                path.rename(target)
+                renamed += 1
+                logging.info("Renamed old decal file %s to %s", path, target.name)
+        except OSError as exc:
+            logging.warning("Could not migrate old decal file %s: %s", path, exc)
+    return renamed, removed
 
 def rebuild_random_pool_from_paints_root(
     paints_root: Path,
@@ -20662,8 +20745,10 @@ def fetch_context_files(
                                 paint_type=paint_type,
                                 is_team_paint=is_team_paint,
                                 is_superspeedway_variant=_manifest_file_url_is_superspeedway_variant(file_url, paint_type),
+                                ext=_manifest_entry_ext(car),
                             ),
                             url=file_url,
+                            expected_size=_manifest_entry_size(car),
                         )
                     )
                 if files:
@@ -20927,6 +21012,7 @@ def normalize_download_for_session_user(session_user: SessionUser, item: Downloa
         url=item.url,
         ai_roster_optional_filename=item.ai_roster_optional_filename,
         ai_roster_dir=item.ai_roster_dir,
+        expected_size=item.expected_size,
     )
 
 def _download_items_have_primary_slot(items: Iterable[DownloadFile], slot: str) -> bool:
@@ -20980,6 +21066,7 @@ def _retarget_personal_download_to_session_directory(session_user: SessionUser, 
         url=item.url,
         ai_roster_optional_filename=item.ai_roster_optional_filename,
         ai_roster_dir=item.ai_roster_dir,
+        expected_size=item.expected_size,
     )
 
 def _retarget_personal_download_for_team(session_user: SessionUser, item: DownloadFile) -> DownloadFile:
@@ -20997,6 +21084,7 @@ def _retarget_personal_download_for_team(session_user: SessionUser, item: Downlo
         url=item.url,
         ai_roster_optional_filename=item.ai_roster_optional_filename,
         ai_roster_dir=item.ai_roster_dir,
+        expected_size=item.expected_size,
     )
 
 _TEAM_DRIVER_PERSONAL_MANIFEST_CACHE_LOCK = threading.Lock()
@@ -21113,6 +21201,7 @@ def _team_driver_preload_candidate_download_ids(
                     directory=user.directory,
                     paint_type=paint_type,
                     is_superspeedway_variant=ss_variant,
+                    ext=user.paint_ext,
                 )
             )
         for numbered_spec in (False, True):
@@ -21123,6 +21212,7 @@ def _team_driver_preload_candidate_download_ids(
                     paint_type=PaintType.CAR_SPEC,
                     is_superspeedway_variant=ss_variant,
                     is_numbered_car_spec=numbered_spec,
+                    ext=user.paint_ext,
                 )
             )
     return candidates
@@ -21710,23 +21800,31 @@ def download_file(
 def save_path_for(download_id: DownloadId, paints_dir: Path) -> Path:
     uid = download_id.user_id
     team_suffix = f"team_{uid}" if download_id.is_team_paint else str(uid)
-    ss_suffix = "_ss" if download_id.is_superspeedway_variant else ""
+    ext = normalize_paint_extension(download_id.ext)
+    is_ss = bool(download_id.is_superspeedway_variant)
+    if ext == "ss":
+        # A car configured with the superspeedway extension already names the slot.
+        ext = ""
+        is_ss = True
+    ext_suffix = f"_{ext}" if ext else ""
+    ss_suffix = "_ss" if is_ss else ""
     if download_id.paint_type is PaintType.CAR:
         safe_dir = sanitize_paint_directory(download_id.directory, fallback="misc")
-        return safe_join_under(paints_dir, safe_dir, f"car_{team_suffix}{ss_suffix}.tga")
+        return safe_join_under(paints_dir, safe_dir, f"car_{team_suffix}{ext_suffix}{ss_suffix}.tga")
     if download_id.paint_type is PaintType.CAR_DECAL:
         safe_dir = sanitize_paint_directory(download_id.directory, fallback="misc")
-        return safe_join_under(paints_dir, safe_dir, f"decal_{team_suffix}{ss_suffix}.tga")
+        return safe_join_under(paints_dir, safe_dir, f"car_decal_{team_suffix}{ext_suffix}{ss_suffix}.tga")
     if download_id.paint_type is PaintType.CAR_NUMBER:
         safe_dir = sanitize_paint_directory(download_id.directory, fallback="misc")
-        return safe_join_under(paints_dir, safe_dir, f"car_num_{team_suffix}{ss_suffix}.tga")
+        return safe_join_under(paints_dir, safe_dir, f"car_num_{team_suffix}{ext_suffix}{ss_suffix}.tga")
     if download_id.paint_type is PaintType.CAR_SPEC:
         safe_dir = sanitize_paint_directory(download_id.directory, fallback="misc")
         if download_id.is_numbered_car_spec:
-            return safe_join_under(paints_dir, safe_dir, f"car_spec_{team_suffix}_spec{ss_suffix}.mip")
-        return safe_join_under(paints_dir, safe_dir, f"car_spec_{team_suffix}{ss_suffix}.mip")
+            return safe_join_under(paints_dir, safe_dir, f"car_spec_{team_suffix}_spec{ext_suffix}{ss_suffix}.mip")
+        return safe_join_under(paints_dir, safe_dir, f"car_spec_{team_suffix}{ext_suffix}{ss_suffix}.mip")
     if download_id.paint_type is PaintType.HELMET:
-        return safe_join_under(paints_dir, f"helmet_{team_suffix}.tga")
+        # iRacing has no team helmet slot; team mode still writes the driver's helmet.
+        return safe_join_under(paints_dir, f"helmet_{uid}.tga")
     if download_id.paint_type is PaintType.SUIT:
         return safe_join_under(paints_dir, f"suit_{team_suffix}.tga")
     raise ValueError(f"Unsupported paint type: {download_id.paint_type}")
@@ -21742,9 +21840,17 @@ def _session_preview_paint_file(user: SessionUser, paints_dir: Path, paint_type:
                 directory=user.directory,
                 paint_type=paint_type,
                 is_team_paint=True,
+                ext=user.paint_ext if _is_car_related_paint_type(paint_type) else "",
             )
         )
-    candidates.append(DownloadId(user_id=int(user.user_id), directory=user.directory, paint_type=paint_type))
+    candidates.append(
+        DownloadId(
+            user_id=int(user.user_id),
+            directory=user.directory,
+            paint_type=paint_type,
+            ext=user.paint_ext if _is_car_related_paint_type(paint_type) else "",
+        )
+    )
     for download_id in candidates:
         try:
             path = save_path_for(download_id, Path(paints_dir))
@@ -21776,6 +21882,7 @@ def _session_preview_car_selection(user: SessionUser, paints_dir: Path) -> tuple
                     directory=user.directory,
                     paint_type=paint_type,
                     is_team_paint=is_team,
+                    ext=user.paint_ext,
                 ),
                 Path(paints_dir),
             )
@@ -22129,6 +22236,7 @@ def _download_id_to_dict(download_id: DownloadId) -> dict[str, object]:
         "is_team_paint": bool(download_id.is_team_paint),
         "is_superspeedway_variant": bool(download_id.is_superspeedway_variant),
         "is_numbered_car_spec": bool(download_id.is_numbered_car_spec),
+        "ext": str(getattr(download_id, "ext", "") or ""),
         "preserve_on_cleanup": bool(getattr(download_id, "preserve_on_cleanup", False)),
         "tp_scheme_id": str(getattr(download_id, "tp_scheme_id", "") or ""),
         "tp_title": str(getattr(download_id, "tp_title", "") or ""),
@@ -22144,6 +22252,7 @@ def _download_id_from_dict(payload: dict[str, object]) -> DownloadId:
         is_team_paint=bool(payload.get('is_team_paint')),
         is_superspeedway_variant=bool(payload.get('is_superspeedway_variant')),
         is_numbered_car_spec=bool(payload.get('is_numbered_car_spec')),
+        ext=str(payload.get('ext') or ''),
         preserve_on_cleanup=bool(payload.get('preserve_on_cleanup')),
         tp_scheme_id=str(payload.get("tp_scheme_id") or ""),
         tp_title=str(payload.get("tp_title") or ""),
@@ -25099,7 +25208,7 @@ def build_tp_ceiling_hint(download_stats: StageTransferStats) -> str:
 # The iRacing UI renders a car in its 3D viewer (My Content -> Cars -> vehicle)
 # by reading the very same custom paint files the sim uses, taken from
 # ``Documents\iRacing\paint\<car directory>\car_<customer id>.tga`` (plus the
-# matching ``car_num_``, ``car_spec_`` and ``decal_`` files, and the root-level
+# matching ``car_num_``, ``car_spec_`` and ``car_decal_`` files, and the root-level
 # ``helmet_<customer id>.tga`` / ``suit_<customer id>.tga``). The UI reloads the
 # preview whenever those files change on disk.
 #
@@ -26827,6 +26936,17 @@ class DownloaderService:
         temp_dir.mkdir(parents=True, exist_ok=True)
         replay_dir.mkdir(parents=True, exist_ok=True)
         replay_packs_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            renamed_decals, removed_decals = migrate_legacy_decal_filenames(paints_dir)
+            if renamed_decals or removed_decals:
+                logging.info(
+                    "Migrated old decal file names under %s: %s renamed, %s removed",
+                    paints_dir,
+                    renamed_decals,
+                    removed_decals,
+                )
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("Could not migrate old decal file names under %s: %s", paints_dir, exc)
         logging.info("Using iRacing documents folder: %s", resolve_iracing_documents_dir(startup_config))
         cleanup_stale_temp_dirs(temp_dir)
         sdk_reader: IracingSdkReader | None = None

@@ -224,7 +224,7 @@ class LeagueLibraryApplyDecalTests(_LeagueLibraryTemp):
             _library_entry("decal", 7, "GT3", 42, CAR),
             _tga_bytes((0, 0, 255), box=(0, 0, 2, 2)),
         )
-        decal_path = self.paints / CAR / "decal_42.tga"
+        decal_path = self.paints / CAR / "car_decal_42.tga"
         decal_path.parent.mkdir(parents=True)
         decal_path.write_bytes(_tga_bytes((255, 0, 0)))
 
@@ -246,14 +246,14 @@ class LeagueLibraryApplyDecalTests(_LeagueLibraryTemp):
         library = APP.load_league_library(self.library)
         written = APP.apply_league_library(session, [user], self.paints, library)
 
-        decal_path = self.paints / CAR / "decal_42.tga"
+        decal_path = self.paints / CAR / "car_decal_42.tga"
         self.assertEqual(written, [decal_path])
         self.assertEqual(decal_path.read_bytes(), source_payload)
 
     def test_apply_decal_tp_only_is_a_no_op(self):
         user = APP.SessionUser(user_id=42, directory=CAR)
         session = self._session(7, [user])
-        decal_path = self.paints / CAR / "decal_42.tga"
+        decal_path = self.paints / CAR / "car_decal_42.tga"
         decal_path.parent.mkdir(parents=True)
         decal_path.write_bytes(_tga_bytes((255, 0, 0)))
 
@@ -273,7 +273,7 @@ class LeagueLibraryApplyDecalTests(_LeagueLibraryTemp):
         written = APP.apply_league_library(session, [user], self.paints, library)
 
         self.assertEqual(written, [])
-        self.assertFalse((self.paints / CAR / "decal_42.tga").exists())
+        self.assertFalse((self.paints / CAR / "car_decal_42.tga").exists())
         self.assertFalse((self.paints / CAR / "car_42.tga").exists())
 
 
