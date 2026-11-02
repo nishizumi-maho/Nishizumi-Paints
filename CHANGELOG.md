@@ -4,7 +4,7 @@ All notable user-facing changes to Nishizumi Paints are documented here.
 
 ## [7.4.0] - 2026-11-02 (beta)
 
-Published as the pre-release `v7.4.0-beta.1`, which the in-app updater does not offer.
+Published as the pre-releases `v7.4.0-beta.1` and `v7.4.0-beta.2`, which the in-app updater does not offer.
 
 ### Added
 
@@ -15,15 +15,33 @@ Published as the pre-release `v7.4.0-beta.1`, which the in-app updater does not 
 - League library for league decals (all drivers, per class, per driver) and per-driver league paints, applied automatically in sessions of that league.
 - Warning decals by iRating and/or safety rating (off by default).
 - Default spec maps per car, car thumbnails, a replay name template copied on the checkered flag, iRacing folder sizes and free space, and an option to pause OneDrive and Dropbox while the app runs (off by default).
+- Log file with **View log** on the Logs tab; unhandled errors from the window and its background threads are written to it.
+- Warning when the Trading Paints app is running at the same time, with **Close Trading Paints**, **Keep both** and **Don't ask again**.
+- **iRacing SDK** section on the General tab: checks `irsdkEnableMem` and **Fix it** turns memory sharing on.
+- Field status bar with **SOF**, **Drivers**, **without livery**, **Files** progress, a progress bar and **TP ready** / **SDK connected**.
+- **Session conditions** panel on the Session tab, folded with **Hide** / **Show**.
+- **Delete all downloaded paints…** on the General tab.
+- **Tags & forbidden…** manager with **Tagged drivers**, **Theme files** and **Forbidden paints**.
+- **League decal preview** and **Export PNGs…** in the league library.
 
 ### Fixed
 
+- Decals now use the `car_decal_<id>.tga` name iRacing reads, and `decal_` files from earlier versions are renamed once at start-up, so decals show up in iRacing.
+- Custom paint extensions, the team helmet slot and car-number matching now use the names iRacing and Trading Paints expect.
+- Malformed session info from iRacing is cleaned before it is read, and the raw YAML is kept for support.
+- AI rosters with duplicate names or numbers, or names Windows cannot use, are written to the log.
 - Files written by league, warning decal and default spec map features are cleaned up with the session's paints.
 - A fallback paint without a spec map no longer keeps the previous driver's spec map.
 - A damaged or error-page download no longer replaces a good paint.
 - Your own car paint is kept when session paints are cleared.
 - The member ID is not changed while watching someone else's replay.
 - Closing the app during a stuck download still runs the session cleanup.
+
+### Changed
+
+- Session paint downloads ask Trading Paints about the whole field in one request instead of one request per driver; fields larger than 64 drivers use a few requests.
+- Paints for cars on track download first, garage cars next, and your own paints last.
+- A download that fails on the main Trading Paints asset server is retried once on the alternate server.
 
 ## [7.3.6] - 2026-10-14
 
@@ -79,7 +97,7 @@ First published as the experimental pre-release `v7.3.6-experimental.1` on 2026-
 - An unreadable `settings.json` is kept as `settings.json.unreadable-<date>` instead of being overwritten with defaults.
 - Turning the iRacing UI previews off during a session now removes their files after the session.
 - A cancelled download no longer leaves a partial file, and a compressed paint can no longer expand past 256 MiB.
-- Showroom links to a paint of a grouped car, such as **Dirt Sprint Cars**, can now be imported into the RandomPool.
+- Showroom links to a paint of a grouped car, such as **Dirt Sprint Cars**, can now be added to the RandomPool.
 
 ## [7.3.5] - 2026-10-10
 
@@ -153,10 +171,10 @@ First published as the experimental pre-release `v7.3.5-experimental.1`; the fin
 
 ### Fixed
 
-- Fixed the automatic car catalog loading zero cars after Trading Paints redesigned the car templates page. The page no longer carries the vehicle ID, so the catalog is now rebuilt by combining the template list (which supplies the iRacing paint folder) with the showroom vehicle index (which supplies the vehicle ID and the category). This restores the public showroom fallback, collections, Member ID tools, Team tools, and the car selectors. Normal session downloads were never affected, because those use the paint folder reported by iRacing and Trading Paints.
+- Fixed the automatic car catalog loading zero cars after Trading Paints redesigned the car templates page. The page no longer carries the vehicle ID, so the catalog is now rebuilt by combining the template list (which supplies the iRacing paint folder) with the showroom vehicle index (which supplies the vehicle ID and the category). This restores the public showroom fallback, collections, Member ID tools, Team tools, and the car selectors. Normal session downloads were never affected, because those use the paint folder iRacing and Trading Paints give.
 - Vehicles are now filed under their real Oval, Road, or Driver category instead of always being labelled Road, so the showroom links the app builds point at the right page.
 - The car catalog is now saved to disk and reused when Trading Paints cannot be reached or changes its page layout again, instead of the app starting with no catalog at all.
-- Failures to install an iRacing UI preview file are now reported in the log with the reason instead of being silently discarded.
+- Failures to install an iRacing UI preview file are now written to the log with the reason instead of being silently discarded.
 
 ## [7.3.0] - 2026-08-11
 
@@ -418,7 +436,7 @@ This release consolidates the 6.5-to-7.0 work into one public release.
 - Added full showroom URL tracking for openable fallback, collection, and override paints.
 - Added on-the-fly Session tab action updates as each driver's car, helmet, or suit becomes available.
 - Added showroom mapping tools in the **Logs** tab: scan, review pending cars, open editable JSON, reset user mapping, open mapping folder, and open bundled seed.
-- Added automatic TP showroom mapping startup scans to detect missing, mapped, and unsupported car mappings.
+- Added automatic TP showroom mapping startup scans to detect missing, mapped, and car mappings the app cannot use.
 - Added same-session roster refresh handling that fetches only newly joined targets instead of reprocessing the whole session.
 
 ### Changed
