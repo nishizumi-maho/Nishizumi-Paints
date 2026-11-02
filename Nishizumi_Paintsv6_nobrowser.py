@@ -23691,10 +23691,13 @@ def clear_session_target_files(
     return kept, len(deleted_paths)
 
 PURGE_PAINT_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"^car_(team_)?(\d+)(?:_ss)?\.tga$", re.IGNORECASE),
-    re.compile(r"^car_num_(team_)?(\d+)(?:_ss)?\.tga$", re.IGNORECASE),
+    # Optional `_<ext>` is iRacing's custom paint extension (see save_path_for).
+    re.compile(r"^car_(team_)?(\d+)(?:_[a-z0-9]+)?(?:_ss)?\.tga$", re.IGNORECASE),
+    re.compile(r"^car_num_(team_)?(\d+)(?:_[a-z0-9]+)?(?:_ss)?\.tga$", re.IGNORECASE),
+    re.compile(r"^car_decal_(team_)?(\d+)(?:_[a-z0-9]+)?(?:_ss)?\.tga$", re.IGNORECASE),
+    # Decals saved before 7.4.0 used `decal_<id>.tga`.
     re.compile(r"^decal_(team_)?(\d+)(?:_ss)?\.tga$", re.IGNORECASE),
-    re.compile(r"^car_spec_(team_)?(\d+)(?:_spec)?(?:_ss)?\.mip$", re.IGNORECASE),
+    re.compile(r"^car_spec_(team_)?(\d+)(?:_spec)?(?:_[a-z0-9]+)?(?:_ss)?\.mip$", re.IGNORECASE),
     re.compile(r"^helmet_(team_)?(\d+)\.tga$", re.IGNORECASE),
     re.compile(r"^suit_(team_)?(\d+)\.tga$", re.IGNORECASE),
 )
