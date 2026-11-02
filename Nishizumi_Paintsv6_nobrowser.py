@@ -11,6 +11,7 @@ import bz2
 import concurrent.futures
 import configparser
 import copy
+import csv
 import datetime
 import html
 import io
@@ -32,6 +33,7 @@ import urllib.parse
 import unicodedata
 import uuid
 import webbrowser
+import yaml
 import re
 import hashlib
 import random
@@ -246,6 +248,12 @@ PAGE_SCROLL_TOLERANCE_PX = 1
 LOG_QUEUE_LIMIT = 5000
 LOG_RENDER_BATCH_SIZE = 300
 LOG_HIDDEN_DRAIN_BATCH_SIZE = 1000
+LOG_DIRNAME = "logs"
+LOG_FILENAME = "nishizumi-paints.log"
+LOG_MAX_BYTES = 10 * 1024 * 1024
+LOG_MAX_AGE_DAYS = 31
+YAML_DUMP_DIRNAME = "yaml"
+YAML_DUMP_MAX_AGE_DAYS = 30
 APP_ICON_ICO_RESOURCE = "assets/icons/nishizumi_paints_icon.ico"
 APP_ICON_PNG_RESOURCE = "assets/icons/nishizumi_paints_icon.png"
 INSTANCE_HOST = "127.0.0.1"
@@ -3465,14 +3473,193 @@ def parse_args() -> argparse.Namespace:
         "-v", "--verbose", action="store_true", help="Enable verbose debug logs."
     )
     return parser.parse_args()
+def default_log_dir() -> Path:
+    appdata = os.getenv("APPDATA")
+    if appdata:
+        return Path(appdata) / "Nishizumi-Paints" / LOG_DIRNAME
+    return Path.home() / "AppData" / "Roaming" / "Nishizumi-Paints" / LOG_DIRNAME
+
+
+def default_log_file_path() -> Path:
+    return default_log_dir() / LOG_FILENAME
+
+
+def trim_log_file(
+    path: Path | str,
+    *,
+    max_bytes: int = LOG_MAX_BYTES,
+    max_age_days: int = LOG_MAX_AGE_DAYS,
+    now: float | None = None,
+) -> int:
+    """Drop records older than ``max_age_days`` and keep the newest ``max_bytes``.
+
+    A record starts with the log timestamp. Continuation lines (tracebacks) follow
+    the record they belong to, so they are kept or dropped with it.
+    """
+    log_path = Path(path)
+    try:
+        data = log_path.read_bytes()
+    except OSError:
+        return 0
+    if not data:
+        return 0
+    cutoff = float(now if now is not None else time.time()) - max(0, int(max_age_days)) * 86400.0
+    try:
+        text = data.decode("utf-8", errors="replace")
+    except Exception:
+        text = ""
+    kept: list[str] = []
+    record_timestamp: float | None = None
+    for line in text.splitlines(keepends=True):
+        match = re.match(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", line)
+        if match:
+            try:
+                record_timestamp = time.mktime(time.strptime(match.group(1), "%Y-%m-%d %H:%M:%S"))
+            except (OverflowError, ValueError):
+                record_timestamp = None
+        if record_timestamp is None or record_timestamp >= cutoff:
+            kept.append(line)
+    trimmed = "".join(kept).encode("utf-8")
+    if max_bytes > 0 and len(trimmed) > max_bytes:
+        trimmed = trimmed[-max_bytes:]
+        newline = trimmed.find(b"\n")
+        if newline != -1:
+            trimmed = trimmed[newline + 1:]
+    if trimmed == data:
+        return 0
+    temp_path: Path | None = None
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = log_path.with_name(f"{log_path.name}.{os.getpid()}.trim.tmp")
+        with temp_path.open("wb") as handle:
+            handle.write(trimmed)
+        os.replace(temp_path, log_path)
+    except OSError:
+        # A reader may hold the file open. Keep logging rather than failing a start.
+        return 0
+    finally:
+        if temp_path is not None:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+    return len(data) - len(trimmed)
+
+
+def _exception_hook(exc_type, exc_value, exc_tb) -> None:
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_tb)
+        return
+    logging.critical("Unhandled exception", exc_info=(exc_type, exc_value, exc_tb))
+
+
+def _thread_exception_hook(args: threading.ExceptHookArgs) -> None:
+    if args.exc_type is SystemExit:
+        return
+    thread_name = getattr(args.thread, "name", "")
+    logging.critical(
+        "Unhandled exception in thread %s",
+        thread_name,
+        exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+    )
+
+
+def install_exception_hooks() -> None:
+    sys.excepthook = _exception_hook
+    threading.excepthook = _thread_exception_hook
+
+
 def setup_logging(verbose: bool) -> None:
     level = logging.DEBUG if verbose else logging.INFO
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s %(levelname)s %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-        force=True,
-    )
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s", "%Y-%m-%d %H:%M:%S")
+    handlers: list[logging.Handler] = [logging.StreamHandler()]
+    try:
+        log_path = default_log_file_path()
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        trim_log_file(log_path)
+        file_handler = logging.FileHandler(log_path, encoding="utf-8")
+        handlers.append(file_handler)
+    except Exception:
+        # The console handler still works when the log folder is not writable.
+        pass
+    for handler in handlers:
+        handler.setFormatter(formatter)
+    logging.basicConfig(level=level, handlers=handlers, force=True)
+    install_exception_hooks()
+
+
+TRADING_PAINTS_PROCESS_NAME = "Trading Paints.exe"
+IRACING_PROCESS_NAMES = frozenset({"iracingui.exe", "iracingsim64.exe", "iracingsim64dx11.exe"})
+
+
+def list_running_process_names() -> list[str]:
+    if sys.platform != "win32":
+        return []
+    try:
+        completed = subprocess.run(
+            ["tasklist", "/FO", "CSV", "/NH"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except Exception:
+        logging.debug("Could not list running processes", exc_info=True)
+        return []
+    names: list[str] = []
+    for line in completed.stdout.splitlines():
+        try:
+            row = next(csv.reader([line]))
+        except (StopIteration, csv.Error):
+            continue
+        if row:
+            names.append(row[0].strip().strip('"'))
+    return names
+
+
+def find_named_process(process_names: Iterable[str], wanted: str) -> str | None:
+    target = str(wanted or "").strip().casefold()
+    if not target:
+        return None
+    for name in process_names or []:
+        normalized = str(name or "").strip().strip('"').casefold()
+        if normalized == target:
+            return str(name).strip().strip('"')
+    return None
+
+
+def trading_paints_is_running(process_names: Iterable[str]) -> bool:
+    return find_named_process(process_names, TRADING_PAINTS_PROCESS_NAME) is not None
+
+
+def should_warn_about_trading_paints(process_names: Iterable[str], dont_ask_again: bool = False) -> bool:
+    return not bool(dont_ask_again) and trading_paints_is_running(process_names)
+
+
+def request_trading_paints_close() -> tuple[bool, str]:
+    try:
+        completed = subprocess.run(
+            ["taskkill", "/IM", TRADING_PAINTS_PROCESS_NAME],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    except Exception as exc:
+        return False, f"Could not ask Trading Paints to close: {exc}"
+    if completed.returncode == 0:
+        return True, "Asked Trading Paints to close."
+    detail = (completed.stderr or completed.stdout or "").strip()
+    return False, f"Trading Paints did not close: {detail or 'unknown error'}"
+
+
+def iracing_is_running(process_names: Iterable[str]) -> bool:
+    for name in process_names or []:
+        if str(name or "").strip().strip('"').casefold() in IRACING_PROCESS_NAMES:
+            return True
+    return False
+
+
 def _windows_documents_root() -> Path | None:
     if sys.platform != "win32":
         return None
@@ -19144,6 +19331,7 @@ def _read_ai_roster_payload(roster_dir: Path) -> tuple[dict[str, list[dict]], li
     if not isinstance(drivers, list):
         raise ValueError("AI roster JSON did not contain a drivers list")
     normalized_drivers = [_normalize_ai_driver_entry(driver) for driver in drivers if isinstance(driver, dict)]
+    log_ai_roster_sanity_problems(normalized_drivers, roster_dir.name)
     with _AI_ROSTER_PAYLOAD_CACHE_LOCK:
         if len(_AI_ROSTER_PAYLOAD_CACHE) > 256:
             _AI_ROSTER_PAYLOAD_CACHE.clear()
@@ -19396,11 +19584,63 @@ def sync_ai_roster_collection_assets(
             optional_unavailable,
         )
     return downloaded, existing, optional_unavailable, failed
+_WINDOWS_INVALID_FILENAME_CHARS_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]+')
+
+
+def sanitize_ai_roster_driver_name(value: object) -> str:
+    """Drop the characters a Windows file name cannot contain."""
+    return _WINDOWS_INVALID_FILENAME_CHARS_RE.sub("", str(value or "")).strip()
+
+
+def ai_roster_sanity_problems(drivers: Iterable[object]) -> list[str]:
+    """Report duplicate numbers/names and names unusable as Windows file names."""
+    name_counts: Counter[str] = Counter()
+    number_counts: Counter[str] = Counter()
+    display_names: dict[str, str] = {}
+    display_numbers: dict[str, str] = {}
+    bad_names: list[str] = []
+    for driver in drivers or []:
+        if not isinstance(driver, dict):
+            continue
+        raw_name = str(driver.get("driverName") or driver.get("name") or "").strip()
+        name_key = _normalize_ai_match_text(raw_name)
+        if name_key:
+            name_counts[name_key] += 1
+            display_names.setdefault(name_key, raw_name)
+        if raw_name and _WINDOWS_INVALID_FILENAME_CHARS_RE.search(raw_name):
+            if raw_name not in bad_names:
+                bad_names.append(raw_name)
+        raw_number = str(driver.get("carNumber") or "").strip()
+        if raw_number:
+            number_key = _normalize_ai_car_number(raw_number)
+            number_counts[number_key] += 1
+            display_numbers.setdefault(number_key, raw_number)
+    problems: list[str] = []
+    for key, count in name_counts.items():
+        if count > 1:
+            problems.append(f"duplicate driver name {display_names.get(key, key)!r} used by {count} entries")
+    for key, count in number_counts.items():
+        if count > 1:
+            problems.append(f"duplicate car number {display_numbers.get(key, key)!r} used by {count} entries")
+    for name in bad_names:
+        problems.append(f"driver name {name!r} contains characters Windows file names cannot hold")
+    return problems
+
+
+def log_ai_roster_sanity_problems(drivers: Iterable[object], source: str = "") -> list[str]:
+    problems = ai_roster_sanity_problems(drivers)
+    label = f"AI roster {source}: " if source else "AI roster: "
+    for problem in problems:
+        logging.warning("%s%s", label, problem)
+    return problems
+
+
 def _normalize_ai_match_text(value: object) -> str:
     # iRacing and Trading Paints do not always agree on punctuation in driver
     # names ("O'Neil" vs "ONeil", "J. Smith" vs "J Smith"). Remove punctuation
     # before comparing so a roster still matches the session drivers.
     text = unicodedata.normalize("NFKC", str(value or "").strip())
+    text = _WINDOWS_INVALID_FILENAME_CHARS_RE.sub("", text)
     text = re.sub(r"[^\w\s]+", "", text, flags=re.UNICODE)
     return re.sub(r"\s+", " ", text).casefold().strip()
 def _normalize_ai_car_path(value: object) -> str:
@@ -19846,6 +20086,7 @@ def _canonicalize_ai_roster_payload(raw_json: str) -> tuple[dict[str, list[dict]
     for driver in drivers:
         if isinstance(driver, dict):
             normalized_drivers.append(_normalize_ai_driver_entry(driver))
+    log_ai_roster_sanity_problems(normalized_drivers)
     return {"drivers": normalized_drivers}, normalized_drivers
 def _build_ai_roster_notes(drivers: list[dict]) -> str:
     lines = ["Summary:", "", "", "", "Drivers:"]
@@ -24020,6 +24261,148 @@ def _read_session_info_update(sdk: object) -> int:
     except Exception:  # noqa: BLE001
         pass
     return 0
+_SESSION_YAML_NAME_KEYS = ("UserName", "TeamName", "AbbrevName", "Initials")
+_SESSION_YAML_EMPTY_DESIGN_KEYS = ("CarDesignStr", "HelmetDesignStr", "SuitDesignStr", "CarNumberDesignStr")
+_SESSION_YAML_UNSAFE_FIRST_CHARS = frozenset("*&!%@`")
+_YAML_DUMPED_SESSION_IDS: set[str] = set()
+_YAML_DUMP_LOCK = threading.Lock()
+
+
+def default_yaml_dump_dir() -> Path:
+    return default_log_dir() / YAML_DUMP_DIRNAME
+
+
+def _session_yaml_value_needs_quotes(value: str) -> bool:
+    if not value:
+        return False
+    if value[0] in _SESSION_YAML_UNSAFE_FIRST_CHARS:
+        return True
+    return ":" in value or "#" in value
+
+
+def _quote_yaml_value(value: str) -> str:
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def clean_session_yaml(text: str) -> str:
+    """Quote the session values that iRacing can emit as invalid bare YAML."""
+    had_trailing_newline = text.endswith(("\n", "\r"))
+    cleaned: list[str] = []
+    name_pattern = re.compile(
+        r"^(\s*(?:" + "|".join(_SESSION_YAML_NAME_KEYS) + r")\s*:\s*)(.*?)(\s*)$"
+    )
+    design_pattern = re.compile(
+        r"^(\s*(?:" + "|".join(_SESSION_YAML_EMPTY_DESIGN_KEYS) + r")\s*:\s*)(.*?)(\s*)$"
+    )
+    for line in text.splitlines():
+        name_match = name_pattern.match(line)
+        if name_match:
+            prefix, value, trailing = name_match.groups()
+            if value and not value.startswith(('"', "'")) and _session_yaml_value_needs_quotes(value):
+                line = f"{prefix}{_quote_yaml_value(value)}{trailing}"
+            cleaned.append(line)
+            continue
+        design_match = design_pattern.match(line)
+        if design_match:
+            prefix, value, trailing = design_match.groups()
+            if not value:
+                separator = "" if prefix.endswith((" ", "\t")) else " "
+                line = f'{prefix}{separator}""{trailing}'
+        cleaned.append(line)
+    result = "\n".join(cleaned)
+    return result + ("\n" if had_trailing_newline else "")
+
+
+def recover_session_info_yaml(text: str) -> dict | None:
+    """Parse cleaned session YAML into the SessionInfo mapping, or return None."""
+    try:
+        parsed = yaml.safe_load(clean_session_yaml(text))
+    except Exception:
+        return None
+    if isinstance(parsed, dict):
+        info = parsed.get("SessionInfo", parsed)
+        if isinstance(info, dict):
+            return info
+    return None
+
+
+def purge_yaml_dumps(
+    dump_dir: Path | str | None = None,
+    *,
+    max_age_days: int = YAML_DUMP_MAX_AGE_DAYS,
+    now: float | None = None,
+) -> int:
+    directory = Path(dump_dir) if dump_dir is not None else default_yaml_dump_dir()
+    cutoff = float(now if now is not None else time.time()) - max(0, int(max_age_days)) * 86400.0
+    removed = 0
+    try:
+        children = list(directory.iterdir())
+    except OSError:
+        return 0
+    for child in children:
+        if not child.is_file() or child.suffix.lower() != ".yaml":
+            continue
+        try:
+            if child.stat().st_mtime < cutoff:
+                child.unlink()
+                removed += 1
+        except OSError:
+            continue
+    return removed
+
+
+def dump_failed_session_yaml(
+    text: str,
+    session_id: object,
+    *,
+    dump_dir: Path | str | None = None,
+    dumped_session_ids: set[str] | None = None,
+    now: float | None = None,
+) -> Path | None:
+    """Write one raw session YAML per session id, for support after a failed parse."""
+    key = str(session_id or "unknown")
+    directory = Path(dump_dir) if dump_dir is not None else default_yaml_dump_dir()
+    purge_yaml_dumps(directory, now=now)
+    ids = dumped_session_ids if dumped_session_ids is not None else _YAML_DUMPED_SESSION_IDS
+    with _YAML_DUMP_LOCK:
+        if key in ids:
+            return None
+        ids.add(key)
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(float(now or time.time())))
+        path = directory / f"{stamp}.yaml"
+        suffix = 2
+        while path.exists():
+            path = directory / f"{stamp}-{suffix}.yaml"
+            suffix += 1
+        path.write_text(text, encoding="utf-8", errors="replace")
+        return path
+    except OSError:
+        logging.debug("Could not write the failed session YAML dump", exc_info=True)
+        return None
+
+
+def _read_raw_session_info_yaml(sdk: object) -> str | None:
+    """Read the raw SessionInfo YAML from pyirsdk without parsing it."""
+    getter = getattr(sdk, "_get_session_info_binary", None)
+    if not callable(getter):
+        return None
+    try:
+        data = getter("SessionInfo")
+    except Exception:
+        return None
+    if not data:
+        return None
+    try:
+        is_utf8 = bool(getattr(sdk, "is_session_info_utf8", True))
+        encoding = "utf-8" if is_utf8 else "cp1252"
+        return data.rstrip(b"\x00").decode(encoding, errors="replace")
+    except Exception:
+        return None
+
+
 def read_session_from_sdk(reader: IracingSdkReader) -> tuple[SdkPollState, Session | None]:
     sdk = reader.sdk
     try:
@@ -24072,6 +24455,16 @@ def read_session_from_sdk(reader: IracingSdkReader) -> tuple[SdkPollState, Sessi
     except Exception as exc:  # noqa: BLE001
         logging.debug("Could not read SessionInfo from SDK: %s", exc)
         session_info = None
+    if not isinstance(session_info, dict):
+        raw_session_yaml = _read_raw_session_info_yaml(sdk)
+        if raw_session_yaml:
+            session_info = recover_session_info_yaml(raw_session_yaml)
+            if isinstance(session_info, dict):
+                logging.warning("Recovered malformed session YAML after cleaning its driver names and design fields.")
+            else:
+                session_key = f"{weekend.get('SessionID') or 'unknown'}"
+                dump_failed_session_yaml(raw_session_yaml, session_key)
+                logging.warning("Session YAML could not be parsed even after cleaning; the raw copy was saved for support.")
     session = _build_session_from_parts(
         weekend,
         driver_info,
@@ -24580,6 +24973,7 @@ class AppConfig:
     auto_start: bool = True
     start_minimized: bool = True
     minimize_to_tray_on_close: bool = True
+    trading_paints_warning_dont_ask: bool = False
     manage_cloud_sync: bool = False
     auto_refresh_paints: bool = True
     cleanup_before_fetch: bool = True
@@ -24866,6 +25260,7 @@ class ConfigStore:
         if config.iracing_documents_dir == default_docs_dir:
             config.iracing_documents_dir = ""
         config.verbose = bool(config.verbose)
+        config.trading_paints_warning_dont_ask = bool(getattr(config, "trading_paints_warning_dont_ask", False))
         config.manage_cloud_sync = bool(getattr(config, "manage_cloud_sync", False))
         config.auto_refresh_paints = bool(config.auto_refresh_paints)
         config.cleanup_before_fetch = bool(config.cleanup_before_fetch)
@@ -25289,6 +25684,118 @@ def normalize_iracing_ui_preview_refresh_minutes(value: object) -> int:
     except Exception:
         minutes = IRACING_UI_PREVIEW_DEFAULT_REFRESH_MINUTES
     return max(IRACING_UI_PREVIEW_MIN_REFRESH_MINUTES, min(IRACING_UI_PREVIEW_MAX_REFRESH_MINUTES, minutes))
+
+
+def read_iracing_ini_value(
+    documents_dir: Path | str | None,
+    section_name: str,
+    key_name: str,
+) -> str | None:
+    """Read one value from the iRacing ``app.ini`` without writing to it."""
+    try:
+        root = resolve_iracing_documents_dir(documents_dir)
+        ini_path = Path(root) / IRACING_APP_INI_FILENAME
+        if not ini_path.is_file():
+            return None
+        text = ini_path.read_text(encoding="utf-8", errors="surrogateescape")
+    except Exception:
+        return None
+    section = ""
+    target_section = str(section_name or "").strip().lower()
+    target_key = str(key_name or "").strip().lower()
+    for raw_line in text.splitlines():
+        line = raw_line.split(";", 1)[0].strip()
+        if not line:
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1].strip().lower()
+            continue
+        if section != target_section or "=" not in line:
+            continue
+        key, _sep, value = line.partition("=")
+        if key.strip().lower() == target_key:
+            return value.strip()
+    return None
+
+
+def read_iracing_sdk_memory_enabled(documents_dir: Path | str | None = None) -> bool | None:
+    value = read_iracing_ini_value(documents_dir, "Misc", "irsdkEnableMem")
+    if value is None:
+        return None
+    try:
+        return bool(int(float(value)))
+    except (TypeError, ValueError):
+        return value.strip().lower() in {"true", "yes", "on"}
+
+
+def _set_ini_value_in_text(text: str, section_name: str, key_name: str, value: str) -> str | None:
+    """Replace ``key`` inside ``section`` and keep the rest of the file untouched."""
+    lines = text.splitlines(keepends=True)
+    section = ""
+    target_section = str(section_name or "").strip().lower()
+    target_key = str(key_name or "").strip().lower()
+    for index, line in enumerate(lines):
+        newline = ""
+        body = line
+        if body.endswith("\r\n"):
+            body, newline = body[:-2], "\r\n"
+        elif body.endswith("\n"):
+            body, newline = body[:-1], "\n"
+        stripped = body.split(";", 1)[0].strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            section = stripped[1:-1].strip().lower()
+            continue
+        if section != target_section or "=" not in body:
+            continue
+        match = re.match(r"^(\s*" + re.escape(target_key) + r"\s*=\s*)([^;]*)(.*)$", body, re.IGNORECASE)
+        if not match:
+            continue
+        lines[index] = match.group(1) + str(value) + match.group(3) + newline
+        return "".join(lines)
+    return None
+
+
+def fix_iracing_sdk_memory_setting(
+    documents_dir: Path | str | None = None,
+    iracing_running: bool | None = None,
+) -> tuple[bool, str]:
+    """Set ``[Misc] irsdkEnableMem=1`` after backing up ``app.ini``.
+
+    iRacing rewrites its settings on exit, so the file is only changed while the
+    sim is closed. Returns ``(changed, message)``.
+    """
+    if iracing_running is None:
+        iracing_running = iracing_is_running(list_running_process_names())
+    if iracing_running:
+        return False, "Close iRacing before changing its SDK memory setting, then try again."
+    try:
+        root = resolve_iracing_documents_dir(documents_dir)
+        ini_path = Path(root) / IRACING_APP_INI_FILENAME
+    except Exception as exc:
+        return False, f"Could not find the iRacing app.ini: {exc}"
+    if not ini_path.is_file():
+        return False, f"iRacing app.ini was not found at {ini_path}."
+    try:
+        text = ini_path.read_text(encoding="utf-8", errors="surrogateescape")
+    except OSError as exc:
+        return False, f"Could not read {ini_path}: {exc}"
+    if read_iracing_ini_value(documents_dir, "Misc", "irsdkEnableMem") == "1":
+        return True, "iRacing SDK memory sharing is already enabled."
+    updated = _set_ini_value_in_text(text, "Misc", "irsdkEnableMem", "1")
+    if updated is None:
+        return False, f"irsdkEnableMem was not found in the [Misc] section of {ini_path}."
+    backup_path = ini_path.with_name(f"{ini_path.name}.bak")
+    try:
+        shutil.copy2(ini_path, backup_path)
+        temp_path = ini_path.with_name(f"{ini_path.name}.{os.getpid()}.tmp")
+        try:
+            temp_path.write_text(updated, encoding="utf-8", errors="surrogateescape")
+            os.replace(temp_path, ini_path)
+        finally:
+            temp_path.unlink(missing_ok=True)
+    except OSError as exc:
+        return False, f"Could not update {ini_path}: {exc}"
+    return True, f"Enabled iRacing SDK memory sharing and backed up the old app.ini to {backup_path.name}."
 
 
 def read_iracing_hide_car_numbers(documents_dir: Path | str | None = None) -> bool | None:
@@ -27889,6 +28396,7 @@ class DownloaderUI:
         self.simpledialog = simpledialog
         self.config_store = ConfigStore()
         self.config = self.config_store.load()
+        setup_logging(bool(self.config.verbose))
         self.log_queue = BoundedLogQueue()
         self._log_history: deque[str] = deque(maxlen=LOG_HISTORY_LIMIT)
         self.service = DownloaderService(self.config, self.log_queue)
@@ -27933,6 +28441,7 @@ class DownloaderUI:
         self.root.geometry(f"{window_width}x{window_height}")
         self.root.minsize(min(WINDOW_MIN_SIZE[0], window_width), min(WINDOW_MIN_SIZE[1], window_height))
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.root.report_callback_exception = self._report_callback_exception
         self._apply_window_icon()
         self.tray_icon = WindowsTrayIcon(
             lambda: self.root.after(0, self.restore_from_background),
@@ -27941,6 +28450,10 @@ class DownloaderUI:
         self.tray_icon.start()
         self.instance_signal_server = SingleInstanceSignalServer(lambda: self.root.after(0, self.bring_to_front))
         self.status_var = tk.StringVar(value="Starting")
+        self.iracing_sdk_memory_var = tk.StringVar(value="iRacing SDK memory sharing: checking...")
+        self.iracing_sdk_memory_label = None
+        self._iracing_sdk_memory_warned = False
+        self._trading_paints_dialog = None
         self.ui_mode_var = tk.StringVar(value=normalize_ui_mode_preference(getattr(self.config, "ui_mode", "advanced")))
         self.auto_start_var = tk.BooleanVar(value=self.config.auto_start)
         self.start_minimized_var = tk.BooleanVar(value=self.config.start_minimized)
@@ -28148,6 +28661,7 @@ class DownloaderUI:
         self.folder_metrics_button = None
         self.folder_metrics_free_space_label = None
         self._build_ui()
+        self._refresh_iracing_sdk_memory_status()
         try:
             pool_after_bytes, pool_freed_bytes = enforce_random_pool_limit(
                 default_random_pool_dir(),
@@ -28190,6 +28704,7 @@ class DownloaderUI:
         self.root.after(150, self._drain_logs)
         self.root.after(600, self._poll_service)
         self.root.after(850, self.show_quick_start_if_needed)
+        self.root.after(900, self._start_trading_paints_check)
         self.root.after(TP_SHOWROOM_STARTUP_SCAN_DELAY_MS, self._start_tp_showroom_mapping_startup_scan)
         if self.config.start_minimized and self._launched_from_autostart:
             self.root.after(500, self.start_minimized)
@@ -28928,6 +29443,20 @@ class DownloaderUI:
             row=3, column=0, sticky="w", pady=(8, 0)
         )
 
+        sdk_memory = ttk.LabelFrame(general_page, text="iRacing SDK", padding=10)
+        sdk_memory.grid(row=8, column=0, sticky="ew", pady=(10, 0))
+        sdk_memory.columnconfigure(0, weight=1)
+        self.iracing_sdk_memory_label = ttk.Label(
+            sdk_memory,
+            textvariable=self.iracing_sdk_memory_var,
+            justify="left",
+            wraplength=700,
+        )
+        self.iracing_sdk_memory_label.grid(row=0, column=0, sticky="w")
+        ttk.Button(sdk_memory, text="Fix it", command=self.fix_iracing_sdk_memory_now).grid(
+            row=0, column=1, sticky="e", padx=(12, 0)
+        )
+
         ai_page.columnconfigure(0, weight=0)
         ai_page.columnconfigure(1, weight=1)
         ai_sync = ttk.LabelFrame(ai_page, text="AI sync", padding=10)
@@ -29389,6 +29918,7 @@ class DownloaderUI:
         ttk.Checkbutton(logs_toolbar, text="Verbose logs", variable=self.verbose_var, command=self.on_setting_changed).pack(side="left", padx=(12, 0))
         ttk.Checkbutton(logs_toolbar, text="Show TP monitor", variable=self.show_tp_monitor_var, command=self.on_setting_changed).pack(side="left", padx=(12, 0))
         ttk.Button(logs_toolbar, text="Export log", command=self.export_log).pack(side="right")
+        ttk.Button(logs_toolbar, text="View log", command=self.view_log).pack(side="right", padx=(0, 8))
         ttk.Button(logs_toolbar, text="Reset app settings", command=self.reset_program_config).pack(side="right", padx=(0, 8))
         mapping_tools = ttk.LabelFrame(logs_page, text="Automatic car identification", padding=10)
         mapping_tools.grid(row=1, column=0, sticky="ew", pady=(10, 0))
@@ -33352,6 +33882,7 @@ class DownloaderUI:
             auto_start=bool(self.auto_start_var.get()),
             start_minimized=bool(self.start_minimized_var.get()),
             minimize_to_tray_on_close=bool(self.minimize_to_tray_var.get()),
+            trading_paints_warning_dont_ask=bool(getattr(self.config, "trading_paints_warning_dont_ask", False)),
             manage_cloud_sync=bool(self.manage_cloud_sync_var.get()),
             auto_refresh_paints=bool(self.auto_refresh_var.get()),
             cleanup_before_fetch=bool(self.cleanup_before_fetch_var.get()),
@@ -33827,6 +34358,155 @@ class DownloaderUI:
         self.service.reset_monitor_snapshot()
         self._refresh_monitor_ui()
         self._append_log("TP worker monitor reset.")
+    def _report_callback_exception(self, exc_type, exc_value, exc_tb) -> None:
+        logging.error(
+            "Unhandled error in a window callback",
+            exc_info=(exc_type, exc_value, exc_tb),
+        )
+
+    def view_log(self) -> None:
+        path = default_log_file_path()
+        if not path.exists():
+            self._append_log(f"The log file has not been created yet: {path}")
+            return
+        try:
+            if sys.platform == "win32":
+                os.startfile(path)  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                os.system(f'open "{path}"')
+            else:
+                os.system(f'xdg-open "{path}"')
+        except Exception as exc:
+            self._append_log(f"Could not open the log file: {exc}")
+
+    def _start_trading_paints_check(self) -> None:
+        if bool(getattr(self.config, "trading_paints_warning_dont_ask", False)):
+            return
+
+        def _work() -> None:
+            names = list_running_process_names()
+            self.root.after(0, lambda: self._show_trading_paints_warning(names))
+
+        threading.Thread(target=_work, name="NishizumiPaintsProcessCheck", daemon=True).start()
+
+    def _show_trading_paints_warning(self, process_names: list[str]) -> None:
+        if self._trading_paints_dialog is not None:
+            return
+        if not should_warn_about_trading_paints(
+            process_names,
+            bool(getattr(self.config, "trading_paints_warning_dont_ask", False)),
+        ):
+            return
+        logging.warning("Trading Paints is running; both apps write the same iRacing paint files.")
+        dialog = self.tk.Toplevel(self.root)
+        self._trading_paints_dialog = dialog
+        dialog.title(APP_NAME)
+        dialog.transient(self.root)
+        try:
+            dialog.grab_set()
+        except Exception:
+            pass
+        frame = self.ttk.Frame(dialog, padding=14)
+        frame.pack(fill="both", expand=True)
+        frame.columnconfigure(0, weight=1)
+        self.ttk.Label(
+            frame,
+            text=(
+                "Trading Paints is running. Both apps write the same iRacing paint files, "
+                "so they can overwrite each other and leave you with the wrong paints."
+            ),
+            justify="left",
+            wraplength=520,
+        ).grid(row=0, column=0, columnspan=3, sticky="w")
+        dont_ask_var = self.tk.BooleanVar(value=False)
+        self.ttk.Checkbutton(frame, text="Don't ask again", variable=dont_ask_var).grid(
+            row=1, column=0, sticky="w", pady=(12, 0)
+        )
+
+        def _finish(close_trading_paints: bool) -> None:
+            if bool(dont_ask_var.get()):
+                self.config.trading_paints_warning_dont_ask = True
+                try:
+                    self.config_store.save(self.config)
+                except Exception:
+                    logging.debug("Could not save the Trading Paints warning preference", exc_info=True)
+            try:
+                dialog.grab_release()
+            except Exception:
+                pass
+            dialog.destroy()
+            self._trading_paints_dialog = None
+            if close_trading_paints:
+                threading.Thread(
+                    target=self._request_trading_paints_close,
+                    name="NishizumiPaintsCloseTradingPaints",
+                    daemon=True,
+                ).start()
+
+        self.ttk.Button(frame, text="Close Trading Paints", command=lambda: _finish(True)).grid(
+            row=2, column=1, sticky="e", padx=(8, 0), pady=(14, 0)
+        )
+        self.ttk.Button(frame, text="Keep both", command=lambda: _finish(False)).grid(
+            row=2, column=2, sticky="e", padx=(8, 0), pady=(14, 0)
+        )
+
+    def _request_trading_paints_close(self) -> None:
+        ok, message = request_trading_paints_close()
+        if ok:
+            logging.info("%s", message)
+        else:
+            logging.warning("%s", message)
+        self.root.after(0, lambda: self._append_log(message))
+
+    def _refresh_iracing_sdk_memory_status(self) -> None:
+        enabled = read_iracing_sdk_memory_enabled(self.config)
+        if enabled is None:
+            text = "iRacing SDK memory sharing could not be checked because app.ini was not found."
+            color = "#666666"
+        elif enabled:
+            text = "iRacing SDK memory sharing is enabled (irsdkEnableMem=1)."
+            color = "#176d2b"
+        else:
+            text = (
+                "iRacing SDK memory sharing is disabled (irsdkEnableMem=0), so session details may be missing. "
+                "Close iRacing, set irsdkEnableMem=1 in the [Misc] section of Documents\\iRacing\\app.ini, "
+                "then start iRacing again."
+            )
+            color = "#b00020"
+        self.iracing_sdk_memory_var.set(text)
+        if self.iracing_sdk_memory_label is not None:
+            try:
+                self.iracing_sdk_memory_label.configure(foreground=color)
+            except Exception:
+                pass
+        if enabled is False and not self._iracing_sdk_memory_warned:
+            self._iracing_sdk_memory_warned = True
+            self.status_var.set("iRacing SDK memory sharing is disabled")
+            self._append_log(text)
+
+    def fix_iracing_sdk_memory_now(self) -> None:
+        self._append_log("Checking whether iRacing is running before changing its SDK setting...")
+
+        def _work() -> None:
+            running = iracing_is_running(list_running_process_names())
+            changed, message = fix_iracing_sdk_memory_setting(self.config, iracing_running=running)
+            self.root.after(0, lambda: self._finish_iracing_sdk_memory_fix(changed, message))
+
+        threading.Thread(target=_work, name="NishizumiPaintsSdkMemoryFix", daemon=True).start()
+
+    def _finish_iracing_sdk_memory_fix(self, changed: bool, message: str) -> None:
+        if changed:
+            logging.info("%s", message)
+        else:
+            logging.warning("%s", message)
+        self._append_log(message)
+        self._refresh_iracing_sdk_memory_status()
+        if not changed:
+            try:
+                self.messagebox.showwarning(APP_NAME, message, parent=self.root)
+            except Exception:
+                pass
+
     def export_log(self) -> None:
         default_name = f"nishizumi-paints-log-{time.strftime('%Y%m%d-%H%M%S')}" + ".txt"
         try:
@@ -36264,6 +36944,21 @@ def run_headless(args: argparse.Namespace | None = None, instance_lock: SingleIn
     if getattr(args, "no_ui_previews", False):
         config.iracing_ui_car_previews = False
     config.verbose = bool(config.verbose or args.verbose)
+    running_processes = list_running_process_names()
+    if should_warn_about_trading_paints(
+        running_processes,
+        bool(getattr(config, "trading_paints_warning_dont_ask", False)),
+    ):
+        logging.warning(
+            "Trading Paints is running. Both apps write the same iRacing paint files, "
+            "so they can overwrite each other."
+        )
+    if read_iracing_sdk_memory_enabled(config) is False:
+        logging.warning(
+            "iRacing SDK memory sharing is disabled (irsdkEnableMem=0). Close iRacing, "
+            "set irsdkEnableMem=1 in the [Misc] section of Documents\\iRacing\\app.ini, "
+            "then start iRacing again."
+        )
     config.poll_seconds = max(args.poll_seconds, 0.2)
     config.retries = max(1, args.retries)
     config.retry_backoff_seconds = max(0.1, args.retry_backoff_seconds)
