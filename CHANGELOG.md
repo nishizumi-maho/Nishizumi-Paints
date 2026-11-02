@@ -2,9 +2,9 @@
 
 All notable user-facing changes to Nishizumi Paints are documented here.
 
-## [7.4.0] - 2026-11-02 (beta)
+## [7.4.0] - 2026-11-02
 
-Published as the pre-releases `v7.4.0-beta.1` and `v7.4.0-beta.2`, which the in-app updater does not offer.
+First published as the pre-releases `v7.4.0-beta.1` and `v7.4.0-beta.2`; this is the final release, offered by the in-app updater.
 
 ### Added
 
