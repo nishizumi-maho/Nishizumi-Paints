@@ -2189,6 +2189,25 @@ class Session:
     track_display_short_name: str = ""
     local_car_short_name: str = ""
     session_type: str = ""
+    # WeekendInfo conditions. iRacing supplies most of these as display strings
+    # with their unit ("24.00 C", "60.00 kph"), which are kept as given.
+    sim_date: str = ""
+    sim_time: str = ""
+    air_temp: str = ""
+    track_temp: str = ""
+    humidity: str = ""
+    wind_speed: str = ""
+    wind_direction: str = ""
+    fog: str = ""
+    skies: str = ""
+    rain: str = ""
+    track_length: str = ""
+    turns: str = ""
+    altitude: str = ""
+    city: str = ""
+    country: str = ""
+    pit_speed_limit: str = ""
+    pace_speed_limit: str = ""
     def fingerprint(self) -> tuple[SessionId, tuple[tuple[str, int, str, int], ...], tuple[bool, str, int, int, bool, str, str, bool, str]]:
         return (self.session_id, self.roster_fingerprint(), self.context_fingerprint())
     def identity_fingerprint(self) -> tuple[SessionId, tuple[bool, str, int, int, bool, str, str, bool, str]]:
@@ -2237,6 +2256,48 @@ class Session:
             "league": str(int(self.league_id or 0)),
             "numbers": "True" if self.load_num_textures else "False",
         }
+
+SESSION_CONDITION_UNKNOWN = "—"
+SESSION_CONDITION_FIELDS: tuple[tuple[str, str], ...] = (
+    ("sim_date", "Sim date"),
+    ("sim_time", "Sim time"),
+    ("air_temp", "Air temperature"),
+    ("track_temp", "Track temperature"),
+    ("humidity", "Humidity"),
+    ("wind_speed", "Wind speed"),
+    ("wind_direction", "Wind direction"),
+    ("fog", "Fog"),
+    ("skies", "Skies"),
+    ("rain", "Rain"),
+    ("track_length", "Track length"),
+    ("turns", "Turns"),
+    ("altitude", "Altitude"),
+    ("city", "City"),
+    ("country", "Country"),
+    ("pit_speed_limit", "Pit speed limit"),
+    ("pace_speed_limit", "Pace speed limit"),
+)
+
+
+def format_session_condition(value: object) -> str:
+    """A conditions value as iRacing gave it, or the missing-value marker."""
+    text = str(value or "").strip()
+    return text or SESSION_CONDITION_UNKNOWN
+
+
+def session_condition_values(session: Session | None) -> dict[str, str]:
+    if session is None:
+        return {key: SESSION_CONDITION_UNKNOWN for key, _label in SESSION_CONDITION_FIELDS}
+    return {
+        key: format_session_condition(getattr(session, key, ""))
+        for key, _label in SESSION_CONDITION_FIELDS
+    }
+
+
+def session_condition_rows(session: Session | None) -> list[tuple[str, str]]:
+    values = session_condition_values(session)
+    return [(label, values[key]) for key, label in SESSION_CONDITION_FIELDS]
+
 
 DEFAULT_REPLAY_NAME_TEMPLATE = "Series{series} S{season} Week{raceweek}"
 REPLAY_NAME_CHECKERED_FLAG = 0x00000001
@@ -2683,6 +2744,90 @@ def _session_status_meta(status_code: str) -> tuple[str, str]:
         "skipped": ("○", "Skipped"),
     }
     return mapping.get(status_code, ("?", status_code.title()))
+
+FIELD_STATUS_DONE_CODES = frozenset(
+    {
+        "override",
+        "downloaded",
+        "team_paint",
+        "driver_paint",
+        "replay",
+        "fallback",
+        "fallback_local",
+        "fallback_online",
+        "iracing_default",
+        "missing",
+        "skipped",
+    }
+)
+FIELD_STATUS_WITHOUT_LIVERY_CODES = frozenset({"missing", "iracing_default", "skipped", ""})
+
+
+def strength_of_field(iratings: list[int]) -> int:
+    """iRacing's strength of field over drivers with a known, positive iRating."""
+    ratings = [int(value) for value in iratings if int(value) > 0]
+    if not ratings:
+        return 0
+    scale = 1600.0 / math.log(2.0)
+    # iRacing's usual form: scale * ln(n / sum(2 ** (-iRating / 1600))).
+    denominator = sum(2.0 ** (-float(rating) / 1600.0) for rating in ratings)
+    if denominator <= 0.0:
+        return 0
+    return int(round(scale * math.log(len(ratings) / denominator)))
+
+
+def session_strength_of_field(session: Session | None) -> int:
+    if session is None:
+        return 0
+    return strength_of_field(
+        [
+            int(user.irating)
+            for user in session.users
+            if not user.is_ai and user.irating is not None and int(user.irating) > 0
+        ]
+    )
+
+
+def session_driver_count(session: Session | None) -> int:
+    return len(session.users) if session is not None else 0
+
+
+def session_paint_progress(rows: Iterable[SessionDriverSnapshot]) -> tuple[int, int]:
+    """Completed asset slots and total slots (car, helmet and suit per driver row)."""
+    done = 0
+    total = 0
+    for row in rows:
+        total += 3
+        for code in (row.car_status_code, row.suit_status_code, row.helmet_status_code):
+            if str(code) in FIELD_STATUS_DONE_CODES:
+                done += 1
+    return done, total
+
+
+def session_without_livery_count(rows: Iterable[SessionDriverSnapshot]) -> int:
+    return sum(
+        1
+        for row in rows
+        if not row.is_ai and str(row.car_status_code) in FIELD_STATUS_WITHOUT_LIVERY_CODES
+    )
+
+
+def session_processing_active(rows: Iterable[SessionDriverSnapshot]) -> bool:
+    """True while any asset of the current session is queued or downloading."""
+    for row in rows:
+        for code in (row.status_code, row.car_status_code, row.suit_status_code, row.helmet_status_code):
+            if str(code) in {"queued", "downloading"}:
+                return True
+    return False
+
+
+def tp_fetch_hosts_available() -> bool:
+    """False when every Trading Paints manifest host recently failed to connect."""
+    now = time.monotonic()
+    with _TP_FETCH_URL_DOWN_LOCK:
+        down = {url for url, until in _TP_FETCH_URL_DOWN_UNTIL.items() if until > now}
+    return bool(TRADING_PAINTS_FETCH_CONTEXT_URLS) and len(down) < len(TRADING_PAINTS_FETCH_CONTEXT_URLS)
+
 
 _SESSION_ASSET_SLOTS: tuple[str, ...] = ("car", "suit", "helmet")
 
@@ -4755,6 +4900,166 @@ def _league_library_decal_entry(
         else:
             driver_any = entry
     return driver_class or driver_any
+
+
+@dataclass(frozen=True)
+class LeaguePreviewSelection:
+    league_id: int
+    car_folder: str
+    car_class: str
+    member_id: int
+    decal_path: Path | None
+    paint_path: Path | None
+
+
+@dataclass(frozen=True)
+class LeagueExportJob:
+    league_id: int
+    member_id: int
+    car_folder: str
+    car_class: str
+    paint_path: Path
+    decal_path: Path | None
+    file_name: str
+
+
+def _league_library_entries_for_car(
+    entries: Iterable[LeagueLibraryEntry],
+    league_id: int,
+    car_folder: str,
+    car_class: str = "",
+) -> list[LeagueLibraryEntry]:
+    return [
+        entry
+        for entry in entries
+        if int(entry.league_id) == int(league_id)
+        and _league_library_same_car_folder(entry.car_folder, car_folder)
+        and _league_library_class_matches(entry, car_class)
+    ]
+
+
+def league_preview_selection(
+    entries: Iterable[LeagueLibraryEntry],
+    league_id: int,
+    car_folder: str,
+    *,
+    car_class: str = "",
+    member_id: int = 0,
+    paint_path: Path | str | None = None,
+    library_dir: Path | str | None = None,
+) -> LeaguePreviewSelection:
+    """Resolve the decal and paint a league preview should render.
+
+    A driver-specific decal wins over the all-driver decal. The driver's library
+    paint is used unless the caller chose a paint TGA explicitly.
+    """
+    root = Path(library_dir) if library_dir is not None else default_league_library_dir()
+    entries_list = list(entries)
+    car_entries = _league_library_entries_for_car(entries_list, int(league_id), car_folder, car_class)
+    decal_entry = None
+    if int(member_id or 0) > 0:
+        decal_entry = _league_library_decal_entry(car_entries, member_id=int(member_id), car_class=car_class)
+    if decal_entry is None:
+        decal_entry = _league_library_decal_entry(car_entries, member_id=0, car_class=car_class)
+    decal_path: Path | None = None
+    if decal_entry is not None:
+        candidate = root / league_library_name(decal_entry)
+        if candidate.exists():
+            decal_path = candidate
+
+    chosen_paint = Path(paint_path) if paint_path else None
+    if chosen_paint is not None and not chosen_paint.is_file():
+        chosen_paint = None
+    if chosen_paint is None and int(member_id or 0) > 0:
+        paint_entries = [
+            entry
+            for entry in car_entries
+            if entry.kind == LEAGUE_LIBRARY_PAINT_KIND
+            and entry.member_id == int(member_id)
+            and entry.ext == "tga"
+        ]
+        for num_type in ("sim", "num"):
+            for entry in paint_entries:
+                if entry.num_type != num_type:
+                    continue
+                candidate = root / league_library_name(entry)
+                if candidate.is_file():
+                    chosen_paint = candidate
+                    break
+            if chosen_paint is not None:
+                break
+    return LeaguePreviewSelection(
+        league_id=int(league_id),
+        car_folder=str(car_folder or ""),
+        car_class=str(car_class or ""),
+        member_id=int(member_id or 0),
+        decal_path=decal_path,
+        paint_path=chosen_paint,
+    )
+
+
+def _league_export_file_name(league_id: int, member_id: int, car_folder: str, car_class: str = "") -> str:
+    parts = [f"league_{int(league_id):06d}", f"{int(member_id):07d}", str(car_folder or "car")]
+    if str(car_class or "").strip():
+        parts.append(str(car_class).strip())
+    stem = "_".join(parts)
+    stem = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", stem).strip(" .")
+    return f"{stem or 'league_preview'}.png"
+
+
+def league_export_jobs(
+    entries: Iterable[LeagueLibraryEntry],
+    *,
+    league_id: int = 0,
+    library_dir: Path | str | None = None,
+) -> list[LeagueExportJob]:
+    """One render job per library driver/car that has a paint and a decal."""
+    root = Path(library_dir) if library_dir is not None else default_league_library_dir()
+    entries_list = list(entries)
+    if int(league_id or 0) > 0:
+        entries_list = [entry for entry in entries_list if int(entry.league_id) == int(league_id)]
+    groups: dict[tuple[int, str, str, int], list[LeagueLibraryEntry]] = {}
+    for entry in entries_list:
+        if entry.kind != LEAGUE_LIBRARY_PAINT_KIND or entry.member_id <= 0 or entry.ext != "tga":
+            continue
+        key = (int(entry.league_id), str(entry.car_folder or ""), str(entry.car_class or ""), int(entry.member_id))
+        groups.setdefault(key, []).append(entry)
+    jobs: list[LeagueExportJob] = []
+    for (job_league_id, car_folder, car_class, member_id), group in sorted(groups.items()):
+        paint_path: Path | None = None
+        for num_type in ("sim", "num"):
+            for entry in group:
+                if entry.num_type != num_type:
+                    continue
+                candidate = root / league_library_name(entry)
+                if candidate.is_file():
+                    paint_path = candidate
+                    break
+            if paint_path is not None:
+                break
+        if paint_path is None:
+            continue
+        selection = league_preview_selection(
+            entries_list,
+            job_league_id,
+            car_folder,
+            car_class=car_class,
+            member_id=member_id,
+            paint_path=paint_path,
+            library_dir=root,
+        )
+        jobs.append(
+            LeagueExportJob(
+                league_id=job_league_id,
+                member_id=member_id,
+                car_folder=car_folder,
+                car_class=car_class,
+                paint_path=paint_path,
+                decal_path=selection.decal_path,
+                file_name=_league_export_file_name(job_league_id, member_id, car_folder, car_class),
+            )
+        )
+    return jobs
 
 
 def _apply_league_library_for_user(
@@ -6952,6 +7257,27 @@ def _build_session_from_parts(
         track_display_short_name=track_display_short_name,
         local_car_short_name=local_car_short_name,
         session_type=session_type,
+        sim_date=str(weekend.get('Date') or weekend.get('EventDate') or '').strip(),
+        sim_time=str(weekend.get('EventTime') or weekend.get('EventTimeRaw') or '').strip(),
+        air_temp=str(weekend.get('TrackAirTemp') or '').strip(),
+        track_temp=str(weekend.get('TrackSurfaceTemp') or weekend.get('TrackTemp') or '').strip(),
+        humidity=str(weekend.get('TrackRelativeHumidity') or '').strip(),
+        wind_speed=str(weekend.get('TrackWindVel') or '').strip(),
+        wind_direction=str(weekend.get('TrackWindDir') or '').strip(),
+        fog=str(weekend.get('TrackFogLevel') or '').strip(),
+        skies=str(weekend.get('TrackSkies') or '').strip(),
+        rain=str(weekend.get('TrackPrecipitation') or '').strip(),
+        track_length=str(weekend.get('TrackLength') or '').strip(),
+        turns=str(weekend.get('TrackNumTurns') or '').strip(),
+        altitude=str(weekend.get('TrackAltitude') or '').strip(),
+        city=str(weekend.get('TrackCity') or '').strip(),
+        country=str(weekend.get('TrackCountry') or '').strip(),
+        pit_speed_limit=str(
+            weekend.get('TrackPitSpeedLimit') or weekend.get('PitSpeedLimit') or weekend_options.get('PitSpeedLimit') or ''
+        ).strip(),
+        pace_speed_limit=str(
+            weekend.get('TrackPaceSpeed') or weekend.get('PaceSpeed') or weekend_options.get('PaceSpeed') or ''
+        ).strip(),
     )
 def _parse_tp_manifest_xml(xml_text: str) -> ET.Element:
     """Parse a Trading Paints manifest; an HTML page is a parse error, not an empty manifest.
@@ -8367,6 +8693,115 @@ def set_tp_paint_forbidden(
         _save_forbidden_tp_paints(paints, path)
     _invalidate_forbidden_tp_paints_cache(path)
     return bool(forbidden)
+
+@dataclass(frozen=True)
+class ManagerTagRow:
+    member_id: int
+    name: str
+    theme: str
+
+
+@dataclass(frozen=True)
+class ManagerThemeRow:
+    theme: str
+    car_folder: str
+    file_type: str
+    path: Path
+
+
+@dataclass(frozen=True)
+class ManagerForbiddenRow:
+    key: str
+    target_kind: str
+    target_id: int
+    kind: str
+    directory: str
+    display_name: str
+
+    @property
+    def target_label(self) -> str:
+        return f"{self.target_kind} {self.target_id}"
+
+    @property
+    def car_label(self) -> str:
+        return self.directory or "-"
+
+
+def build_manager_tables(
+    people: dict[str, object] | None,
+    themes: dict[str, list[TagThemeFile]] | None,
+    forbidden: dict[str, object] | None,
+) -> tuple[list[ManagerTagRow], list[ManagerThemeRow], list[ManagerForbiddenRow]]:
+    """The three read-only manager tables, assembled from the stored files."""
+    aliases = dict((people or {}).get("driver_aliases") or {}) if isinstance(people, dict) else {}
+    forbidden_entries = (forbidden or {}).get("entries") if isinstance(forbidden, dict) else {}
+    if not isinstance(forbidden_entries, dict):
+        forbidden_entries = {}
+    names_by_user: dict[str, str] = {}
+    for entry in forbidden_entries.values():
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("target_kind") or "").strip().lower() != "user":
+            continue
+        user_key = str(entry.get("target_id") or "").strip()
+        display_name = str(entry.get("display_name") or "").strip()
+        if user_key and display_name and user_key not in names_by_user:
+            names_by_user[user_key] = display_name
+
+    tags = dict((people or {}).get("tags") or {}) if isinstance(people, dict) else {}
+    tag_rows: list[ManagerTagRow] = []
+    for raw_id, raw_theme in tags.items():
+        member_key = str(raw_id or "").strip()
+        theme = str(raw_theme or "").strip()
+        if not member_key or not theme:
+            continue
+        try:
+            member_id = int(member_key)
+        except (TypeError, ValueError):
+            continue
+        name = str(aliases.get(member_key) or names_by_user.get(member_key) or "").strip()
+        tag_rows.append(ManagerTagRow(member_id=member_id, name=name, theme=theme))
+    tag_rows.sort(key=lambda row: (row.member_id, row.theme.casefold()))
+
+    theme_rows: list[ManagerThemeRow] = []
+    for theme_name, files in (themes or {}).items():
+        for entry in files:
+            theme_rows.append(
+                ManagerThemeRow(
+                    theme=str(entry.theme or theme_name),
+                    car_folder=str(entry.car_folder or ""),
+                    file_type=str(entry.file_type or ""),
+                    path=Path(entry.path),
+                )
+            )
+    theme_rows.sort(
+        key=lambda row: (row.theme.casefold(), row.car_folder.casefold(), row.file_type.casefold(), str(row.path).casefold())
+    )
+
+    forbidden_rows: list[ManagerForbiddenRow] = []
+    for entry in forbidden_entries.values():
+        if not isinstance(entry, dict):
+            continue
+        key = str(entry.get("key") or "").strip()
+        if not key:
+            continue
+        try:
+            target_id = max(0, int(entry.get("target_id") or 0))
+        except (TypeError, ValueError):
+            target_id = 0
+        forbidden_rows.append(
+            ManagerForbiddenRow(
+                key=key,
+                target_kind="team" if str(entry.get("target_kind") or "").strip().lower() == "team" else "user",
+                target_id=target_id,
+                kind=str(entry.get("kind") or "").strip(),
+                directory=str(entry.get("directory") or "").strip(),
+                display_name=str(entry.get("display_name") or "").strip(),
+            )
+        )
+    forbidden_rows.sort(key=lambda row: (row.target_kind, row.target_id, row.kind, row.directory.casefold()))
+    return tag_rows, theme_rows, forbidden_rows
+
 
 def is_tp_paint_forbidden(
     target_kind: str,
@@ -23255,6 +23690,95 @@ def clear_session_target_files(
                 deleted_paths.add(key)
     return kept, len(deleted_paths)
 
+PURGE_PAINT_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"^car_(team_)?(\d+)(?:_ss)?\.tga$", re.IGNORECASE),
+    re.compile(r"^car_num_(team_)?(\d+)(?:_ss)?\.tga$", re.IGNORECASE),
+    re.compile(r"^decal_(team_)?(\d+)(?:_ss)?\.tga$", re.IGNORECASE),
+    re.compile(r"^car_spec_(team_)?(\d+)(?:_spec)?(?:_ss)?\.mip$", re.IGNORECASE),
+    re.compile(r"^helmet_(team_)?(\d+)\.tga$", re.IGNORECASE),
+    re.compile(r"^suit_(team_)?(\d+)\.tga$", re.IGNORECASE),
+)
+
+
+def _purge_path_key(path: Path | str) -> str:
+    return os.path.normcase(os.path.abspath(os.path.normpath(str(path))))
+
+
+def _purge_base_name(name: str) -> str:
+    """Strip the compression/temp trailer the app adds around a paint file."""
+    base = str(name or "").strip().lower()
+    for suffix in (".bz2", ".tmp", ".part"):
+        if base.endswith(suffix):
+            base = base[: -len(suffix)]
+    # Atomic writes use "<paint name>.<uuid hex>.tmp".
+    return re.sub(r"\.[0-9a-f]{8,}$", "", base)
+
+
+def _purge_paint_target(base_name: str) -> tuple[bool, int] | None:
+    for pattern in PURGE_PAINT_PATTERNS:
+        match = pattern.fullmatch(base_name)
+        if match is not None:
+            return bool(match.group(1)), int(match.group(2))
+    return None
+
+
+def _purge_owned_target(base_name: str, own_member_id: int, own_team_id: int) -> bool:
+    target = _purge_paint_target(base_name)
+    if target is None:
+        return False
+    is_team, target_id = target
+    if is_team:
+        return own_team_id > 0 and target_id == int(own_team_id)
+    return own_member_id > 0 and target_id == int(own_member_id)
+
+
+def select_purge_files(
+    root: Path | str,
+    *,
+    own_member_id: int = 0,
+    own_team_id: int = 0,
+    protected_paths: Iterable[Path | str] = (),
+) -> list[Path]:
+    """Paint tree files the purge command may remove.
+
+    Only the app's own car, number, spec, decal, helmet and suit names (and the
+    ``.bz2``/temporary leftovers of those) qualify. The local user's targets,
+    iRacing UI preview files and anything with another name are kept.
+    """
+    root_path = Path(root)
+    if not root_path.is_dir():
+        return []
+    protected = {_purge_path_key(path) for path in protected_paths}
+    selected: list[Path] = []
+    for path in root_path.rglob("*"):
+        try:
+            if not path.is_file():
+                continue
+        except OSError:
+            continue
+        if _purge_path_key(path) in protected:
+            continue
+        base_name = _purge_base_name(path.name)
+        if _purge_paint_target(base_name) is None:
+            continue
+        if _purge_owned_target(base_name, int(own_member_id or 0), int(own_team_id or 0)):
+            continue
+        selected.append(path)
+    return sorted(selected, key=lambda item: str(item).lower())
+
+
+def purge_file_stats(paths: Iterable[Path]) -> tuple[int, int]:
+    count = 0
+    size = 0
+    for path in paths:
+        count += 1
+        try:
+            size += int(Path(path).stat().st_size)
+        except OSError:
+            continue
+    return count, size
+
+
 def clear_changed_team_driver_target_files(
     *,
     session: Session,
@@ -28731,6 +29255,29 @@ class DownloaderUI:
         self.session_preview_panel = None
         self._session_preview_after_id = None
         self._session_preview_key_value = None
+        self.session_condition_vars = {
+            key: tk.StringVar(value=SESSION_CONDITION_UNKNOWN) for key, _label in SESSION_CONDITION_FIELDS
+        }
+        self._session_conditions_expanded = True
+        self.field_sof_var = tk.StringVar(value=f"SOF {SESSION_CONDITION_UNKNOWN}")
+        self.field_drivers_var = tk.StringVar(value="Drivers 0")
+        self.field_livery_var = tk.StringVar(value="0 without livery")
+        self.field_files_var = tk.StringVar(value="Files 0/0")
+        self.field_links_var = tk.StringVar(value="TP ready • SDK waiting")
+        self.field_progress_var = tk.DoubleVar(value=0.0)
+        self._purge_in_progress = False
+        self._manager_window = None
+        self._manager_loading = False
+        self._manager_tag_rows: list[ManagerTagRow] = []
+        self._manager_theme_rows: list[ManagerThemeRow] = []
+        self._manager_forbidden_rows: list[ManagerForbiddenRow] = []
+        self.league_preview_league_var = tk.StringVar(value="")
+        self.league_preview_car_var = tk.StringVar(value="")
+        self.league_preview_class_var = tk.StringVar(value="")
+        self.league_preview_driver_var = tk.StringVar(value="")
+        self.league_preview_paint_var = tk.StringVar(value="Paint TGA: library paint")
+        self._league_preview_paint_path: Path | None = None
+        self.league_preview_panel = None
         self.show_activity_var = tk.BooleanVar(value=self.config.show_activity_log)
         self.show_tp_monitor_var = tk.BooleanVar(value=getattr(self.config, "show_tp_monitor", False))
         self.check_updates_var = tk.BooleanVar(value=getattr(self.config, "check_updates_automatically", True))
@@ -29077,6 +29624,16 @@ class DownloaderUI:
         outer.columnconfigure(0, weight=1)
         outer.rowconfigure(1, weight=1, minsize=260)
 
+        field_status = ttk.Frame(outer, padding=(0, 6, 0, 0))
+        field_status.grid(row=2, column=0, sticky="ew")
+        field_status.columnconfigure(7, weight=1)
+        ttk.Label(field_status, textvariable=self.field_sof_var, font=("Segoe UI", 9, "bold")).grid(row=0, column=0, sticky="w")
+        ttk.Label(field_status, textvariable=self.field_drivers_var).grid(row=0, column=1, sticky="w", padx=(18, 0))
+        ttk.Label(field_status, textvariable=self.field_livery_var, foreground="#9a2020").grid(row=0, column=2, sticky="w", padx=(18, 0))
+        ttk.Label(field_status, textvariable=self.field_files_var).grid(row=0, column=3, sticky="w", padx=(18, 0))
+        ttk.Progressbar(field_status, orient="horizontal", mode="determinate", length=120, maximum=100, variable=self.field_progress_var).grid(row=0, column=4, sticky="w", padx=(8, 0))
+        ttk.Label(field_status, textvariable=self.field_links_var, foreground="#555555").grid(row=0, column=5, sticky="w", padx=(18, 0))
+
         header = ttk.Frame(outer)
         header.grid(row=0, column=0, sticky="ew")
         header.columnconfigure(1, weight=1)
@@ -29113,16 +29670,44 @@ class DownloaderUI:
         notebook.bind("<<NotebookTabChanged>>", self._on_main_tab_changed, add="+")
 
         session_page.columnconfigure(0, weight=1)
-        session_page.rowconfigure(1, weight=1)
+        session_page.rowconfigure(2, weight=1)
         session_info = ttk.LabelFrame(session_page, text="Current session", padding=10)
         session_info.grid(row=0, column=0, sticky="ew")
         session_info.columnconfigure(0, weight=1)
         ttk.Label(session_info, textvariable=self.session_summary_var, justify="left").grid(row=0, column=0, sticky="w")
         ttk.Label(session_info, textvariable=self.session_status_summary_var, justify="left", foreground="#555555").grid(row=1, column=0, sticky="w", pady=(4, 0))
         ttk.Button(session_info, text="Force refresh current car/team", command=self.force_refresh_current_car_team).grid(row=0, column=1, rowspan=2, sticky="e", padx=(12, 0))
+        ttk.Button(session_info, text="Tags & forbidden…", command=self.open_tags_forbidden_manager).grid(row=0, column=2, rowspan=2, sticky="e", padx=(12, 0))
+
+        conditions_frame = ttk.LabelFrame(session_page, text="Session conditions", padding=8)
+        conditions_frame.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        conditions_frame.columnconfigure(0, weight=1)
+        conditions_header = ttk.Frame(conditions_frame)
+        conditions_header.grid(row=0, column=0, sticky="ew")
+        conditions_header.columnconfigure(0, weight=1)
+        ttk.Label(
+            conditions_header,
+            text="WeekendInfo values as iRacing reports them; missing values show a dash.",
+            foreground="#555555",
+        ).grid(row=0, column=0, sticky="w")
+        self.session_conditions_toggle = ttk.Button(conditions_header, text="Hide", command=self._toggle_session_conditions)
+        self.session_conditions_toggle.grid(row=0, column=1, sticky="e")
+        self.session_conditions_body = ttk.Frame(conditions_frame)
+        self.session_conditions_body.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        for column_index in range(4):
+            self.session_conditions_body.columnconfigure(column_index, weight=1 if column_index % 2 else 0)
+        for index, (field_key, field_label) in enumerate(SESSION_CONDITION_FIELDS):
+            row_index = index // 2
+            column = (index % 2) * 2
+            ttk.Label(self.session_conditions_body, text=f"{field_label}:").grid(
+                row=row_index, column=column, sticky="w", padx=(0, 6), pady=1
+            )
+            ttk.Label(self.session_conditions_body, textvariable=self.session_condition_vars[field_key]).grid(
+                row=row_index, column=column + 1, sticky="w", padx=(0, 24), pady=1
+            )
 
         driver_list_frame = ttk.LabelFrame(session_page, text="Drivers in session", padding=8)
-        driver_list_frame.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
+        driver_list_frame.grid(row=2, column=0, sticky="nsew", pady=(10, 0))
         driver_list_frame.columnconfigure(0, weight=1)
         driver_list_frame.rowconfigure(0, weight=1)
         # The list still grows to fill the tab; the smaller request is how far it may
@@ -29189,7 +29774,7 @@ class DownloaderUI:
             self.session_tree.tag_configure(tag_name, foreground=color)
 
         driver_actions = ttk.LabelFrame(session_page, text="Driver fixed paints", padding=8)
-        driver_actions.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        driver_actions.grid(row=3, column=0, sticky="ew", pady=(10, 0))
         driver_actions.columnconfigure(0, weight=1)
         ttk.Label(driver_actions, textvariable=self.session_driver_action_summary_var, foreground="#555555").grid(row=0, column=0, sticky="w")
         action_rows = ttk.Frame(driver_actions)
@@ -29220,7 +29805,7 @@ class DownloaderUI:
                 self.session_driver_action_buttons_by_kind[(kind, action_key)] = button
 
         session_preview_frame = ttk.LabelFrame(session_page, text="Preview", padding=8)
-        session_preview_frame.grid(row=3, column=0, sticky="nsew", pady=(10, 0))
+        session_preview_frame.grid(row=4, column=0, sticky="nsew", pady=(10, 0))
         session_preview_frame.columnconfigure(0, weight=1)
         session_preview_frame.rowconfigure(0, weight=1)
         self.session_preview_panel = PaintPreviewPanel(session_preview_frame, app=self)
@@ -29230,6 +29815,7 @@ class DownloaderUI:
         general_actions = ttk.LabelFrame(general_page, text="Actions", padding=10)
         general_actions.grid(row=0, column=0, sticky="w")
         ttk.Button(general_actions, text="Clear downloaded", command=self.clear_downloaded_now).pack(side="left")
+        ttk.Button(general_actions, text="Delete all downloaded paints…", command=self.purge_all_downloaded_paints).pack(side="left", padx=(8, 0))
         ttk.Button(general_actions, text="Refresh paints", command=self.redownload_now).pack(side="left", padx=(8, 0))
         ttk.Button(general_actions, text="Trigger global reload", command=self.trigger_global_reload_now).pack(side="left", padx=(8, 0))
         ttk.Button(general_actions, text="Paint folder", command=self.open_paint_folder).pack(side="left", padx=(8, 0))
@@ -29957,20 +30543,48 @@ class DownloaderUI:
         ttk.Button(league_actions, text="Import folder...", command=self.import_league_library_folder).pack(side="left", padx=(8, 0))
         ttk.Button(league_actions, text="Open folder", command=self.open_league_library_folder).pack(side="left", padx=(8, 0))
         ttk.Button(league_actions, text="Delete selected", command=self.delete_selected_league_library_entries).pack(side="left", padx=(8, 0))
+        league_preview_box = ttk.LabelFrame(league_library_box, text="League decal preview", padding=8)
+        league_preview_box.grid(row=2, column=0, sticky="nsew", pady=(10, 0))
+        league_preview_box.columnconfigure(1, weight=1)
+        league_preview_controls = ttk.Frame(league_preview_box)
+        league_preview_controls.grid(row=0, column=0, columnspan=2, sticky="ew")
+        ttk.Label(league_preview_controls, text="League").pack(side="left")
+        self.league_preview_league_combo = ttk.Combobox(
+            league_preview_controls, textvariable=self.league_preview_league_var, width=8
+        )
+        self.league_preview_league_combo.pack(side="left", padx=(6, 12))
+        self.league_preview_league_combo.bind("<<ComboboxSelected>>", lambda _event: self._update_league_preview_cars())
+        ttk.Label(league_preview_controls, text="Car").pack(side="left")
+        self.league_preview_car_combo = ttk.Combobox(
+            league_preview_controls, textvariable=self.league_preview_car_var, width=30
+        )
+        self.league_preview_car_combo.pack(side="left", padx=(6, 12))
+        ttk.Label(league_preview_controls, text="Class").pack(side="left")
+        ttk.Entry(league_preview_controls, textvariable=self.league_preview_class_var, width=16).pack(side="left", padx=(6, 12))
+        ttk.Label(league_preview_controls, text="Driver ID").pack(side="left")
+        ttk.Entry(league_preview_controls, textvariable=self.league_preview_driver_var, width=10).pack(side="left", padx=(6, 0))
+        league_preview_actions = ttk.Frame(league_preview_box)
+        league_preview_actions.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        ttk.Button(league_preview_actions, text="Preview decal", command=self.preview_league_decal).pack(side="left")
+        ttk.Button(league_preview_actions, text="Choose paint TGA…", command=self.choose_league_preview_paint).pack(side="left", padx=(8, 0))
+        ttk.Button(league_preview_actions, text="Export PNGs…", command=self.export_league_library_pngs).pack(side="left", padx=(8, 0))
+        ttk.Label(league_preview_actions, textvariable=self.league_preview_paint_var, foreground="#555555").pack(side="left", padx=(12, 0))
+        self.league_preview_panel = PaintPreviewPanel(league_preview_box, app=self)
+        self.league_preview_panel.grid(row=2, column=0, columnspan=2, sticky="nsew", pady=(8, 0))
         ttk.Label(
             league_library_box,
             text="Applied automatically in sessions of the same league.",
             foreground="#555555",
             justify="left",
             wraplength=920,
-        ).grid(row=2, column=0, sticky="w", pady=(8, 0))
+        ).grid(row=3, column=0, sticky="w", pady=(8, 0))
         ttk.Label(
             league_library_box,
             textvariable=self.league_library_status_var,
             foreground="#555555",
             justify="left",
             wraplength=920,
-        ).grid(row=3, column=0, sticky="w", pady=(4, 0))
+        ).grid(row=4, column=0, sticky="w", pady=(4, 0))
         self._refresh_league_library_tree()
 
         self._build_tp_download_page(tp_download_page)
@@ -31706,6 +32320,60 @@ class DownloaderUI:
             self.session_driver_action_summary_var.set(
                 f"{len(contexts)} drivers selected | actions apply to compatible selected rows."
             )
+    def _toggle_session_conditions(self) -> None:
+        self._session_conditions_expanded = not self._session_conditions_expanded
+        try:
+            if self._session_conditions_expanded:
+                self.session_conditions_body.grid()
+                self.session_conditions_toggle.configure(text="Hide")
+            else:
+                self.session_conditions_body.grid_remove()
+                self.session_conditions_toggle.configure(text="Show")
+        except Exception:
+            logging.debug("Could not toggle the session conditions frame", exc_info=True)
+        self._refresh_page_scroll_regions()
+
+    def _refresh_session_conditions(self, snapshot: RuntimeSnapshot | None = None) -> None:
+        if snapshot is None:
+            snapshot = self._cached_runtime_snapshot
+        if snapshot is None:
+            try:
+                snapshot = self.service.get_runtime_snapshot()
+            except Exception:
+                snapshot = None
+        values = session_condition_values(snapshot.current_session if snapshot is not None else None)
+        for field_key, variable in self.session_condition_vars.items():
+            try:
+                variable.set(values.get(field_key, SESSION_CONDITION_UNKNOWN))
+            except Exception:
+                logging.debug("Could not update the session condition %s", field_key, exc_info=True)
+
+    def _refresh_field_status(self, snapshot: RuntimeSnapshot | None = None) -> None:
+        if snapshot is None:
+            snapshot = self._cached_runtime_snapshot
+        if snapshot is None:
+            try:
+                snapshot = self.service.get_runtime_snapshot()
+            except Exception:
+                snapshot = None
+        session = snapshot.current_session if snapshot is not None else None
+        rows = list(snapshot.session_rows) if snapshot is not None else []
+        sof = session_strength_of_field(session)
+        drivers = session_driver_count(session)
+        without_livery = session_without_livery_count(rows)
+        done, total = session_paint_progress(rows)
+        sdk_state = "connected" if session is not None else "waiting"
+        tp_state = "ready" if tp_fetch_hosts_available() else "offline"
+        try:
+            self.field_sof_var.set(f"SOF {sof}" if sof > 0 else f"SOF {SESSION_CONDITION_UNKNOWN}")
+            self.field_drivers_var.set(f"Drivers {drivers}")
+            self.field_livery_var.set(f"{without_livery} without livery")
+            self.field_files_var.set(f"Files {done}/{total}")
+            self.field_links_var.set(f"TP {tp_state} • SDK {sdk_state}")
+            self.field_progress_var.set((done / total * 100.0) if total > 0 else 0.0)
+        except Exception:
+            logging.debug("Could not update the field status bar", exc_info=True)
+
     def _refresh_session_tree(self, snapshot: RuntimeSnapshot | None = None) -> None:
         if snapshot is None:
             snapshot = self.service.get_runtime_snapshot()
@@ -33476,6 +34144,8 @@ class DownloaderUI:
                 self._append_log(
                     "Another copy of Nishizumi Paints is running the downloader, so this window does not start a second one."
                 )
+        self._refresh_field_status()
+        self._refresh_session_conditions()
         return True
 
     def _claim_single_instance(self) -> bool:
@@ -34468,6 +35138,312 @@ class DownloaderUI:
     def clear_downloaded_now(self) -> None:
         self._append_log("Manual clear requested.")
         self.service.request_clear_current_downloads()
+
+    def purge_all_downloaded_paints(self) -> None:
+        if self._purge_in_progress:
+            self._append_log("A paint purge is already running.")
+            return
+        snapshot = self.service.get_runtime_snapshot()
+        if snapshot.current_session is not None and session_processing_active(snapshot.session_rows):
+            self.messagebox.showinfo(
+                APP_NAME,
+                "Wait until the current session has finished processing before deleting all downloaded paints.",
+                parent=self.root,
+            )
+            return
+        session = snapshot.current_session
+        own_member_id = int(session.local_user_id or 0) if session is not None else 0
+        own_team_id = int(session.local_team_id or 0) if session is not None else 0
+        if own_member_id <= 0:
+            own_member_id, _source = resolve_iracing_ui_preview_member_id(self.config)
+        paints_dir = default_paints_dir(self.config)
+        protected = iracing_ui_preview_protected_paths()
+        self._purge_in_progress = True
+        self.status_var.set("Checking downloaded paints…")
+
+        def _worker() -> None:
+            try:
+                files = select_purge_files(
+                    paints_dir,
+                    own_member_id=own_member_id,
+                    own_team_id=own_team_id,
+                    protected_paths=protected,
+                )
+                count, size = purge_file_stats(files)
+            except Exception as exc:  # noqa: BLE001
+                logging.warning("Could not inspect the paint folder for a purge: %s", exc)
+                error_text = str(exc)
+                self.root.after(0, lambda: self._finish_purge(0, 0, error_text))
+                return
+            self.root.after(0, lambda: self._confirm_purge_files(files, count, size, paints_dir))
+
+        threading.Thread(target=_worker, name="NishizumiPaintPurgeScan", daemon=True).start()
+
+    def _confirm_purge_files(self, files: list[Path], count: int, size: int, paints_dir: Path) -> None:
+        if not files:
+            self._finish_purge(0, 0, "")
+            return
+        message = (
+            f"Delete {count} downloaded paint file(s) ({format_folder_size(size)}) from:\n\n"
+            f"{paints_dir}\n\n"
+            "Your own paints, iRacing UI preview files and unrecognised files are kept."
+        )
+        try:
+            confirmed = self.messagebox.askyesno(APP_NAME, message, parent=self.root)
+        except Exception:
+            confirmed = False
+        if not confirmed:
+            self._purge_in_progress = False
+            self.status_var.set("Purge cancelled.")
+            return
+        self.status_var.set(f"Deleting {count} downloaded paint file(s)…")
+
+        def _worker() -> None:
+            removed = 0
+            freed = 0
+            failed = 0
+            for path in files:
+                try:
+                    size_bytes = int(path.stat().st_size)
+                except OSError:
+                    size_bytes = 0
+                if _hard_delete_file(path, paints_root=paints_dir):
+                    removed += 1
+                    freed += size_bytes
+                else:
+                    failed += 1
+            self.root.after(0, lambda: self._finish_purge(removed, freed, "" if not failed else f"{failed} file(s) could not be deleted"))
+
+        threading.Thread(target=_worker, name="NishizumiPaintPurge", daemon=True).start()
+
+    def _finish_purge(self, removed: int, freed: int, error: str) -> None:
+        self._purge_in_progress = False
+        if error:
+            self.status_var.set("Purge finished with errors.")
+            self._append_log(f"Paint purge: removed {removed} file(s), {format_folder_size(freed)}; {error}.")
+            return
+        if removed <= 0:
+            self.status_var.set("No downloaded paints to delete.")
+            self._append_log("Paint purge found no files to delete.")
+            return
+        self.status_var.set(f"Deleted {removed} downloaded paint file(s).")
+        self._append_log(f"Paint purge removed {removed} file(s) ({format_folder_size(freed)}).")
+        self._refresh_session_tree()
+
+    def open_tags_forbidden_manager(self) -> None:
+        existing = self._manager_window
+        try:
+            if existing is not None and existing.winfo_exists():
+                existing.deiconify()
+                existing.lift()
+                existing.focus_force()
+                return
+        except Exception:
+            self._manager_window = None
+        ttk = self.ttk
+        window = self.tk.Toplevel(self.root)
+        window.title("Tags & forbidden paints")
+        window.geometry("980x620")
+        window.transient(self.root)
+        window.columnconfigure(0, weight=1)
+        window.rowconfigure(0, weight=1)
+        self._manager_window = window
+        notebook = ttk.Notebook(window)
+        notebook.grid(row=0, column=0, sticky="nsew", padx=10, pady=(10, 0))
+
+        tag_tab = ttk.Frame(notebook, padding=8)
+        theme_tab = ttk.Frame(notebook, padding=8)
+        forbidden_tab = ttk.Frame(notebook, padding=8)
+        notebook.add(tag_tab, text="Tagged drivers")
+        notebook.add(theme_tab, text="Theme files")
+        notebook.add(forbidden_tab, text="Forbidden paints")
+
+        tag_tab.columnconfigure(0, weight=1)
+        tag_tab.rowconfigure(0, weight=1)
+        self._manager_tag_tree = ttk.Treeview(tag_tab, columns=("id", "name", "theme"), show="headings", selectmode="extended")
+        for column, label, width in (("id", "iRacing ID", 110), ("name", "Name", 260), ("theme", "Theme", 240)):
+            self._manager_tag_tree.heading(column, text=label)
+            self._manager_tag_tree.column(column, width=width, anchor="w" if column != "id" else "e")
+        self._manager_tag_tree.grid(row=0, column=0, sticky="nsew")
+        tag_scroll = ttk.Scrollbar(tag_tab, orient="vertical", command=self._manager_tag_tree.yview)
+        tag_scroll.grid(row=0, column=1, sticky="ns")
+        self._manager_tag_tree.configure(yscrollcommand=tag_scroll.set)
+        tag_actions = ttk.Frame(tag_tab)
+        tag_actions.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        ttk.Button(tag_actions, text="Remove tag", command=self.remove_selected_manager_tag).pack(side="left")
+        ttk.Button(tag_actions, text="Refresh", command=self._load_manager_tables).pack(side="left", padx=(8, 0))
+
+        theme_tab.columnconfigure(0, weight=1)
+        theme_tab.rowconfigure(0, weight=1)
+        self._manager_theme_tree = ttk.Treeview(
+            theme_tab, columns=("theme", "car", "type", "file"), show="headings", selectmode="browse"
+        )
+        for column, label, width in (
+            ("theme", "Theme", 180),
+            ("car", "Car", 240),
+            ("type", "Type", 90),
+            ("file", "File", 420),
+        ):
+            self._manager_theme_tree.heading(column, text=label)
+            self._manager_theme_tree.column(column, width=width, anchor="w")
+        self._manager_theme_tree.grid(row=0, column=0, sticky="nsew")
+        theme_scroll = ttk.Scrollbar(theme_tab, orient="vertical", command=self._manager_theme_tree.yview)
+        theme_scroll.grid(row=0, column=1, sticky="ns")
+        self._manager_theme_tree.configure(yscrollcommand=theme_scroll.set)
+        theme_actions = ttk.Frame(theme_tab)
+        theme_actions.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        ttk.Button(theme_actions, text="Open themes folder", command=self.open_tag_themes_folder).pack(side="left")
+        ttk.Button(theme_actions, text="Refresh", command=self._load_manager_tables).pack(side="left", padx=(8, 0))
+
+        forbidden_tab.columnconfigure(0, weight=1)
+        forbidden_tab.rowconfigure(0, weight=1)
+        self._manager_forbidden_tree = ttk.Treeview(
+            forbidden_tab, columns=("target", "kind", "car", "name"), show="headings", selectmode="extended"
+        )
+        for column, label, width in (
+            ("target", "Target", 130),
+            ("kind", "Kind", 90),
+            ("car", "Car", 280),
+            ("name", "Name", 300),
+        ):
+            self._manager_forbidden_tree.heading(column, text=label)
+            self._manager_forbidden_tree.column(column, width=width, anchor="w")
+        self._manager_forbidden_tree.grid(row=0, column=0, sticky="nsew")
+        forbidden_scroll = ttk.Scrollbar(forbidden_tab, orient="vertical", command=self._manager_forbidden_tree.yview)
+        forbidden_scroll.grid(row=0, column=1, sticky="ns")
+        self._manager_forbidden_tree.configure(yscrollcommand=forbidden_scroll.set)
+        forbidden_actions = ttk.Frame(forbidden_tab)
+        forbidden_actions.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        ttk.Button(forbidden_actions, text="Allow", command=self.allow_selected_manager_paints).pack(side="left")
+        ttk.Button(forbidden_actions, text="Refresh", command=self._load_manager_tables).pack(side="left", padx=(8, 0))
+
+        self._manager_status_var = self.tk.StringVar(value="Loading stored tags and paints…")
+        ttk.Label(window, textvariable=self._manager_status_var, foreground="#555555").grid(
+            row=1, column=0, sticky="ew", padx=10, pady=(6, 10)
+        )
+        window.protocol("WM_DELETE_WINDOW", self._close_tags_forbidden_manager)
+        self._load_manager_tables()
+
+    def _close_tags_forbidden_manager(self) -> None:
+        window = self._manager_window
+        self._manager_window = None
+        try:
+            if window is not None:
+                window.destroy()
+        except Exception:
+            logging.debug("Could not close the tags & forbidden manager", exc_info=True)
+
+    def _load_manager_tables(self) -> None:
+        if self._manager_loading:
+            return
+        self._manager_loading = True
+        try:
+            self._manager_status_var.set("Loading stored tags and paints…")
+        except Exception:
+            pass
+
+        def _worker() -> None:
+            try:
+                people = load_people()
+                themes = load_tag_themes()
+                forbidden = load_forbidden_tp_paints()
+                rows = build_manager_tables(people, themes, forbidden)
+                error = ""
+            except Exception as exc:  # noqa: BLE001
+                logging.warning("Could not load the tags & forbidden manager: %s", exc)
+                rows = ([], [], [])
+                error = str(exc)
+            self.root.after(0, lambda: self._populate_manager_tables(*rows, error))
+
+        threading.Thread(target=_worker, name="NishizumiManagerLoad", daemon=True).start()
+
+    def _populate_manager_tables(
+        self,
+        tag_rows: list[ManagerTagRow],
+        theme_rows: list[ManagerThemeRow],
+        forbidden_rows: list[ManagerForbiddenRow],
+        error: str,
+    ) -> None:
+        self._manager_loading = False
+        window = self._manager_window
+        try:
+            if window is None or not window.winfo_exists():
+                return
+        except Exception:
+            return
+        self._manager_tag_rows = list(tag_rows)
+        self._manager_theme_rows = list(theme_rows)
+        self._manager_forbidden_rows = list(forbidden_rows)
+        for tree, rows in (
+            (self._manager_tag_tree, [
+                (row.member_id, row.name or "-", row.theme) for row in self._manager_tag_rows
+            ]),
+            (self._manager_theme_tree, [
+                (row.theme, row.car_folder or "-", row.file_type, str(row.path)) for row in self._manager_theme_rows
+            ]),
+            (self._manager_forbidden_tree, [
+                (row.target_label, row.kind, row.car_label, row.display_name or "-") for row in self._manager_forbidden_rows
+            ]),
+        ):
+            for iid in tree.get_children():
+                tree.delete(iid)
+            for index, values in enumerate(rows):
+                tree.insert("", "end", iid=str(index), values=values)
+        if error:
+            self._manager_status_var.set(f"Could not load stored data: {error}")
+        else:
+            self._manager_status_var.set(
+                f"{len(self._manager_tag_rows)} tagged driver(s), {len(self._manager_theme_rows)} theme file(s), "
+                f"{len(self._manager_forbidden_rows)} forbidden paint(s)."
+            )
+
+    def remove_selected_manager_tag(self) -> None:
+        selection = list(self._manager_tag_tree.selection())
+        rows = [self._manager_tag_rows[int(iid)] for iid in selection if iid.isdigit() and int(iid) < len(self._manager_tag_rows)]
+        if not rows:
+            self._manager_status_var.set("Select a tagged driver to remove.")
+            return
+        self._manager_status_var.set(f"Removing {len(rows)} tag(s)…")
+
+        def _worker() -> None:
+            for row in rows:
+                try:
+                    set_tag(row.member_id, "")
+                except Exception as exc:  # noqa: BLE001
+                    logging.warning("Could not remove the tag for %s: %s", row.member_id, exc)
+            self.root.after(0, self._load_manager_tables)
+
+        threading.Thread(target=_worker, name="NishizumiManagerRemoveTag", daemon=True).start()
+
+    def allow_selected_manager_paints(self) -> None:
+        selection = list(self._manager_forbidden_tree.selection())
+        rows = [
+            self._manager_forbidden_rows[int(iid)]
+            for iid in selection
+            if iid.isdigit() and int(iid) < len(self._manager_forbidden_rows)
+        ]
+        if not rows:
+            self._manager_status_var.set("Select a forbidden paint to allow.")
+            return
+        self._manager_status_var.set(f"Allowing {len(rows)} paint(s)…")
+
+        def _worker() -> None:
+            for row in rows:
+                try:
+                    set_tp_paint_forbidden(
+                        row.target_kind,
+                        row.target_id,
+                        row.kind,
+                        row.directory,
+                        row.display_name,
+                        False,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logging.warning("Could not allow the paint %s: %s", row.key, exc)
+            self.root.after(0, self._load_manager_tables)
+
+        threading.Thread(target=_worker, name="NishizumiManagerAllowPaint", daemon=True).start()
+
     def trigger_global_reload_now(self) -> None:
         self._append_log("Manual global texture reload requested.")
         self.service.request_global_texture_reload()
@@ -34822,6 +35798,160 @@ class DownloaderUI:
         status_var = getattr(self, "league_library_status_var", None)
         if status_var is not None:
             status_var.set(f"{len(entries)} file(s) in {default_league_library_dir()}.")
+        self._refresh_league_preview_choices()
+
+    def _refresh_league_preview_choices(self) -> None:
+        entries = list(getattr(self, "_league_library_entries", []) or [])
+        leagues = sorted({str(entry.league_id) for entry in entries}, key=lambda value: int(value))
+        combo = getattr(self, "league_preview_league_combo", None)
+        if combo is not None:
+            combo.configure(values=leagues)
+        current = str(self.league_preview_league_var.get() or "").strip()
+        if not current and leagues:
+            default_league = self._league_library_default_league_id()
+            current = str(default_league) if default_league > 0 and str(default_league) in leagues else leagues[0]
+            self.league_preview_league_var.set(current)
+        self._update_league_preview_cars()
+
+    def _update_league_preview_cars(self) -> None:
+        entries = list(getattr(self, "_league_library_entries", []) or [])
+        try:
+            league_id = int(str(self.league_preview_league_var.get() or "").strip())
+        except (TypeError, ValueError):
+            league_id = 0
+        cars = sorted(
+            {entry.car_folder for entry in entries if int(entry.league_id) == league_id and entry.car_folder},
+            key=str.casefold,
+        )
+        combo = getattr(self, "league_preview_car_combo", None)
+        if combo is not None:
+            combo.configure(values=cars)
+        if str(self.league_preview_car_var.get() or "").strip() not in cars:
+            self.league_preview_car_var.set(cars[0] if cars else "")
+
+    def preview_league_decal(self) -> None:
+        try:
+            league_id = int(str(self.league_preview_league_var.get() or "").strip())
+        except (TypeError, ValueError):
+            league_id = 0
+        car_folder = str(self.league_preview_car_var.get() or "").strip()
+        if league_id <= 0 or not car_folder:
+            self.league_library_status_var.set("Choose a league and a car to preview its decal.")
+            return
+        try:
+            member_id = int(str(self.league_preview_driver_var.get() or "0").strip() or "0")
+        except (TypeError, ValueError):
+            member_id = 0
+        selection = league_preview_selection(
+            list(getattr(self, "_league_library_entries", []) or []),
+            league_id,
+            car_folder,
+            car_class=str(self.league_preview_class_var.get() or "").strip(),
+            member_id=member_id,
+            paint_path=self._league_preview_paint_path,
+        )
+        if selection.decal_path is None:
+            self.league_library_status_var.set("No league decal was found for that league and car.")
+            return
+        if selection.paint_path is None:
+            self.league_library_status_var.set("No paint TGA was found; use Choose paint TGA… first.")
+            return
+        try:
+            self.league_preview_panel.show(
+                selection.paint_path,
+                decal_tga=selection.decal_path,
+                car_path=selection.car_folder,
+                member_id=selection.member_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("Could not preview the league decal: %s", exc)
+            self.league_library_status_var.set(f"Could not preview the league decal: {exc}")
+            return
+        self.league_library_status_var.set(
+            f"Previewing {selection.decal_path.name} over {selection.paint_path.name}."
+        )
+
+    def choose_league_preview_paint(self) -> None:
+        try:
+            selected = self.filedialog.askopenfilename(
+                title="Choose a paint TGA for the league decal preview",
+                filetypes=[("TGA paint files", "*.tga"), ("All files", "*.*")],
+                parent=self.root,
+            )
+        except Exception as exc:
+            self.league_library_status_var.set(f"Could not open the paint chooser: {exc}")
+            return
+        if not selected:
+            return
+        self._league_preview_paint_path = Path(selected)
+        self.league_preview_paint_var.set(f"Paint TGA: {self._league_preview_paint_path.name}")
+
+    def export_league_library_pngs(self) -> None:
+        try:
+            league_id = int(str(self.league_preview_league_var.get() or "0").strip() or "0")
+        except (TypeError, ValueError):
+            league_id = 0
+        try:
+            destination = self.filedialog.askdirectory(
+                title="Choose a folder for the league PNGs",
+                parent=self.root,
+            )
+        except Exception as exc:
+            self.league_library_status_var.set(f"Could not open the folder chooser: {exc}")
+            return
+        if not destination:
+            return
+        destination_dir = Path(destination)
+        self.league_library_status_var.set("Exporting league PNGs…")
+
+        def _worker() -> None:
+            if not iracing_render_service_available():
+                self.root.after(
+                    0,
+                    lambda: self._finish_league_export(
+                        destination_dir, 0, 0, "The iRacing UI render service is unavailable, so no PNGs were exported."
+                    ),
+                )
+                return
+            rendered = 0
+            skipped = 0
+            temp_dir = Path(tempfile.mkdtemp(prefix="nishizumi-league-export-"))
+            try:
+                destination_dir.mkdir(parents=True, exist_ok=True)
+                entries = load_league_library(default_league_library_dir())
+                jobs = league_export_jobs(entries, league_id=league_id)
+                for job in jobs:
+                    if job.decal_path is None:
+                        skipped += 1
+                        continue
+                    merged = temp_dir / f"{job.member_id}_{uuid.uuid4().hex}.tga"
+                    source = job.paint_path
+                    if merge_decal_onto_tga(job.paint_path, job.decal_path, merged) is not None:
+                        source = merged
+                    url = iracing_render_url("car", source, car_path=job.car_folder)
+                    if fetch_iracing_render_png(url, destination_dir / job.file_name) is not None:
+                        rendered += 1
+                    else:
+                        skipped += 1
+            except Exception as exc:  # noqa: BLE001
+                logging.warning("Could not export league PNGs: %s", exc)
+                error_text = str(exc)
+                self.root.after(0, lambda: self._finish_league_export(destination_dir, rendered, skipped, error_text))
+                return
+            finally:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+            self.root.after(0, lambda: self._finish_league_export(destination_dir, rendered, skipped, ""))
+
+        threading.Thread(target=_worker, name="NishizumiLeagueExport", daemon=True).start()
+
+    def _finish_league_export(self, destination: Path, rendered: int, skipped: int, error: str) -> None:
+        if error:
+            self.league_library_status_var.set(error)
+            return
+        message = f"Exported {rendered} league PNG(s) to {destination}."
+        if skipped:
+            message += f" {skipped} job(s) were skipped."
+        self.league_library_status_var.set(message)
 
     def _league_library_default_league_id(self) -> int:
         try:
