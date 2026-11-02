@@ -99,6 +99,15 @@ TP_SAFE_MANIFEST_WORKER_CAP = 16
 TP_SAFE_DOWNLOAD_WORKER_CAP = 32
 TP_SAFE_SAVE_WORKER_CAP = 16
 TP_UNAVAILABLE_DOWNLOAD_STATUS_CODES = {401, 403, 404}
+# Trading Paints answers one fetch.php request for every driver in the list field.
+# The official client sends the whole field at once; 64 drivers keeps a request and
+# its XML answer comfortably small without adding round trips for a normal field.
+TP_BATCH_MANIFEST_CHUNK_SIZE = 64
+# Asset downloads normally come from dl.tradingpaints.gg; dl1 is the alternate CDN
+# node the official client intended to fall back to.
+TP_ALTERNATE_ASSET_HOST = "dl1.tradingpaints.gg"
+TP_ASSET_HOST_SUFFIX = ".tradingpaints.gg"
+TP_NON_ASSET_HOSTS = frozenset({"fetch.tradingpaints.gg", "www.tradingpaints.gg", "update.tradingpaints.gg"})
 # A 12-16 MB AI paint can take much longer than 30 s when Trading Paints is busy.
 TP_PAINT_DOWNLOAD_TIMEOUT_SECONDS = 120.0
 TP_RECENT_SCHEMES_FILENAME = ".nishizumi_tp_recent_schemes.json"
@@ -2163,6 +2172,36 @@ def session_user_is_local_target(session: Session | None, user: SessionUser | No
         and user.team_id is not None
         and int(user.team_id) == int(session.local_team_id)
     )
+
+def session_local_target_keys(session: Session | None) -> set[tuple[str, int, str]]:
+    if session is None:
+        return set()
+    return {
+        user.effective_target_key()
+        for user in session.users
+        if session_user_is_local_target(session, user)
+    }
+
+def order_session_targets(
+    users: Iterable[SessionUser],
+    on_track_car_idxs: set[int],
+    local_keys: Iterable[tuple[str, int, str]],
+) -> list[SessionUser]:
+    """Order download work: cars in the world first, garage cars next, own targets last.
+
+    The sort is stable, so when telemetry is unavailable the caller's order (today,
+    user id) is kept apart from moving the local user's targets to the end.
+    """
+    local = set(local_keys or ())
+    on_track = {int(index) for index in (on_track_car_idxs or ())}
+    def _rank(user: SessionUser) -> int:
+        if user.effective_target_key() in local:
+            return 2
+        if user.car_idx is not None and int(user.car_idx) in on_track:
+            return 0
+        return 1
+    return sorted(list(users or ()), key=_rank)
+
 @dataclass(frozen=True)
 class Session:
     session_id: SessionId
@@ -19719,6 +19758,42 @@ def _matches_context_manifest_entry(user: SessionUser, car: ET.Element) -> bool:
     if session_user_uses_team_target(user):
         return manifest_user == expected_user or manifest_team == expected_team
     return manifest_user == expected_user and manifest_team == expected_team
+
+def _context_download_file_for_car(user: SessionUser, car: ET.Element) -> DownloadFile | None:
+    file_url = (car.findtext("file") or '').strip()
+    type_raw = (car.findtext("type") or '').strip().lower()
+    directory = (car.findtext("directory") or '').strip()
+    team_id_text = (car.findtext("teamid") or "0").strip() or "0"
+    if not file_url or not type_raw:
+        return None
+    _observe_tp_manifest_directory(directory)
+    if not directory and type_raw.startswith("car"):
+        return None
+    try:
+        paint_type = PaintType(type_raw)
+    except ValueError:
+        logging.debug(
+            "Skipping unknown contextual paint type '%s' for user %s",
+            type_raw,
+            user.user_id,
+        )
+        return None
+    response_team_id = _to_int_or_none(team_id_text)
+    is_team_paint = bool(response_team_id and response_team_id > 0 and paint_type in TEAM_PAINT_TYPES)
+    target_user_id = int(response_team_id) if is_team_paint else user.user_id
+    target_directory = directory or user.directory
+    return DownloadFile(
+        download_id=DownloadId(
+            user_id=target_user_id,
+            directory=target_directory,
+            paint_type=paint_type,
+            is_team_paint=is_team_paint,
+            is_superspeedway_variant=_manifest_file_url_is_superspeedway_variant(file_url, paint_type),
+            ext=_manifest_entry_ext(car),
+        ),
+        url=file_url,
+        expected_size=_manifest_entry_size(car),
+    )
 _WINDOWS_RESERVED_FILE_NAMES = frozenset(
     {"con", "prn", "aux", "nul"} | {f"com{i}" for i in range(1, 10)} | {f"lpt{i}" for i in range(1, 10)}
 )
@@ -21391,42 +21466,9 @@ def fetch_context_files(
                 for car in root.findall(".//Car"):
                     if not _matches_context_manifest_entry(user, car):
                         continue
-                    file_url = (car.findtext("file") or '').strip()
-                    type_raw = (car.findtext("type") or '').strip().lower()
-                    directory = (car.findtext("directory") or '').strip()
-                    team_id_text = (car.findtext("teamid") or "0").strip() or "0"
-                    if not file_url or not type_raw:
-                        continue
-                    _observe_tp_manifest_directory(directory)
-                    if not directory and type_raw.startswith("car"):
-                        continue
-                    try:
-                        paint_type = PaintType(type_raw)
-                    except ValueError:
-                        logging.debug(
-                            "Skipping unknown contextual paint type '%s' for user %s",
-                            type_raw,
-                            user.user_id,
-                        )
-                        continue
-                    response_team_id = _to_int_or_none(team_id_text)
-                    is_team_paint = bool(response_team_id and response_team_id > 0 and paint_type in TEAM_PAINT_TYPES)
-                    target_user_id = int(response_team_id) if is_team_paint else user.user_id
-                    target_directory = directory or user.directory
-                    files.append(
-                        DownloadFile(
-                            download_id=DownloadId(
-                                user_id=target_user_id,
-                                directory=target_directory,
-                                paint_type=paint_type,
-                                is_team_paint=is_team_paint,
-                                is_superspeedway_variant=_manifest_file_url_is_superspeedway_variant(file_url, paint_type),
-                                ext=_manifest_entry_ext(car),
-                            ),
-                            url=file_url,
-                            expected_size=_manifest_entry_size(car),
-                        )
-                    )
+                    item = _context_download_file_for_car(user, car)
+                    if item is not None:
+                        files.append(item)
                 if files:
                     logging.debug(
                         "Context fetch succeeded for user %s via %s with %s file(s) (list=%s)",
@@ -21466,6 +21508,120 @@ def fetch_context_files(
                     time.sleep(delay)
     assert last_exc is not None
     raise last_exc
+
+def _chunk_session_users(
+    users: Iterable[SessionUser],
+    chunk_size: int = TP_BATCH_MANIFEST_CHUNK_SIZE,
+) -> list[list[SessionUser]]:
+    ordered = list(users or ())
+    size = max(1, int(chunk_size))
+    return [ordered[index:index + size] for index in range(0, len(ordered), size)]
+
+def _build_fetch_context_payload_batch(
+    session: Session,
+    users: Iterable[SessionUser],
+    superspeedway_variant: bool = False,
+) -> dict[str, str] | None:
+    context = session.trading_paints_context()
+    user_list = list(users or ())
+    if context is None or not user_list:
+        return None
+    payload = dict(context)
+    # The official client sends every driver in one comma-separated list field.
+    payload["list"] = ",".join(user.trading_paints_list_value() for user in user_list)
+    if superspeedway_variant and session.is_superspeedway_track:
+        payload["ss"] = "1"
+    return payload
+
+def _assign_context_manifest_entries(users: Iterable[SessionUser], root: ET.Element) -> dict[tuple[str, int, str], list[DownloadFile]]:
+    user_list = list(users or ())
+    assigned: dict[tuple[str, int, str], list[DownloadFile]] = {
+        user.effective_target_key(): [] for user in user_list
+    }
+    for car in root.findall(".//Car"):
+        for user in user_list:
+            if not _matches_context_manifest_entry(user, car):
+                continue
+            item = _context_download_file_for_car(user, car)
+            if item is not None:
+                assigned[user.effective_target_key()].append(item)
+    return assigned
+
+def _fetch_context_manifest_batch_chunk(
+    users: list[SessionUser],
+    payload: dict[str, str],
+    retries: int,
+    retry_backoff_seconds: float,
+    cancel_event: threading.Event | None = None,
+) -> dict[tuple[str, int, str], list[DownloadFile]] | None:
+    last_exc: Exception | None = None
+    urls = tp_fetch_context_urls()
+    for url_index, url in enumerate(urls):
+        for attempt in range(1, retries + 1):
+            if _cancel_requested(cancel_event):
+                return None
+            try:
+                http = get_thread_http_session()
+                resp = http.post(url, data=payload, timeout=30)
+                resp.raise_for_status()
+                root = _parse_tp_manifest_xml(resp.text)
+                _note_tp_fetch_url_result(url, None)
+                return _assign_context_manifest_entries(users, root)
+            except (requests.RequestException, ET.ParseError, RuntimeError) as exc:
+                last_exc = exc
+                unreachable = _note_tp_fetch_url_result(url, exc, exhausted=attempt >= retries)
+                if attempt >= retries or (unreachable and url_index + 1 < len(urls)):
+                    break
+                delay = compute_retry_delay(retry_backoff_seconds, attempt)
+                if cancel_event is not None:
+                    cancel_event.wait(delay)
+                else:
+                    time.sleep(delay)
+    logging.debug("Batched context manifest fetch failed for %s driver(s): %s", len(users), last_exc)
+    return None
+
+def fetch_context_files_batch(
+    session: Session,
+    users: Iterable[SessionUser],
+    retries: int,
+    retry_backoff_seconds: float,
+    cancel_event: threading.Event | None = None,
+    superspeedway_variant: bool = False,
+) -> dict[tuple[str, int, str], list[DownloadFile]]:
+    """Fetch every driver's context manifest with as few fetch.php requests as possible.
+
+    The returned mapping only contains drivers the server answered with at least one
+    usable file. Everything else (a failed chunk or an empty entry) is left to the
+    unchanged per-driver path.
+    """
+    user_list = list(users or ())
+    if not user_list or session.trading_paints_context() is None:
+        return {}
+    answered: dict[tuple[str, int, str], list[DownloadFile]] = {}
+    for chunk in _chunk_session_users(user_list):
+        payload = _build_fetch_context_payload_batch(session, chunk, superspeedway_variant=superspeedway_variant)
+        if payload is None:
+            break
+        assigned = _fetch_context_manifest_batch_chunk(
+            chunk,
+            payload,
+            retries,
+            retry_backoff_seconds,
+            cancel_event=cancel_event,
+        )
+        if assigned is None:
+            continue
+        for user in chunk:
+            files = assigned.get(user.effective_target_key()) or []
+            if not files:
+                continue
+            # On a superspeedway the per-driver path retries the regular manifest when
+            # the _ss answer has no car asset, so leave that decision to it.
+            if superspeedway_variant and session.is_superspeedway_track and not _manifest_has_car_related_items(files):
+                continue
+            answered[user.effective_target_key()] = files
+    return answered
+
 def _apply_special_variant_flags(session: Session, user: SessionUser, items: list[DownloadFile]) -> list[DownloadFile]:
     _ = user
     return _select_manifest_variants_for_session(session, items)
@@ -21542,6 +21698,7 @@ def fetch_best_manifest_files(
     retry_backoff_seconds: float,
     ai_rosters_dir: Path | None = None,
     cancel_event: threading.Event | None = None,
+    prefetched_manifest: dict[tuple[str, int, str], list[DownloadFile]] | None = None,
 ) -> list[DownloadFile]:
     if _cancel_requested(cancel_event):
         return []
@@ -21555,6 +21712,10 @@ def fetch_best_manifest_files(
             user.user_id,
         )
         return []
+    if prefetched_manifest is not None:
+        target_key = user.effective_target_key()
+        if target_key in prefetched_manifest:
+            return _select_manifest_variants_for_session(session, list(prefetched_manifest[target_key]))
     context = session.trading_paints_context()
     if context is None:
         logging.debug(
@@ -22334,6 +22495,46 @@ def _select_team_session_downloads(
     if fallback_items:
         fallback_items = _select_manifest_variants_for_session(session, fallback_items)
     return team_items + fallback_items, applied_slots, still_missing_slots + disabled_missing_slots, cached_slots
+def alternate_tp_asset_url(url: str) -> str | None:
+    """The alternate Trading Paints CDN URL for an asset, or None for any other host."""
+    try:
+        parsed = urllib.parse.urlsplit(str(url or ""))
+    except ValueError:
+        return None
+    if parsed.scheme not in ("http", "https"):
+        return None
+    host = (parsed.hostname or "").lower()
+    if not host or host == TP_ALTERNATE_ASSET_HOST:
+        return None
+    if not host.endswith(TP_ASSET_HOST_SUFFIX) or host in TP_NON_ASSET_HOSTS:
+        return None
+    try:
+        port = f":{parsed.port}" if parsed.port is not None else ""
+    except ValueError:
+        return None
+    return urllib.parse.urlunsplit(parsed._replace(netloc=f"{TP_ALTERNATE_ASSET_HOST}{port}"))
+
+def _tp_download_error_allows_alternate(exc: BaseException | None) -> bool:
+    if isinstance(exc, (requests.ConnectionError, requests.Timeout)):
+        return True
+    response = getattr(exc, "response", None)
+    status_code = getattr(response, "status_code", None)
+    return isinstance(status_code, int) and (status_code == 404 or 500 <= status_code <= 599)
+
+def _stream_tp_asset_response(response, dest_file: Path, cancel_event: threading.Event | None) -> tuple[bool, int]:
+    cancelled = False
+    total = 0
+    with dest_file.open("wb") as f:
+        # 256 KiB reads: on a slow link a 1 MiB read held a cancel back for about 20 seconds.
+        for chunk in response.iter_content(chunk_size=256 * 1024):
+            if _cancel_requested(cancel_event):
+                cancelled = True
+                break
+            if chunk:
+                total += len(chunk)
+                f.write(chunk)
+    return cancelled, total
+
 def download_file(
     session_id: SessionId,
     temp_root: Path,
@@ -22396,19 +22597,10 @@ def download_file(
             )
             try:
                 session = get_thread_http_session()
-                cancelled_mid_stream = False
                 with session.get(item.url, timeout=(10, TP_PAINT_DOWNLOAD_TIMEOUT_SECONDS), stream=True) as response:
                     response.raise_for_status()
-                    with dest_file.open("wb") as f:
-                        # 256 KiB reads: on a slow link a 1 MiB read held a cancel back
-                        # for about 20 seconds.
-                        for chunk in response.iter_content(chunk_size=256 * 1024):
-                            if _cancel_requested(cancel_event):
-                                cancelled_mid_stream = True
-                                break
-                            if chunk:
-                                bytes_downloaded_total += len(chunk)
-                                f.write(chunk)
+                    cancelled_mid_stream, bytes_read = _stream_tp_asset_response(response, dest_file, cancel_event)
+                    bytes_downloaded_total += bytes_read
                 if cancelled_mid_stream:
                     # The file is closed now, so the partial download can go.
                     dest_file.unlink(missing_ok=True)
@@ -22450,6 +22642,51 @@ def download_file(
                     cancel_event.wait(delay)
                 else:
                     time.sleep(delay)
+            except Exception:
+                dest_file.unlink(missing_ok=True)
+                raise
+        alternate_url = alternate_tp_asset_url(item.url)
+        if alternate_url is not None and _tp_download_error_allows_alternate(last_exc):
+            if _cancel_requested(cancel_event):
+                dest_file.unlink(missing_ok=True)
+                return None
+            skipped_unavailable_status = None
+            logging.info(
+                "%sRetrying %s from the alternate Trading Paints CDN host %s",
+                progress_prefix,
+                item.url,
+                alternate_url,
+            )
+            try:
+                session = get_thread_http_session()
+                with session.get(alternate_url, timeout=(10, TP_PAINT_DOWNLOAD_TIMEOUT_SECONDS), stream=True) as response:
+                    response.raise_for_status()
+                    cancelled_mid_stream, bytes_read = _stream_tp_asset_response(response, dest_file, cancel_event)
+                    bytes_downloaded_total += bytes_read
+                if cancelled_mid_stream:
+                    dest_file.unlink(missing_ok=True)
+                    return None
+                logging.debug("%sDownloaded from alternate CDN to temp file: %s", progress_prefix, dest_file)
+                success = True
+                return DownloadedFile(
+                    session_id=session_id,
+                    download_id=item.download_id,
+                    file_path=dest_file,
+                )
+            except requests.RequestException as exc:
+                last_exc = exc
+                dest_file.unlink(missing_ok=True)
+                response = getattr(exc, "response", None)
+                status_code = getattr(response, "status_code", None)
+                if isinstance(status_code, int) and status_code in TP_UNAVAILABLE_DOWNLOAD_STATUS_CODES:
+                    skipped_unavailable_status = status_code
+                logging.warning(
+                    "%sAlternate CDN retry failed for %s via %s: %s",
+                    progress_prefix,
+                    item.url,
+                    alternate_url,
+                    exc,
+                )
             except Exception:
                 dest_file.unlink(missing_ok=True)
                 raise
@@ -23814,16 +24051,50 @@ def _collect_wanted_downloads(
     team_driver_personal_fallback_slots: Iterable[str],
     ai_rosters_dir: Path | None = None,
     cancel_event: threading.Event | None = None,
+    on_track_car_idxs: set[int] | None = None,
+    local_keys: Iterable[tuple[str, int, str]] | None = None,
 ) -> list[DownloadFile]:
     wanted_items: list[DownloadFile] = []
     users_sorted = sorted(session.users, key=lambda u: u.user_id)
+    users_ordered = order_session_targets(users_sorted, on_track_car_idxs or set(), local_keys or ())
     manifest_workers = max(1, int(manifest_workers))
     if not users_sorted:
         return wanted_items
+    batch_users = [user for user in users_ordered if not user.is_ai]
+    batched_manifests: dict[tuple[str, int, str], list[DownloadFile]] = {}
+    if batch_users and session.trading_paints_context() is not None:
+        batched_manifests = fetch_context_files_batch(
+            session,
+            batch_users,
+            retries,
+            retry_backoff_seconds,
+            cancel_event=cancel_event,
+            superspeedway_variant=session.is_superspeedway_track,
+        )
+    batch_requests = 0
+    if batch_users and session.trading_paints_context() is not None:
+        batch_requests = max(1, (len(batch_users) + TP_BATCH_MANIFEST_CHUNK_SIZE - 1) // TP_BATCH_MANIFEST_CHUNK_SIZE)
+    fallback_users = sum(1 for user in batch_users if user.effective_target_key() not in batched_manifests)
+    logging.info(
+        "Trading Paints manifest: %s drivers in %s batched request(s), %s per-driver fallbacks",
+        len(batch_users),
+        batch_requests,
+        fallback_users,
+    )
+    collected: dict[int, list[DownloadFile]] = {id(user): [] for user in users_ordered}
     with concurrent.futures.ThreadPoolExecutor(max_workers=manifest_workers) as executor:
         future_to_user = {
-            executor.submit(fetch_best_manifest_files, session, user, retries, retry_backoff_seconds, ai_rosters_dir, cancel_event): user
-            for user in users_sorted
+            executor.submit(
+                fetch_best_manifest_files,
+                session,
+                user,
+                retries,
+                retry_backoff_seconds,
+                ai_rosters_dir,
+                cancel_event,
+                batched_manifests,
+            ): user
+            for user in users_ordered
             if not _cancel_requested(cancel_event)
         }
         completed = 0
@@ -23911,17 +24182,20 @@ def _collect_wanted_downloads(
                 )
             elif not all_files:
                 logging.debug("Manifest returned no files for source user %s", user.user_id)
-            wanted_items.extend(user_wanted)
-    wanted_items.sort(
-        key=lambda f: (
-            f.download_id.is_team_paint,
-            f.download_id.user_id,
-            f.download_id.directory.lower(),
-            f.download_id.paint_type.value,
+            collected[id(user)] = user_wanted
+    for user in users_ordered:
+        user_items = collected.get(id(user), [])
+        user_items.sort(
+            key=lambda f: (
+                f.download_id.is_team_paint,
+                f.download_id.user_id,
+                f.download_id.directory.lower(),
+                f.download_id.paint_type.value,
+            )
         )
-    )
+        wanted_items.extend(user_items)
     return wanted_items
-def _dedupe_download_items(items: list[DownloadFile]) -> list[DownloadFile]:
+def _dedupe_download_items(items: list[DownloadFile], preserve_order: bool = False) -> list[DownloadFile]:
     unique: dict[tuple[int, str, PaintType], DownloadFile] = {}
     for item in items:
         key = (
@@ -23932,15 +24206,18 @@ def _dedupe_download_items(items: list[DownloadFile]) -> list[DownloadFile]:
             item.download_id.is_numbered_car_spec,
         )
         unique[key] = item
-    deduped = sorted(
-        unique.values(),
-        key=lambda f: (
-            f.download_id.is_team_paint,
-            f.download_id.user_id,
-            f.download_id.directory.lower(),
-            f.download_id.paint_type.value,
-        ),
-    )
+    if preserve_order:
+        deduped = list(unique.values())
+    else:
+        deduped = sorted(
+            unique.values(),
+            key=lambda f: (
+                f.download_id.is_team_paint,
+                f.download_id.user_id,
+                f.download_id.directory.lower(),
+                f.download_id.paint_type.value,
+            ),
+        )
     removed = len(items) - len(deduped)
     if removed > 0:
         logging.debug("Removed %s duplicate manifest item(s) before download", removed)
@@ -24226,8 +24503,10 @@ def process_session(
         team_driver_personal_fallback_slots=team_driver_personal_fallback_slots,
         ai_rosters_dir=ai_rosters_dir,
         cancel_event=cancel_event,
+        on_track_car_idxs=read_on_track_car_idxs(reload_reader),
+        local_keys=session_local_target_keys(session),
     )
-    wanted_items = _dedupe_download_items(wanted_items)
+    wanted_items = _dedupe_download_items(wanted_items, preserve_order=True)
     progress_statuses = build_session_stage_statuses(session, wanted_items, sync_my_livery_from_server)
     # A car's paint, spec, helmet and suit land a few hundred ms apart; waiting a second
     # reloads each car once instead of once per file, and every reload is a hitch in the sim.
@@ -25347,6 +25626,33 @@ def _read_sdk_int_var(sdk: object, key: str, default: int) -> int:
         return int(value)
     except (TypeError, ValueError):
         return int(default)
+
+def read_on_track_car_idxs(reader: IracingSdkReader | None) -> set[int]:
+    """Car indices iRacing reports in the world (CarIdxTrackSurface >= 0)."""
+    if reader is None:
+        return set()
+    try:
+        sdk = reader.sdk
+    except Exception:
+        return set()
+    try:
+        sdk.freeze_var_buffer_latest()
+    except Exception:
+        pass
+    try:
+        surfaces = sdk["CarIdxTrackSurface"]
+    except Exception:
+        return set()
+    if not isinstance(surfaces, (list, tuple)):
+        return set()
+    on_track: set[int] = set()
+    for car_idx, value in enumerate(surfaces):
+        try:
+            if int(value) >= 0:
+                on_track.add(car_idx)
+        except (TypeError, ValueError):
+            continue
+    return on_track
 
 def _sdk_camera_group_number_by_name(sdk: object, wanted_name: str) -> int | None:
     wanted = str(wanted_name or "").strip().lower()
