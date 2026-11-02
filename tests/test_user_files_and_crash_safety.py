@@ -176,7 +176,7 @@ class LocalTargetFilesWithSyncOffTests(_TempDirMixin, unittest.TestCase):
     def setUp(self):
         self.paints = self.make_tmp() / "paint"
         self.own_car = self.paints / CAR / "car_team_99.tga"
-        self.own_helmet = self.paints / "helmet_team_99.tga"
+        self.own_helmet = self.paints / "helmet_99.tga"
         for path in (self.own_car, self.own_helmet):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(b"MY OWN LIVERY")

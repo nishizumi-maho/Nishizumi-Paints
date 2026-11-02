@@ -103,7 +103,7 @@ class PreviewInputTests(unittest.TestCase):
     def test_inputs_prefer_the_installed_car_paint(self):
         car_tga = self.car_dir / "car_42.tga"
         car_tga.write_bytes(b"car")
-        decal_tga = self.car_dir / "decal_42.tga"
+        decal_tga = self.car_dir / "car_decal_42.tga"
         decal_tga.write_bytes(b"decal")
         (self.paints / "helmet_42.tga").write_bytes(b"helmet")
         (self.paints / "suit_42.tga").write_bytes(b"suit")
