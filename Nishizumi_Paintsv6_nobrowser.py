@@ -6,10 +6,15 @@ textures in iRacing, and cleans up session files when you leave.
 """
 from __future__ import annotations
 import argparse
+import base64
 import bz2
 import concurrent.futures
+import configparser
 import copy
+import csv
+import datetime
 import html
+import io
 import json
 import logging
 import math
@@ -28,6 +33,7 @@ import urllib.parse
 import unicodedata
 import uuid
 import webbrowser
+import yaml
 import re
 import hashlib
 import random
@@ -41,10 +47,17 @@ from typing import Any, Callable, Iterable, Sequence
 import requests
 from requests.adapters import HTTPAdapter
 
+try:  # Tk is optional so the headless service still runs where it is not installed.
+    import tkinter as _TK_MODULE
+    from tkinter import ttk as _TTK_MODULE
+except Exception:  # pragma: no cover - depends on the Python build
+    _TK_MODULE = None
+    _TTK_MODULE = None
+
 # Browserless copy: Trading Paints browser automation is intentionally disabled.
 sync_playwright = None
 APP_NAME = "Nishizumi Paints"
-APP_VERSION = "7.3.6"
+APP_VERSION = "7.4.0"
 APP_REGISTRY_NAME = "NishizumiPaints"
 APP_CONFIG_DIRNAME = "NishizumiPaints"
 APP_TOOLTIP = f"{APP_NAME} {APP_VERSION}"
@@ -86,9 +99,27 @@ TP_SAFE_MANIFEST_WORKER_CAP = 16
 TP_SAFE_DOWNLOAD_WORKER_CAP = 32
 TP_SAFE_SAVE_WORKER_CAP = 16
 TP_UNAVAILABLE_DOWNLOAD_STATUS_CODES = {401, 403, 404}
+# Trading Paints answers one fetch.php request for every driver in the list field.
+# The official client sends the whole field at once; 64 drivers keeps a request and
+# its XML answer comfortably small without adding round trips for a normal field.
+TP_BATCH_MANIFEST_CHUNK_SIZE = 64
+# Asset downloads normally come from dl.tradingpaints.gg; dl1 is the alternate CDN
+# node the official client intended to fall back to.
+TP_ALTERNATE_ASSET_HOST = "dl1.tradingpaints.gg"
+TP_ASSET_HOST_SUFFIX = ".tradingpaints.gg"
+TP_NON_ASSET_HOSTS = frozenset({"fetch.tradingpaints.gg", "www.tradingpaints.gg", "update.tradingpaints.gg"})
+# A 12-16 MB AI paint can take much longer than 30 s when Trading Paints is busy.
+TP_PAINT_DOWNLOAD_TIMEOUT_SECONDS = 120.0
 TP_RECENT_SCHEMES_FILENAME = ".nishizumi_tp_recent_schemes.json"
 DRIVER_PAINT_OVERRIDES_FILENAME = ".nishizumi_driver_paint_overrides.json"
 RANDOM_PAINT_PREFERENCES_FILENAME = ".nishizumi_random_paint_preferences.json"
+PEOPLE_FILENAME = ".nishizumi_people.json"
+FORBIDDEN_TP_PAINTS_FILENAME = ".nishizumi_forbidden_tp_paints.json"
+TAG_THEMES_DIRNAME = "Tags"
+TAG_THEME_TYPES = ("car", "num", "spec", "decal", "helmet", "suit")
+TAG_THEME_EXTENSIONS = {"spec": "mip"}
+WARNING_DECAL_THEME_NAME = "Warning"
+WARNING_DECAL_MODES = ("off", "and", "or")
 PAINT_HISTORY_DIRNAME = "PaintHistory"
 PAINT_HISTORY_INDEX_FILENAME = "history.json"
 PAINT_HISTORY_LIMIT_PER_TARGET = 12
@@ -152,6 +183,7 @@ UPDATE_SCRIPT_ENV_INSTALLER = "NISHIZUMI_UPDATE_INSTALLER"
 UPDATE_SCRIPT_ENV_APP = "NISHIZUMI_UPDATE_APP"
 UPDATE_SCRIPT_ENV_LOG = "NISHIZUMI_UPDATE_LOG"
 UPDATE_SCRIPT_ENV_FAILED_MARKER = "NISHIZUMI_UPDATE_FAILED_MARKER"
+UPDATE_SCRIPT_ENV_PID = "NISHIZUMI_UPDATE_PID"
 # The update script writes the installer's exit code next to the installer when it
 # fails. The relaunched app then does not install that version automatically again for
 # a day, so a failing installer cannot download and fail in a loop.
@@ -172,6 +204,15 @@ TRADING_PAINTS_COLLECTION_POOL_URL = "https://www.tradingpaints.com/js/myCollect
 TRADING_PAINTS_COLLECTIONS_URL = "https://fetch.tradingpaints.gg/collections.php?user={member_id}"
 TRADING_PAINTS_SHOWROOM_COMPRESSED_URL = "https://showroom-assets.tradingpaints.gg/compressed/{asset_id}.tga.bz2"
 TRADING_PAINTS_SHOWROOM_MIP_URL = "https://showroom-assets.tradingpaints.gg/mips/{asset_id}.mip"
+# iRacing's own UI serves live paint previews from this loopback HTTP service.
+IRACING_LOCAL_RENDER_URL = "http://localhost:32034/"
+# The render service is single-shot in practice: concurrent requests can return the
+# wrong car or fail. Every request that asks iRacing to draw a car goes through this lock.
+_IRACING_RENDER_LOCK = threading.Lock()
+# Give iRacing time to finish loading the textures before reading the same TGAs back
+# for thumbnails. Rendering while the sim is still reading them made cars render blank.
+THUMBNAIL_RENDER_SETTLE_SECONDS = 2.0
+SERVICE_STOP_JOIN_TIMEOUT_SECONDS = 20.0
 AI_SPECIAL_CAR_IDS_WITH_DEFAULT_DESIGN = {27, 179}
 AI_ROSTER_META_FILENAME = ".nishizumi_ai_roster.json"
 AI_ROSTER_REPLACED_SUFFIX = ".nishizumi-replaced"
@@ -216,6 +257,12 @@ PAGE_SCROLL_TOLERANCE_PX = 1
 LOG_QUEUE_LIMIT = 5000
 LOG_RENDER_BATCH_SIZE = 300
 LOG_HIDDEN_DRAIN_BATCH_SIZE = 1000
+LOG_DIRNAME = "logs"
+LOG_FILENAME = "nishizumi-paints.log"
+LOG_MAX_BYTES = 10 * 1024 * 1024
+LOG_MAX_AGE_DAYS = 31
+YAML_DUMP_DIRNAME = "yaml"
+YAML_DUMP_MAX_AGE_DAYS = 30
 APP_ICON_ICO_RESOURCE = "assets/icons/nishizumi_paints_icon.ico"
 APP_ICON_PNG_RESOURCE = "assets/icons/nishizumi_paints_icon.png"
 INSTANCE_HOST = "127.0.0.1"
@@ -1598,6 +1645,7 @@ def update_launcher_environment(
     app_exe: Path,
     log_path: Path,
     failed_marker_path: Path,
+    app_pid: int | None = None,
 ) -> dict[str, str]:
     """The paths the update script reads, as environment variables.
 
@@ -1617,10 +1665,18 @@ def update_launcher_environment(
         if not text or any(character in text for character in '"\r\n\0'):
             raise RuntimeError(f"Refusing to build an update script for an unsafe path: {text!r}")
         environment[name] = text
+    if app_pid is not None:
+        try:
+            safe_pid = int(app_pid)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(f"Refusing to wait for an invalid process id: {app_pid!r}") from exc
+        if safe_pid <= 0:
+            raise RuntimeError(f"Refusing to wait for an invalid process id: {app_pid!r}")
+        environment[UPDATE_SCRIPT_ENV_PID] = str(safe_pid)
     return environment
 
 
-def build_update_launcher_script(relaunch_args: Sequence[str] = ()) -> str:
+def build_update_launcher_script(relaunch_args: Sequence[str] = (), *, wait_for_app_pid: bool = False) -> str:
     """Batch wrapper that installs the update and relaunches the app afterwards.
 
     The app has to exit before the installer can replace its own files, so the install
@@ -1638,10 +1694,18 @@ def build_update_launcher_script(relaunch_args: Sequence[str] = ()) -> str:
             raise RuntimeError(f"Refusing to build an update script with an unsafe relaunch argument: {argument!r}")
     arguments = " ".join(UPDATE_INSTALLER_SILENT_ARGS)
     relaunch = "".join(f" {argument}" for argument in relaunch_args)
-    return "\r\n".join(
+    lines = ["@echo off", "setlocal DisableDelayedExpansion"]
+    if wait_for_app_pid:
+        # start_update_installer() is called before exit_app() so the app can still
+        # report a launch error. The installer must not run until the old process has
+        # released its files, otherwise Inno Setup aborts a perfectly good update.
+        lines.append(
+            f'"%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" '
+            f'-NoProfile -NonInteractive -Command "Wait-Process -Id %{UPDATE_SCRIPT_ENV_PID}% '
+            f'-Timeout 120 -ErrorAction SilentlyContinue"'
+        )
+    lines.extend(
         [
-            "@echo off",
-            "setlocal DisableDelayedExpansion",
             f'"%{UPDATE_SCRIPT_ENV_INSTALLER}%" {arguments} /LOG="%{UPDATE_SCRIPT_ENV_LOG}%"',
             'set "NISHIZUMI_UPDATE_RC=%ERRORLEVEL%"',
             f'if not "%NISHIZUMI_UPDATE_RC%"=="0" (echo %NISHIZUMI_UPDATE_RC%) > "%{UPDATE_SCRIPT_ENV_FAILED_MARKER}%"',
@@ -1650,6 +1714,7 @@ def build_update_launcher_script(relaunch_args: Sequence[str] = ()) -> str:
             "",
         ]
     )
+    return "\r\n".join(lines)
 
 
 def _windows_command_processor() -> str:
@@ -1679,8 +1744,17 @@ def start_update_installer(
     log_path = directory / "install.log"
     failed_marker = update_install_failure_marker_path(installer)
     environment = dict(os.environ)
-    environment.update(update_launcher_environment(script_path, installer, target_exe, log_path, failed_marker))
-    script = build_update_launcher_script(relaunch_args)
+    environment.update(
+        update_launcher_environment(
+            script_path,
+            installer,
+            target_exe,
+            log_path,
+            failed_marker,
+            app_pid=os.getpid(),
+        )
+    )
+    script = build_update_launcher_script(relaunch_args, wait_for_app_pid=True)
     failed_marker.unlink(missing_ok=True)
     script_path.write_text(script, encoding="ascii", newline="")
     creationflags = 0
@@ -2001,6 +2075,17 @@ class SessionId:
         if self.sub_session_id is None:
             return str(self.main_session_id)
         return f"{self.main_session_id}_{self.sub_session_id}"
+def normalize_trading_paints_number(value: object) -> str:
+    """The number Trading Paints matches: digits and dots only, like the official client."""
+    text = re.sub(r"[^0-9.]", "", str(value or "").strip())
+    return text or "0"
+def normalize_paint_extension(value: object) -> str:
+    """A safe filename suffix for CarCfgCustomPaintExt; empty means the default paint."""
+    text = str(value or "").strip().lower()
+    text = re.sub(r"[^a-z0-9]+", "_", text).strip("_")
+    if text in {"none", "default", "regular"}:
+        return ""
+    return text
 def _normalize_ss_token(value: str | None) -> str:
     return normalize_directory(value or '')
 def _is_superspeedway_track(track_name: str, track_display_name: str, track_config_name: str) -> bool:
@@ -2055,15 +2140,26 @@ class SessionUser:
     irating: int | None = None
     license_label: str = "-"
     safety_rating: str = "-"
+    car_class: str = field(default="", compare=False)
+    # Paint designs describe the driver, not who is in the session, so they stay
+    # out of equality, hashing and every session fingerprint.
+    car_design: str = field(default="", compare=False)
+    helmet_design: str = field(default="", compare=False)
+    suit_design: str = field(default="", compare=False)
     def effective_target_key(self) -> tuple[str, int, str]:
         target_kind = "team" if session_user_uses_team_target(self) else "user"
         target_id = self.team_id if target_kind == "team" else self.user_id
         return (target_kind, int(target_id), self.directory.lower())
     def trading_paints_list_value(self) -> str:
-        return f"{self.user_id}={self.directory}={self.team_id or 0}={self.number or '0'}={self.paint_ext or ''}"
+        return f"{self.user_id}={self.directory}={self.team_id or 0}={normalize_trading_paints_number(self.number)}={self.paint_ext or ''}"
 
 def session_user_uses_team_target(user: SessionUser) -> bool:
     return bool((not user.is_ai) and user.team_id is not None and user.team_id > 0)
+
+def session_user_saved_target_key(user: SessionUser) -> tuple[int, bool]:
+    if session_user_uses_team_target(user):
+        return (int(user.team_id or 0), True)
+    return (int(user.user_id), False)
 
 def session_user_is_local_target(session: Session | None, user: SessionUser | None) -> bool:
     if session is None or user is None:
@@ -2076,6 +2172,36 @@ def session_user_is_local_target(session: Session | None, user: SessionUser | No
         and user.team_id is not None
         and int(user.team_id) == int(session.local_team_id)
     )
+
+def session_local_target_keys(session: Session | None) -> set[tuple[str, int, str]]:
+    if session is None:
+        return set()
+    return {
+        user.effective_target_key()
+        for user in session.users
+        if session_user_is_local_target(session, user)
+    }
+
+def order_session_targets(
+    users: Iterable[SessionUser],
+    on_track_car_idxs: set[int],
+    local_keys: Iterable[tuple[str, int, str]],
+) -> list[SessionUser]:
+    """Order download work: cars in the world first, garage cars next, own targets last.
+
+    The sort is stable, so when telemetry is unavailable the caller's order (today,
+    user id) is kept apart from moving the local user's targets to the end.
+    """
+    local = set(local_keys or ())
+    on_track = {int(index) for index in (on_track_car_idxs or ())}
+    def _rank(user: SessionUser) -> int:
+        if user.effective_target_key() in local:
+            return 2
+        if user.car_idx is not None and int(user.car_idx) in on_track:
+            return 0
+        return 1
+    return sorted(list(users or ()), key=_rank)
+
 @dataclass(frozen=True)
 class Session:
     session_id: SessionId
@@ -2095,9 +2221,35 @@ class Session:
     ai_roster_id: str = ""
     ai_roster_name: str = ""
     ai_drivers: tuple[dict, ...] = ()
-    def fingerprint(self) -> tuple[SessionId, tuple[tuple[str, int, str, int], ...], tuple[bool, str, int, int, bool, str, str, bool]]:
+    season_id: int = 0
+    race_week: int = 0
+    category: str = ""
+    event_date_raw: str = ""
+    track_display_short_name: str = ""
+    local_car_short_name: str = ""
+    session_type: str = ""
+    # WeekendInfo conditions. iRacing supplies most of these as display strings
+    # with their unit ("24.00 C", "60.00 kph"), which are kept as given.
+    sim_date: str = ""
+    sim_time: str = ""
+    air_temp: str = ""
+    track_temp: str = ""
+    humidity: str = ""
+    wind_speed: str = ""
+    wind_direction: str = ""
+    fog: str = ""
+    skies: str = ""
+    rain: str = ""
+    track_length: str = ""
+    turns: str = ""
+    altitude: str = ""
+    city: str = ""
+    country: str = ""
+    pit_speed_limit: str = ""
+    pace_speed_limit: str = ""
+    def fingerprint(self) -> tuple[SessionId, tuple[tuple[str, int, str, int], ...], tuple[bool, str, int, int, bool, str, str, bool, str]]:
         return (self.session_id, self.roster_fingerprint(), self.context_fingerprint())
-    def identity_fingerprint(self) -> tuple[SessionId, tuple[bool, str, int, int, bool, str, str, bool]]:
+    def identity_fingerprint(self) -> tuple[SessionId, tuple[bool, str, int, int, bool, str, str, bool, str]]:
         # Same session and same Trading Paints context, whoever is in it. A driver
         # joining or leaving keeps this stable, so work already done stays valid.
         return (self.session_id, self.context_fingerprint())
@@ -2113,7 +2265,7 @@ class Session:
                 for u in self.users
             )
         )
-    def context_fingerprint(self) -> tuple[bool, str, int, int, bool, str, str, bool]:
+    def context_fingerprint(self) -> tuple[bool, str, int, int, bool, str, str, bool, str]:
         return (
             self.team_racing,
             (self.event_time_raw or "10:00 am").strip().lower(),
@@ -2123,6 +2275,7 @@ class Session:
             normalize_directory(self.track_name),
             normalize_directory(self.track_config_name),
             bool(self.is_superspeedway_track),
+            str(self.session_type or "").strip().lower(),
         )
     def local_preserve_targets(self) -> set[tuple[bool, int]]:
         targets: set[tuple[bool, int]] = set()
@@ -2143,7 +2296,191 @@ class Session:
             "numbers": "True" if self.load_num_textures else "False",
         }
 
-def session_identity_fingerprint(session: Session) -> tuple[SessionId, tuple[bool, str, int, int, bool, str, str, bool]]:
+SESSION_CONDITION_UNKNOWN = "—"
+SESSION_CONDITION_FIELDS: tuple[tuple[str, str], ...] = (
+    ("sim_date", "Sim date"),
+    ("sim_time", "Sim time"),
+    ("air_temp", "Air temperature"),
+    ("track_temp", "Track temperature"),
+    ("humidity", "Humidity"),
+    ("wind_speed", "Wind speed"),
+    ("wind_direction", "Wind direction"),
+    ("fog", "Fog"),
+    ("skies", "Skies"),
+    ("rain", "Rain"),
+    ("track_length", "Track length"),
+    ("turns", "Turns"),
+    ("altitude", "Altitude"),
+    ("city", "City"),
+    ("country", "Country"),
+    ("pit_speed_limit", "Pit speed limit"),
+    ("pace_speed_limit", "Pace speed limit"),
+)
+
+
+def format_session_condition(value: object) -> str:
+    """A conditions value as iRacing gave it, or the missing-value marker."""
+    text = str(value or "").strip()
+    return text or SESSION_CONDITION_UNKNOWN
+
+
+def session_condition_values(session: Session | None) -> dict[str, str]:
+    if session is None:
+        return {key: SESSION_CONDITION_UNKNOWN for key, _label in SESSION_CONDITION_FIELDS}
+    return {
+        key: format_session_condition(getattr(session, key, ""))
+        for key, _label in SESSION_CONDITION_FIELDS
+    }
+
+
+def session_condition_rows(session: Session | None) -> list[tuple[str, str]]:
+    values = session_condition_values(session)
+    return [(label, values[key]) for key, label in SESSION_CONDITION_FIELDS]
+
+
+DEFAULT_REPLAY_NAME_TEMPLATE = "Series{series} S{season} Week{raceweek}"
+REPLAY_NAME_CHECKERED_FLAG = 0x00000001
+REPLAY_NAME_GREEN_FLAG = 0x00000004
+REPLAY_NAME_TOKENS = (
+    "category",
+    "series",
+    "series_id",
+    "season",
+    "season_id",
+    "league_id",
+    "raceweek",
+    "session",
+    "subsession",
+    "simdate",
+    "simtime",
+    "localdate",
+    "localtime",
+    "track",
+    "car",
+)
+REPLAY_NAME_EXAMPLE_VALUES = {
+    "category": "Formula",
+    "series": "123",
+    "series_id": "123",
+    "season": "2",
+    "season_id": "2",
+    "league_id": "121",
+    "raceweek": "3",
+    "session": "123456",
+    "subsession": "654321",
+    "simdate": "2024-01-01",
+    "simtime": "18:30",
+    "localdate": "2024-01-01",
+    "localtime": "18:30",
+    "track": "Montreal",
+    "car": "FIA F4",
+}
+_REPLAY_NAME_TOKEN_PATTERN = re.compile(r"\{[^}]+\}")
+_REPLAY_NAME_INVALID_CHARS = re.compile(r'[<>:"/\\|?*]')
+_REPLAY_NAME_WHITESPACE = re.compile(r"\s+")
+
+
+def _replay_name_value(value: object) -> str:
+    if value is None:
+        return ""
+    text = str(value).strip()
+    return "" if text in {"", "0"} else text
+
+
+def _format_replay_sim_date(raw: object) -> str:
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    candidate = text.split("T", 1)[0].split(" ", 1)[0]
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%m/%d/%Y", "%d/%m/%Y", "%m-%d-%Y"):
+        try:
+            return datetime.datetime.strptime(candidate, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    return text
+
+
+def _format_replay_sim_time(raw: object) -> str:
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    match = re.match(r"^(\d{1,2}):(\d{2})(?::\d{2})?\s*([aApP]\.?[mM]\.?)?$", text)
+    if match is None:
+        return text
+    hour = int(match.group(1))
+    minute = int(match.group(2))
+    marker = (match.group(3) or "").replace(".", "").lower()
+    if marker:
+        if hour > 12 or minute > 59:
+            return text
+        hour = hour % 12 + (12 if marker == "pm" else 0)
+    elif hour > 23 or minute > 59:
+        return text
+    return f"{hour:02d}:{minute:02d}"
+
+
+def render_replay_name(template: str, values: dict[str, str]) -> str:
+    if not template:
+        return ""
+    lookup = {str(key).casefold(): _replay_name_value(value) for key, value in values.items()}
+
+    def _replace(match: re.Match[str]) -> str:
+        token = match.group(0)
+        return lookup.get(token[1:-1].casefold(), token)
+
+    text = _REPLAY_NAME_TOKEN_PATTERN.sub(_replace, str(template))
+    text = _REPLAY_NAME_INVALID_CHARS.sub("", text)
+    return _REPLAY_NAME_WHITESPACE.sub(" ", text).strip()
+
+
+def replay_name_values(session: Session | None) -> dict[str, str]:
+    series_id = _replay_name_value(getattr(session, "series_id", 0))
+    season_id = _replay_name_value(getattr(session, "season_id", 0))
+    session_id = getattr(session, "session_id", None)
+    now = datetime.datetime.now()
+    return {
+        "category": _replay_name_value(getattr(session, "category", "")),
+        "series": series_id,
+        "series_id": series_id,
+        "season": season_id,
+        "season_id": season_id,
+        "league_id": _replay_name_value(getattr(session, "league_id", 0)),
+        "raceweek": _replay_name_value(getattr(session, "race_week", 0)),
+        "session": _replay_name_value(getattr(session_id, "main_session_id", 0)),
+        "subsession": _replay_name_value(getattr(session_id, "sub_session_id", 0)),
+        "simdate": _format_replay_sim_date(getattr(session, "event_date_raw", "")),
+        "simtime": _format_replay_sim_time(getattr(session, "event_time_raw", "")),
+        "localdate": now.strftime("%Y-%m-%d"),
+        "localtime": now.strftime("%H:%M"),
+        "track": _replay_name_value(
+            getattr(session, "track_display_short_name", "")
+            or getattr(session, "track_display_name", "")
+        ),
+        "car": _replay_name_value(getattr(session, "local_car_short_name", "")),
+    }
+
+
+class ReplayNameLatch:
+    def __init__(self) -> None:
+        self._session_key: str | None = None
+        self._copied = False
+
+    def update(self, session_key: str | None, session_flags: object) -> bool:
+        if session_key != self._session_key:
+            self._session_key = session_key
+            self._copied = False
+        if session_key is None:
+            return False
+        flags = _to_int_or_none(session_flags) or 0
+        if flags & REPLAY_NAME_GREEN_FLAG:
+            self._copied = False
+        if not (flags & REPLAY_NAME_CHECKERED_FLAG) or self._copied:
+            return False
+        self._copied = True
+        return True
+
+
+def session_identity_fingerprint(session: Session) -> tuple[SessionId, tuple[bool, str, int, int, bool, str, str, bool, str]]:
     return session.identity_fingerprint()
 @dataclass(frozen=True)
 class DownloadId:
@@ -2158,12 +2495,14 @@ class DownloadId:
     tp_title: str = ""
     tp_source_link: str = ""
     tp_source: str = ""
+    ext: str = ""
 @dataclass(frozen=True)
 class DownloadFile:
     download_id: DownloadId
     url: str
     ai_roster_optional_filename: str = ""
     ai_roster_dir: Path | None = None
+    expected_size: int | None = None
 @dataclass(frozen=True)
 class DownloadedFile:
     session_id: SessionId
@@ -2225,7 +2564,7 @@ class SdkPollState(str, Enum):
     INVALID = "invalid"
 @dataclass
 class PendingTextureReload:
-    fingerprint: tuple[SessionId, tuple[tuple[str, int, str, int], ...], tuple[bool, str, int, int, bool, str, str, bool]]
+    fingerprint: tuple[SessionId, tuple[tuple[str, int, str, int], ...], tuple[bool, str, int, int, bool, str, str, bool, str]]
     first_requested_at: float
     wait_log_emitted: bool = False
 
@@ -2361,7 +2700,7 @@ class ThroughputMonitorSnapshot:
 
 @dataclass(frozen=True)
 class PendingDriverOverrideApply:
-    session_fingerprint: tuple[SessionId, tuple[bool, str, int, int, bool, str, str, bool]]
+    session_fingerprint: tuple[SessionId, tuple[bool, str, int, int, bool, str, str, bool, str]]
     entry: dict[str, object]
 
 @dataclass(frozen=True)
@@ -2444,6 +2783,90 @@ def _session_status_meta(status_code: str) -> tuple[str, str]:
         "skipped": ("○", "Skipped"),
     }
     return mapping.get(status_code, ("?", status_code.title()))
+
+FIELD_STATUS_DONE_CODES = frozenset(
+    {
+        "override",
+        "downloaded",
+        "team_paint",
+        "driver_paint",
+        "replay",
+        "fallback",
+        "fallback_local",
+        "fallback_online",
+        "iracing_default",
+        "missing",
+        "skipped",
+    }
+)
+FIELD_STATUS_WITHOUT_LIVERY_CODES = frozenset({"missing", "iracing_default", "skipped", ""})
+
+
+def strength_of_field(iratings: list[int]) -> int:
+    """iRacing's strength of field over drivers with a known, positive iRating."""
+    ratings = [int(value) for value in iratings if int(value) > 0]
+    if not ratings:
+        return 0
+    scale = 1600.0 / math.log(2.0)
+    # iRacing's usual form: scale * ln(n / sum(2 ** (-iRating / 1600))).
+    denominator = sum(2.0 ** (-float(rating) / 1600.0) for rating in ratings)
+    if denominator <= 0.0:
+        return 0
+    return int(round(scale * math.log(len(ratings) / denominator)))
+
+
+def session_strength_of_field(session: Session | None) -> int:
+    if session is None:
+        return 0
+    return strength_of_field(
+        [
+            int(user.irating)
+            for user in session.users
+            if not user.is_ai and user.irating is not None and int(user.irating) > 0
+        ]
+    )
+
+
+def session_driver_count(session: Session | None) -> int:
+    return len(session.users) if session is not None else 0
+
+
+def session_paint_progress(rows: Iterable[SessionDriverSnapshot]) -> tuple[int, int]:
+    """Completed asset slots and total slots (car, helmet and suit per driver row)."""
+    done = 0
+    total = 0
+    for row in rows:
+        total += 3
+        for code in (row.car_status_code, row.suit_status_code, row.helmet_status_code):
+            if str(code) in FIELD_STATUS_DONE_CODES:
+                done += 1
+    return done, total
+
+
+def session_without_livery_count(rows: Iterable[SessionDriverSnapshot]) -> int:
+    return sum(
+        1
+        for row in rows
+        if not row.is_ai and str(row.car_status_code) in FIELD_STATUS_WITHOUT_LIVERY_CODES
+    )
+
+
+def session_processing_active(rows: Iterable[SessionDriverSnapshot]) -> bool:
+    """True while any asset of the current session is queued or downloading."""
+    for row in rows:
+        for code in (row.status_code, row.car_status_code, row.suit_status_code, row.helmet_status_code):
+            if str(code) in {"queued", "downloading"}:
+                return True
+    return False
+
+
+def tp_fetch_hosts_available() -> bool:
+    """False when every Trading Paints manifest host recently failed to connect."""
+    now = time.monotonic()
+    with _TP_FETCH_URL_DOWN_LOCK:
+        down = {url for url, until in _TP_FETCH_URL_DOWN_UNTIL.items() if until > now}
+    return bool(TRADING_PAINTS_FETCH_CONTEXT_URLS) and len(down) < len(TRADING_PAINTS_FETCH_CONTEXT_URLS)
+
 
 _SESSION_ASSET_SLOTS: tuple[str, ...] = ("car", "suit", "helmet")
 
@@ -2772,6 +3195,31 @@ def _try_incremental_texture_reload(
         if trigger_texture_reload(reader, car_idx=car_idx):
             triggered_any = True
     return triggered_any
+
+
+def _session_car_index_for_member(session: Session | None, member_id: object, car_directory: object) -> int | None:
+    """The car index of one member's car in the live session, when it is there."""
+    if session is None:
+        return None
+    try:
+        member = int(member_id or 0)
+    except (TypeError, ValueError):
+        return None
+    directory = normalize_directory(str(car_directory or ""))
+    if member <= 0 or not directory:
+        return None
+    for user in session.users:
+        if int(user.user_id) != member or normalize_directory(user.directory) != directory:
+            continue
+        if user.car_idx is None:
+            continue
+        try:
+            car_idx = int(user.car_idx)
+        except (TypeError, ValueError):
+            continue
+        if car_idx >= 0:
+            return car_idx
+    return None
 
 
 def _session_user_map(session: Session | None) -> dict[tuple[str, int, str], SessionUser]:
@@ -3222,14 +3670,193 @@ def parse_args() -> argparse.Namespace:
         "-v", "--verbose", action="store_true", help="Enable verbose debug logs."
     )
     return parser.parse_args()
+def default_log_dir() -> Path:
+    appdata = os.getenv("APPDATA")
+    if appdata:
+        return Path(appdata) / "Nishizumi-Paints" / LOG_DIRNAME
+    return Path.home() / "AppData" / "Roaming" / "Nishizumi-Paints" / LOG_DIRNAME
+
+
+def default_log_file_path() -> Path:
+    return default_log_dir() / LOG_FILENAME
+
+
+def trim_log_file(
+    path: Path | str,
+    *,
+    max_bytes: int = LOG_MAX_BYTES,
+    max_age_days: int = LOG_MAX_AGE_DAYS,
+    now: float | None = None,
+) -> int:
+    """Drop records older than ``max_age_days`` and keep the newest ``max_bytes``.
+
+    A record starts with the log timestamp. Continuation lines (tracebacks) follow
+    the record they belong to, so they are kept or dropped with it.
+    """
+    log_path = Path(path)
+    try:
+        data = log_path.read_bytes()
+    except OSError:
+        return 0
+    if not data:
+        return 0
+    cutoff = float(now if now is not None else time.time()) - max(0, int(max_age_days)) * 86400.0
+    try:
+        text = data.decode("utf-8", errors="replace")
+    except Exception:
+        text = ""
+    kept: list[str] = []
+    record_timestamp: float | None = None
+    for line in text.splitlines(keepends=True):
+        match = re.match(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", line)
+        if match:
+            try:
+                record_timestamp = time.mktime(time.strptime(match.group(1), "%Y-%m-%d %H:%M:%S"))
+            except (OverflowError, ValueError):
+                record_timestamp = None
+        if record_timestamp is None or record_timestamp >= cutoff:
+            kept.append(line)
+    trimmed = "".join(kept).encode("utf-8")
+    if max_bytes > 0 and len(trimmed) > max_bytes:
+        trimmed = trimmed[-max_bytes:]
+        newline = trimmed.find(b"\n")
+        if newline != -1:
+            trimmed = trimmed[newline + 1:]
+    if trimmed == data:
+        return 0
+    temp_path: Path | None = None
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = log_path.with_name(f"{log_path.name}.{os.getpid()}.trim.tmp")
+        with temp_path.open("wb") as handle:
+            handle.write(trimmed)
+        os.replace(temp_path, log_path)
+    except OSError:
+        # A reader may hold the file open. Keep logging rather than failing a start.
+        return 0
+    finally:
+        if temp_path is not None:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+    return len(data) - len(trimmed)
+
+
+def _exception_hook(exc_type, exc_value, exc_tb) -> None:
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_tb)
+        return
+    logging.critical("Unhandled exception", exc_info=(exc_type, exc_value, exc_tb))
+
+
+def _thread_exception_hook(args: threading.ExceptHookArgs) -> None:
+    if args.exc_type is SystemExit:
+        return
+    thread_name = getattr(args.thread, "name", "")
+    logging.critical(
+        "Unhandled exception in thread %s",
+        thread_name,
+        exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+    )
+
+
+def install_exception_hooks() -> None:
+    sys.excepthook = _exception_hook
+    threading.excepthook = _thread_exception_hook
+
+
 def setup_logging(verbose: bool) -> None:
     level = logging.DEBUG if verbose else logging.INFO
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s %(levelname)s %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-        force=True,
-    )
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s", "%Y-%m-%d %H:%M:%S")
+    handlers: list[logging.Handler] = [logging.StreamHandler()]
+    try:
+        log_path = default_log_file_path()
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        trim_log_file(log_path)
+        file_handler = logging.FileHandler(log_path, encoding="utf-8")
+        handlers.append(file_handler)
+    except Exception:
+        # The console handler still works when the log folder is not writable.
+        pass
+    for handler in handlers:
+        handler.setFormatter(formatter)
+    logging.basicConfig(level=level, handlers=handlers, force=True)
+    install_exception_hooks()
+
+
+TRADING_PAINTS_PROCESS_NAME = "Trading Paints.exe"
+IRACING_PROCESS_NAMES = frozenset({"iracingui.exe", "iracingsim64.exe", "iracingsim64dx11.exe"})
+
+
+def list_running_process_names() -> list[str]:
+    if sys.platform != "win32":
+        return []
+    try:
+        completed = subprocess.run(
+            ["tasklist", "/FO", "CSV", "/NH"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except Exception:
+        logging.debug("Could not list running processes", exc_info=True)
+        return []
+    names: list[str] = []
+    for line in completed.stdout.splitlines():
+        try:
+            row = next(csv.reader([line]))
+        except (StopIteration, csv.Error):
+            continue
+        if row:
+            names.append(row[0].strip().strip('"'))
+    return names
+
+
+def find_named_process(process_names: Iterable[str], wanted: str) -> str | None:
+    target = str(wanted or "").strip().casefold()
+    if not target:
+        return None
+    for name in process_names or []:
+        normalized = str(name or "").strip().strip('"').casefold()
+        if normalized == target:
+            return str(name).strip().strip('"')
+    return None
+
+
+def trading_paints_is_running(process_names: Iterable[str]) -> bool:
+    return find_named_process(process_names, TRADING_PAINTS_PROCESS_NAME) is not None
+
+
+def should_warn_about_trading_paints(process_names: Iterable[str], dont_ask_again: bool = False) -> bool:
+    return not bool(dont_ask_again) and trading_paints_is_running(process_names)
+
+
+def request_trading_paints_close() -> tuple[bool, str]:
+    try:
+        completed = subprocess.run(
+            ["taskkill", "/IM", TRADING_PAINTS_PROCESS_NAME],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    except Exception as exc:
+        return False, f"Could not ask Trading Paints to close: {exc}"
+    if completed.returncode == 0:
+        return True, "Asked Trading Paints to close."
+    detail = (completed.stderr or completed.stdout or "").strip()
+    return False, f"Trading Paints did not close: {detail or 'unknown error'}"
+
+
+def iracing_is_running(process_names: Iterable[str]) -> bool:
+    for name in process_names or []:
+        if str(name or "").strip().strip('"').casefold() in IRACING_PROCESS_NAMES:
+            return True
+    return False
+
+
 def _windows_documents_root() -> Path | None:
     if sys.platform != "win32":
         return None
@@ -3389,11 +4016,35 @@ def default_random_pool_dir() -> Path:
     if appdata:
         return Path(appdata) / "Nishizumi-Paints" / "RandomPool"
     return Path.home() / "AppData" / "Roaming" / "Nishizumi-Paints" / "RandomPool"
+def default_league_library_dir() -> Path:
+    appdata = os.getenv("APPDATA")
+    if appdata:
+        return Path(appdata) / "Nishizumi-Paints" / "LeagueLibrary"
+    return Path.home() / "AppData" / "Roaming" / "Nishizumi-Paints" / "LeagueLibrary"
+def default_tag_themes_dir() -> Path:
+    appdata = os.getenv("APPDATA")
+    if appdata:
+        return Path(appdata) / "Nishizumi-Paints" / TAG_THEMES_DIRNAME
+    return Path.home() / "AppData" / "Roaming" / "Nishizumi-Paints" / TAG_THEMES_DIRNAME
+def default_spec_maps_dir() -> Path:
+    appdata = os.getenv("APPDATA")
+    if appdata:
+        return Path(appdata) / "Nishizumi-Paints" / "SpecMaps"
+    return Path.home() / "AppData" / "Roaming" / "Nishizumi-Paints" / "SpecMaps"
+def default_car_thumbnails_dir() -> Path:
+    appdata = os.getenv("APPDATA")
+    if appdata:
+        return Path(appdata) / "Nishizumi-Paints" / "Thumbnails"
+    return Path.home() / "AppData" / "Roaming" / "Nishizumi-Paints" / "Thumbnails"
 def default_tp_collection_pool_dir() -> Path:
     appdata = os.getenv("APPDATA")
     if appdata:
         return Path(appdata) / "Nishizumi-Paints" / "CollectionPool"
     return Path.home() / "AppData" / "Roaming" / "Nishizumi-Paints" / "CollectionPool"
+def default_preview_export_dir() -> Path:
+    profile = os.getenv("USERPROFILE")
+    home = Path(profile) if profile else Path.home()
+    return home / "Pictures" / "iRacing"
 
 def default_driver_paint_override_cache_dir() -> Path:
     appdata = os.getenv("APPDATA")
@@ -3418,6 +4069,18 @@ def default_random_paint_preferences_path() -> Path:
     if appdata:
         return Path(appdata) / APP_CONFIG_DIRNAME / RANDOM_PAINT_PREFERENCES_FILENAME
     return Path.home() / f".{APP_CONFIG_DIRNAME.lower()}_{RANDOM_PAINT_PREFERENCES_FILENAME}"
+
+def default_people_path() -> Path:
+    appdata = os.getenv("APPDATA")
+    if appdata:
+        return Path(appdata) / APP_CONFIG_DIRNAME / PEOPLE_FILENAME
+    return Path.home() / f".{APP_CONFIG_DIRNAME.lower()}_{PEOPLE_FILENAME}"
+
+def default_forbidden_tp_paints_path() -> Path:
+    appdata = os.getenv("APPDATA")
+    if appdata:
+        return Path(appdata) / APP_CONFIG_DIRNAME / FORBIDDEN_TP_PAINTS_FILENAME
+    return Path.home() / f".{APP_CONFIG_DIRNAME.lower()}_{FORBIDDEN_TP_PAINTS_FILENAME}"
 
 def default_paint_history_dir() -> Path:
     appdata = os.getenv("APPDATA")
@@ -3467,6 +4130,84 @@ def default_replay_packs_dir() -> Path:
     if appdata:
         return Path(appdata) / "Nishizumi-Paints" / "ReplayPacks"
     return Path.home() / "AppData" / "Roaming" / "Nishizumi-Paints" / "ReplayPacks"
+
+
+IRACING_FOLDER_METRIC_NAMES = ("airosters", "paint", "replay", "telemetry", "videos")
+
+
+def measure_folder_size(path: Path) -> int:
+    """Total size of the regular files under *path*, without following links."""
+    root = Path(path)
+    try:
+        if not root.exists():
+            return -1
+    except OSError as exc:
+        logging.error("Could not check folder %s: %s", root, exc)
+        return -2
+    total = 0
+    stack = [root]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    try:
+                        if entry.is_symlink() or getattr(entry, "is_junction", lambda: False)():
+                            continue
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(Path(entry.path))
+                        elif entry.is_file(follow_symlinks=False):
+                            total += entry.stat(follow_symlinks=False).st_size
+                    except OSError as exc:
+                        logging.debug("Skipping unreadable file %s: %s", entry.path, exc)
+        except OSError as exc:
+            if current == root:
+                logging.error("Could not measure folder %s: %s", root, exc)
+                return -2
+            logging.debug("Skipping unreadable folder %s: %s", current, exc)
+    return total
+
+
+def iracing_folder_metrics(documents_dir: Path, extra: dict[str, Path]) -> list[tuple[str, Path, int]]:
+    documents = Path(documents_dir)
+    metrics = [
+        (name, documents / name, measure_folder_size(documents / name))
+        for name in IRACING_FOLDER_METRIC_NAMES
+    ]
+    for label, path in extra.items():
+        candidate = Path(path)
+        metrics.append((str(label), candidate, measure_folder_size(candidate)))
+    return metrics
+
+
+def format_folder_size(size: int) -> str:
+    if size == -1:
+        return "N/A"
+    if size == -2:
+        return "Error"
+    scaled = float(max(0, int(size)))
+    units = ("B", "KB", "MB", "GB", "TB")
+    unit_index = 0
+    while scaled >= 1024.0 and unit_index < len(units) - 1:
+        scaled /= 1024.0
+        unit_index += 1
+    if unit_index == 0:
+        return f"{int(scaled)} B"
+    return f"{scaled:.1f} {units[unit_index]}"
+
+
+def free_space_info(path: Path) -> tuple[int, int, bool] | None:
+    try:
+        usage = shutil.disk_usage(path)
+    except Exception as exc:
+        logging.error("Could not read free disk space for %s: %s", path, exc)
+        return None
+    free = int(usage.free)
+    total = int(usage.total)
+    low = bool(total > 0 and (free / total) < 0.10)
+    return free, total, low
+
+
 def clamp_random_pool_gb(value: float | int | str, fallback: float = 5.0) -> float:
     try:
         parsed = float(value)
@@ -3696,6 +4437,2551 @@ def get_thread_http_session() -> requests.Session:
         _THREAD_LOCAL.http_session = session
     return session
 
+# --- iRacing paint previews -------------------------------------------------
+
+_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+_IRACING_DEFAULT_CAR_DESIGN = ("1", "FF0000,00FF00,0000FF")
+_PILLOW_IMPORT_WARNING_LOGGED = False
+
+
+def _iracing_design_parts(design: str) -> tuple[str, str]:
+    text = (design or "").strip()
+    if "," not in text:
+        return _IRACING_DEFAULT_CAR_DESIGN
+    pattern, colours = text.split(",", 1)
+    return pattern, colours
+
+
+def _iracing_car_path(car_path: str) -> str:
+    # iRacing car folders are space separated on disk but backslash separated in URLs.
+    return str(car_path or "").replace(" ", "\\")
+
+
+def _iracing_paint_path(tga_path: str | Path) -> str:
+    return str(tga_path).replace(" ", "%20")
+
+
+def iracing_render_url(
+    kind: str,
+    tga_path: str | Path,
+    *,
+    car_path: str = "",
+    design: str = "",
+    number: str | None = None,
+    tick: int | None = None,
+) -> str:
+    if kind not in {"car", "car_num", "suit", "helmet"}:
+        return ""
+    stamp = time.time_ns() // 100 if tick is None else int(tick)
+    paint = _iracing_paint_path(tga_path)
+    if kind in {"car", "car_num"}:
+        pattern, colours = _iracing_design_parts(design)
+        number_part = f"&number={number}" if kind == "car" and isinstance(number, str) and number else "&numShow=0"
+        return (
+            f"{IRACING_LOCAL_RENDER_URL}pk_car.png?size=2{number_part}&stampShow=0"
+            f"&carPat={pattern}&carCol={colours}"
+            f"&carPath={_iracing_car_path(car_path)}&tick={stamp}&carCustPaint={paint}"
+        )
+    if kind == "suit":
+        return f"{IRACING_LOCAL_RENDER_URL}pk_suit.png?size=3&tick={stamp}&suitCustPaint={paint}"
+    return f"{IRACING_LOCAL_RENDER_URL}pk_helmet.png?size=2&tick={stamp}&hlmtCustPaint={paint}"
+
+
+def _write_bytes_atomically(destination: Path, payload: bytes) -> None:
+    temp_path = destination.with_name(f"{destination.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temp_path.write_bytes(payload)
+        os.replace(temp_path, destination)
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
+def _looks_like_html_payload(path: Path) -> bool:
+    """True when a paint download is actually an HTML/XML error page.
+
+    Trading Paints and proxies can answer HTTP 200 with a challenge/login/error page.
+    Writing that as a TGA/MIP replaces a good paint with a file iRacing cannot read.
+    A real paint starts with binary bytes, never '<'.
+    """
+    try:
+        with Path(path).open("rb") as handle:
+            head = handle.read(512)
+    except OSError:
+        return False
+    head = head.lstrip(b"\xef\xbb\xbf \t\r\n")
+    return head.startswith(b"<")
+
+
+def _paint_payload_looks_valid(path: Path, paint_type: PaintType) -> bool:
+    """True when a downloaded paint payload can be written without breaking a paint.
+
+    Compressed downloads must be real bz2 streams, TGA payloads must carry a
+    truecolor header iRacing can read, and MIP payloads must at least be
+    non-empty and not an HTML/XML error page.
+    """
+    payload = Path(path)
+    try:
+        if payload.stat().st_size <= 0:
+            return False
+    except OSError:
+        return False
+    suffix = payload.suffix.lower()
+    if suffix == ".bz2":
+        try:
+            with payload.open("rb") as handle:
+                return handle.read(3) == b"BZh"
+        except OSError:
+            return False
+    if paint_type is PaintType.CAR_SPEC or suffix == ".mip":
+        return not _looks_like_html_payload(payload)
+    try:
+        with payload.open("rb") as handle:
+            header = handle.read(18)
+    except OSError:
+        return False
+    stripped = header.lstrip(b"\xef\xbb\xbf \t\r\n")
+    if stripped.startswith((b"<", b"{", b"[")):
+        return False
+    if len(header) < 18:
+        # Short opaque payloads predate the TGA check; only reject a short file
+        # when its first bytes could be a truncated TGA header.
+        return len(header) < 2 or header[1] not in {0, 1}
+    if header[1] not in {0, 1}:
+        # Not a TGA header at all: keep accepting the non-HTML payloads callers
+        # could already save before this validation existed.
+        return True
+    image_type = header[2]
+    width = int.from_bytes(header[12:14], "little")
+    height = int.from_bytes(header[14:16], "little")
+    pixel_depth = header[16]
+    return (
+        image_type in {2, 10}
+        and 0 < width <= 8192
+        and 0 < height <= 8192
+        and pixel_depth in {24, 32}
+    )
+
+
+def fetch_iracing_render_png(
+    url: str,
+    destination: Path,
+    *,
+    timeout: float = 10.0,
+    session: requests.Session | None = None,
+) -> Path | None:
+    if not url:
+        return None
+    http = session or get_thread_http_session()
+    try:
+        # The local render service is asked for one car at a time.
+        with _IRACING_RENDER_LOCK:
+            response = http.get(url, timeout=timeout)
+            status_code = response.status_code
+            content = response.content or b""
+    except requests.RequestException as exc:
+        logging.debug("iRacing render request failed: %s", exc)
+        return None
+    if status_code != 200:
+        logging.debug("iRacing render returned HTTP %s", status_code)
+        return None
+    if not content.startswith(_PNG_SIGNATURE):
+        logging.debug("iRacing render did not return a PNG")
+        return None
+    resolved = Path(destination)
+    try:
+        resolved.parent.mkdir(parents=True, exist_ok=True)
+        _write_bytes_atomically(resolved, content)
+    except OSError as exc:
+        logging.debug("Could not write iRacing render %s: %s", resolved, exc)
+        return None
+    return resolved
+
+
+def iracing_render_service_available(*, timeout: float = 1.0, session: requests.Session | None = None) -> bool:
+    http = session or get_thread_http_session()
+    try:
+        with _IRACING_RENDER_LOCK:
+            http.get(IRACING_LOCAL_RENDER_URL, timeout=timeout)
+    except Exception as exc:
+        logging.debug("iRacing render service is unavailable: %s", exc)
+        return False
+    return True
+
+
+def _load_pillow_image_module() -> Any | None:
+    global _PILLOW_IMPORT_WARNING_LOGGED
+    try:
+        from PIL import Image
+    except ImportError:
+        if not _PILLOW_IMPORT_WARNING_LOGGED:
+            logging.warning("Pillow is not installed; paint previews are unavailable.")
+            _PILLOW_IMPORT_WARNING_LOGGED = True
+        return None
+    return Image
+
+
+def tga_to_png_bytes(tga_path: Path, *, max_size: int | None = None) -> bytes | None:
+    Image = _load_pillow_image_module()
+    if Image is None:
+        return None
+    try:
+        with Image.open(tga_path) as image:
+            converted = image.convert("RGBA")
+        if max_size and max_size > 0:
+            converted.thumbnail((max_size, max_size))
+        buffer = io.BytesIO()
+        converted.save(buffer, format="PNG")
+    except Exception as exc:
+        logging.debug("Could not decode TGA %s: %s", tga_path, exc)
+        return None
+    return buffer.getvalue()
+
+
+def _atomic_save_tga(image: Any, destination: Path) -> None:
+    temp_path = destination.with_name(f"{destination.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        # RLE is lossless. A 16 MB decal copied to 40 drivers is otherwise 640 MB
+        # of disk I/O for every session.
+        image.save(temp_path, format="TGA", compression="tga_rle")
+        os.replace(temp_path, destination)
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
+def merge_decal_onto_tga(car_tga: Path, decal_tga: Path, destination: Path) -> Path | None:
+    Image = _load_pillow_image_module()
+    if Image is None:
+        return None
+    car_path = Path(car_tga)
+    decal_path = Path(decal_tga)
+    resolved = Path(destination)
+    try:
+        with Image.open(car_path) as car_image:
+            car = car_image.convert("RGBA")
+    except Exception as exc:
+        logging.debug("Could not read car paint %s: %s", car_path, exc)
+        return None
+    try:
+        resolved.parent.mkdir(parents=True, exist_ok=True)
+        if not decal_path.exists():
+            _write_bytes_atomically(resolved, car_path.read_bytes())
+            return resolved
+        with Image.open(decal_path) as decal_image:
+            decal = decal_image.convert("RGBA")
+        if decal.size != car.size:
+            decal = decal.resize(car.size)
+        _atomic_save_tga(Image.alpha_composite(car, decal), resolved)
+    except Exception as exc:
+        logging.debug("Could not merge decal %s onto %s: %s", decal_path, car_path, exc)
+        return None
+    return resolved
+
+
+# --- League library -------------------------------------------------------
+LEAGUE_LIBRARY_DECAL_KIND = "decal"
+LEAGUE_LIBRARY_PAINT_KIND = "paint"
+LEAGUE_LIBRARY_TGA_RECOMPRESS_BYTES = 10 * 1024 * 1024
+
+
+@dataclass(frozen=True)
+class LeagueLibraryEntry:
+    kind: str
+    league_id: int
+    car_class: str = ""
+    member_id: int = 0
+    car_folder: str = ""
+    num_type: str = ""
+    ext: str = "tga"
+
+
+def _parse_league_library_league(value: str) -> tuple[int, str] | None:
+    base, _separator, car_class = str(value or "").partition("-")
+    if not base.isdigit():
+        return None
+    league_id = int(base)
+    if league_id <= 0:
+        return None
+    return league_id, car_class.strip()
+
+
+def _parse_league_library_body(body: list[str], *, member_required: bool) -> tuple[int, str, int, str] | None:
+    if len(body) < 2:
+        return None
+    league = _parse_league_library_league(body[0])
+    if league is None:
+        return None
+    league_id, car_class = league
+    if body[1].isdigit():
+        member_id = int(body[1])
+        car_parts = body[2:]
+    elif member_required:
+        return None
+    else:
+        member_id = 0
+        car_parts = body[1:]
+    if not car_parts:
+        return None
+    car_folder = ".".join(car_parts).strip()
+    if not car_folder:
+        return None
+    return league_id, car_class, member_id, car_folder
+
+
+def parse_league_library_name(name: str) -> LeagueLibraryEntry | None:
+    parts = Path(str(name or "")).name.split(".")
+    if len(parts) < 4:
+        return None
+    ext = parts[-1].lower()
+    if ext == "tga" and parts[-2].lower() == "decal":
+        parsed = _parse_league_library_body(parts[:-2], member_required=False)
+        if parsed is None:
+            return None
+        league_id, car_class, member_id, car_folder = parsed
+        return LeagueLibraryEntry(
+            kind=LEAGUE_LIBRARY_DECAL_KIND,
+            league_id=league_id,
+            car_class=car_class,
+            member_id=member_id,
+            car_folder=car_folder,
+            ext="tga",
+        )
+    if len(parts) >= 5 and parts[-3].lower() == "paint" and ext in {"tga", "mip"}:
+        num_type = parts[-2].lower()
+        if num_type not in {"num", "sim"}:
+            return None
+        if ext == "mip":
+            num_type = "sim"
+        parsed = _parse_league_library_body(parts[:-3], member_required=True)
+        if parsed is None:
+            return None
+        league_id, car_class, member_id, car_folder = parsed
+        return LeagueLibraryEntry(
+            kind=LEAGUE_LIBRARY_PAINT_KIND,
+            league_id=league_id,
+            car_class=car_class,
+            member_id=member_id,
+            car_folder=car_folder,
+            num_type=num_type,
+            ext=ext,
+        )
+    return None
+
+
+def _league_library_name_component(value: object) -> str:
+    """Avoid Windows-invalid characters in a class or car folder name.
+
+    The class comes from iRacing and can contain '/', ':' or similar. Dots, spaces
+    and hyphens are legal and must stay because they distinguish PRO-AM classes and
+    dotted car folders.
+    """
+    return re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", str(value or "").strip())
+
+
+def league_library_name(entry: LeagueLibraryEntry) -> str:
+    league = f"{int(entry.league_id):06d}"
+    car_class = _league_library_name_component(entry.car_class)
+    if car_class:
+        league = f"{league}-{car_class}"
+    member = f"{int(entry.member_id):07d}"
+    car_folder = _league_library_name_component(entry.car_folder)
+    if entry.kind == LEAGUE_LIBRARY_DECAL_KIND:
+        return f"{league}.{member}.{car_folder}.decal.tga"
+    ext = str(entry.ext or "tga").lower()
+    num_type = "sim" if ext == "mip" else str(entry.num_type or "sim").lower()
+    return f"{league}.{member}.{car_folder}.paint.{num_type}.{ext}"
+
+
+def load_league_library(folder: Path) -> list[LeagueLibraryEntry]:
+    root = Path(folder)
+    if not root.is_dir():
+        return []
+    entries: list[LeagueLibraryEntry] = []
+    for path in sorted(root.iterdir()):
+        if not path.is_file():
+            continue
+        entry = parse_league_library_name(path.name)
+        if entry is None:
+            continue
+        canonical = league_library_name(entry)
+        if path.name != canonical:
+            target = root / canonical
+            if target.exists():
+                try:
+                    same_file = target.samefile(path)
+                except OSError:
+                    same_file = False
+                if not same_file:
+                    logging.debug("League library kept %s because %s already exists", path.name, canonical)
+                    continue
+            try:
+                path.rename(target)
+            except OSError as exc:
+                if not target.exists():
+                    logging.warning("League library could not rename %s to %s: %s", path.name, canonical, exc)
+                    continue
+        entries.append(entry)
+    return entries
+
+
+def _league_library_member_id(source_name: str, member_id_hint: int) -> int:
+    stripped = Path(str(source_name or "")).stem.lower()
+    for token in ("car_", "num_", "decal_", "spec_", "team_"):
+        stripped = stripped.replace(token, "")
+    match = re.search(r"\d+", stripped)
+    if match is not None:
+        try:
+            return int(match.group(0))
+        except ValueError:
+            pass
+    try:
+        return max(0, int(member_id_hint or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def league_library_import_name(
+    source_name: str,
+    league_id: int,
+    member_id_hint: int,
+    car_folder: str,
+    car_class: str = "",
+) -> str | None:
+    try:
+        league = int(league_id)
+    except (TypeError, ValueError):
+        return None
+    folder = str(car_folder or "").strip()
+    if league <= 0 or not folder:
+        return None
+    source = Path(str(source_name or "")).name
+    lower = source.lower()
+    _stem, ext = os.path.splitext(lower)
+    if ext not in {".tga", ".mip"}:
+        return None
+    member_id = _league_library_member_id(source, member_id_hint)
+    if "decal" in lower:
+        if ext != ".tga":
+            return None
+        return league_library_name(
+            LeagueLibraryEntry(
+                kind=LEAGUE_LIBRARY_DECAL_KIND,
+                league_id=league,
+                car_class=str(car_class or "").strip(),
+                member_id=member_id,
+                car_folder=folder,
+                ext="tga",
+            )
+        )
+    if member_id <= 0:
+        return None
+    if lower.startswith("car_num_") and ext == ".tga":
+        entry = LeagueLibraryEntry(
+            kind=LEAGUE_LIBRARY_PAINT_KIND,
+            league_id=league,
+            car_class=str(car_class or "").strip(),
+            member_id=member_id,
+            car_folder=folder,
+            num_type="num",
+            ext="tga",
+        )
+        return league_library_name(entry)
+    if lower.startswith("car_spec_") and ext == ".mip":
+        entry = LeagueLibraryEntry(
+            kind=LEAGUE_LIBRARY_PAINT_KIND,
+            league_id=league,
+            car_class=str(car_class or "").strip(),
+            member_id=member_id,
+            car_folder=folder,
+            num_type="sim",
+            ext="mip",
+        )
+        return league_library_name(entry)
+    if lower.startswith("car_") and ext == ".tga":
+        entry = LeagueLibraryEntry(
+            kind=LEAGUE_LIBRARY_PAINT_KIND,
+            league_id=league,
+            car_class=str(car_class or "").strip(),
+            member_id=member_id,
+            car_folder=folder,
+            num_type="sim",
+            ext="tga",
+        )
+        return league_library_name(entry)
+    return None
+
+
+def _league_library_source_path(entry: LeagueLibraryEntry) -> Path:
+    return default_league_library_dir() / league_library_name(entry)
+
+
+def _league_library_same_car_folder(left: str, right: str) -> bool:
+    return str(left or "").strip().casefold() == str(right or "").strip().casefold()
+
+
+def _league_library_class_matches(entry: LeagueLibraryEntry, car_class: str) -> bool:
+    return not entry.car_class or entry.car_class.casefold() == str(car_class or "").strip().casefold()
+
+
+def _league_library_decal_entry(
+    entries: list[LeagueLibraryEntry],
+    *,
+    member_id: int,
+    car_class: str,
+) -> LeagueLibraryEntry | None:
+    driver_class: LeagueLibraryEntry | None = None
+    driver_any: LeagueLibraryEntry | None = None
+    for entry in entries:
+        if entry.kind != LEAGUE_LIBRARY_DECAL_KIND or entry.member_id != member_id:
+            continue
+        if entry.car_class:
+            if entry.car_class.casefold() == str(car_class or "").strip().casefold():
+                driver_class = entry
+        else:
+            driver_any = entry
+    return driver_class or driver_any
+
+
+@dataclass(frozen=True)
+class LeaguePreviewSelection:
+    league_id: int
+    car_folder: str
+    car_class: str
+    member_id: int
+    decal_path: Path | None
+    paint_path: Path | None
+
+
+@dataclass(frozen=True)
+class LeagueExportJob:
+    league_id: int
+    member_id: int
+    car_folder: str
+    car_class: str
+    paint_path: Path
+    decal_path: Path | None
+    file_name: str
+
+
+def _league_library_entries_for_car(
+    entries: Iterable[LeagueLibraryEntry],
+    league_id: int,
+    car_folder: str,
+    car_class: str = "",
+) -> list[LeagueLibraryEntry]:
+    return [
+        entry
+        for entry in entries
+        if int(entry.league_id) == int(league_id)
+        and _league_library_same_car_folder(entry.car_folder, car_folder)
+        and _league_library_class_matches(entry, car_class)
+    ]
+
+
+def league_preview_selection(
+    entries: Iterable[LeagueLibraryEntry],
+    league_id: int,
+    car_folder: str,
+    *,
+    car_class: str = "",
+    member_id: int = 0,
+    paint_path: Path | str | None = None,
+    library_dir: Path | str | None = None,
+) -> LeaguePreviewSelection:
+    """Resolve the decal and paint a league preview should render.
+
+    A driver-specific decal wins over the all-driver decal. The driver's library
+    paint is used unless the caller chose a paint TGA explicitly.
+    """
+    root = Path(library_dir) if library_dir is not None else default_league_library_dir()
+    entries_list = list(entries)
+    car_entries = _league_library_entries_for_car(entries_list, int(league_id), car_folder, car_class)
+    decal_entry = None
+    if int(member_id or 0) > 0:
+        decal_entry = _league_library_decal_entry(car_entries, member_id=int(member_id), car_class=car_class)
+    if decal_entry is None:
+        decal_entry = _league_library_decal_entry(car_entries, member_id=0, car_class=car_class)
+    decal_path: Path | None = None
+    if decal_entry is not None:
+        candidate = root / league_library_name(decal_entry)
+        if candidate.exists():
+            decal_path = candidate
+
+    chosen_paint = Path(paint_path) if paint_path else None
+    if chosen_paint is not None and not chosen_paint.is_file():
+        chosen_paint = None
+    if chosen_paint is None and int(member_id or 0) > 0:
+        paint_entries = [
+            entry
+            for entry in car_entries
+            if entry.kind == LEAGUE_LIBRARY_PAINT_KIND
+            and entry.member_id == int(member_id)
+            and entry.ext == "tga"
+        ]
+        for num_type in ("sim", "num"):
+            for entry in paint_entries:
+                if entry.num_type != num_type:
+                    continue
+                candidate = root / league_library_name(entry)
+                if candidate.is_file():
+                    chosen_paint = candidate
+                    break
+            if chosen_paint is not None:
+                break
+    return LeaguePreviewSelection(
+        league_id=int(league_id),
+        car_folder=str(car_folder or ""),
+        car_class=str(car_class or ""),
+        member_id=int(member_id or 0),
+        decal_path=decal_path,
+        paint_path=chosen_paint,
+    )
+
+
+def _league_export_file_name(league_id: int, member_id: int, car_folder: str, car_class: str = "") -> str:
+    parts = [f"league_{int(league_id):06d}", f"{int(member_id):07d}", str(car_folder or "car")]
+    if str(car_class or "").strip():
+        parts.append(str(car_class).strip())
+    stem = "_".join(parts)
+    stem = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", stem).strip(" .")
+    return f"{stem or 'league_preview'}.png"
+
+
+def league_export_jobs(
+    entries: Iterable[LeagueLibraryEntry],
+    *,
+    league_id: int = 0,
+    library_dir: Path | str | None = None,
+) -> list[LeagueExportJob]:
+    """One render job per library driver/car that has a paint and a decal."""
+    root = Path(library_dir) if library_dir is not None else default_league_library_dir()
+    entries_list = list(entries)
+    if int(league_id or 0) > 0:
+        entries_list = [entry for entry in entries_list if int(entry.league_id) == int(league_id)]
+    groups: dict[tuple[int, str, str, int], list[LeagueLibraryEntry]] = {}
+    for entry in entries_list:
+        if entry.kind != LEAGUE_LIBRARY_PAINT_KIND or entry.member_id <= 0 or entry.ext != "tga":
+            continue
+        key = (int(entry.league_id), str(entry.car_folder or ""), str(entry.car_class or ""), int(entry.member_id))
+        groups.setdefault(key, []).append(entry)
+    jobs: list[LeagueExportJob] = []
+    for (job_league_id, car_folder, car_class, member_id), group in sorted(groups.items()):
+        paint_path: Path | None = None
+        for num_type in ("sim", "num"):
+            for entry in group:
+                if entry.num_type != num_type:
+                    continue
+                candidate = root / league_library_name(entry)
+                if candidate.is_file():
+                    paint_path = candidate
+                    break
+            if paint_path is not None:
+                break
+        if paint_path is None:
+            continue
+        selection = league_preview_selection(
+            entries_list,
+            job_league_id,
+            car_folder,
+            car_class=car_class,
+            member_id=member_id,
+            paint_path=paint_path,
+            library_dir=root,
+        )
+        jobs.append(
+            LeagueExportJob(
+                league_id=job_league_id,
+                member_id=member_id,
+                car_folder=car_folder,
+                car_class=car_class,
+                paint_path=paint_path,
+                decal_path=selection.decal_path,
+                file_name=_league_export_file_name(job_league_id, member_id, car_folder, car_class),
+            )
+        )
+    return jobs
+
+
+def _apply_league_library_for_user(
+    session: Session,
+    user: SessionUser,
+    paints_dir: Path,
+    entries: list[LeagueLibraryEntry],
+) -> list[Path]:
+    written: list[Path] = []
+    label = user.display_name or str(user.user_id)
+    member_id = int(user.user_id)
+    car_class = str(getattr(user, "car_class", "") or "")
+    car_entries = [
+        entry
+        for entry in entries
+        if _league_library_same_car_folder(entry.car_folder, user.directory)
+        and _league_library_class_matches(entry, car_class)
+    ]
+    if not car_entries:
+        return written
+
+    # Use the effective target: a team livery lives on car_team_<team>.tga and
+    # car_decal_team_<team>.tga, not on the current driver's personal files.
+    car_path = _tag_target_path(user, paints_dir, PaintType.CAR)
+    number_path = _tag_target_path(user, paints_dir, PaintType.CAR_NUMBER)
+    spec_path = _tag_target_path(user, paints_dir, PaintType.CAR_SPEC)
+    decal_path = _tag_target_path(user, paints_dir, PaintType.CAR_DECAL)
+
+    paint_entries = [entry for entry in car_entries if entry.kind == LEAGUE_LIBRARY_PAINT_KIND and entry.member_id == member_id]
+    num_entry = next(
+        (entry for entry in paint_entries if entry.num_type == "num" and entry.ext == "tga" and _league_library_source_path(entry).exists()),
+        None,
+    )
+    sim_entry = next(
+        (entry for entry in paint_entries if entry.num_type == "sim" and entry.ext == "tga" and _league_library_source_path(entry).exists()),
+        None,
+    )
+    mip_entry = next(
+        (entry for entry in paint_entries if entry.num_type == "sim" and entry.ext == "mip" and _league_library_source_path(entry).exists()),
+        None,
+    )
+    paint_applied = False
+    if num_entry is not None:
+        number_path.parent.mkdir(parents=True, exist_ok=True)
+        _write_bytes_atomically(number_path, _league_library_source_path(num_entry).read_bytes())
+        written.append(number_path)
+        car_path.unlink(missing_ok=True)
+        paint_applied = True
+    elif sim_entry is not None:
+        car_path.parent.mkdir(parents=True, exist_ok=True)
+        _write_bytes_atomically(car_path, _league_library_source_path(sim_entry).read_bytes())
+        written.append(car_path)
+        paint_applied = True
+    if mip_entry is not None:
+        spec_path.parent.mkdir(parents=True, exist_ok=True)
+        _write_bytes_atomically(spec_path, _league_library_source_path(mip_entry).read_bytes())
+        written.append(spec_path)
+        paint_applied = True
+    elif paint_applied:
+        spec_path.unlink(missing_ok=True)
+    if paint_applied:
+        logging.info("League paint applied to %s", label)
+
+    sources: list[Path] = []
+    if decal_path.exists():
+        sources.append(decal_path)
+    all_drivers = _league_library_decal_entry(car_entries, member_id=0, car_class=car_class)
+    if all_drivers is not None:
+        all_path = _league_library_source_path(all_drivers)
+        if all_path.exists():
+            sources.append(all_path)
+    driver_decal = _league_library_decal_entry(car_entries, member_id=member_id, car_class=car_class)
+    if driver_decal is not None:
+        driver_path = _league_library_source_path(driver_decal)
+        if driver_path.exists():
+            sources.append(driver_path)
+    if not sources or (len(sources) == 1 and sources[0] == decal_path):
+        return written
+    decal_path.parent.mkdir(parents=True, exist_ok=True)
+    if len(sources) == 1:
+        _write_bytes_atomically(decal_path, sources[0].read_bytes())
+    else:
+        Image = _load_pillow_image_module()
+        if Image is None:
+            logging.warning("League decals for %s were not merged because Pillow is unavailable", label)
+            return written
+        images = []
+        for source in sources:
+            with Image.open(source) as image:
+                images.append(image.convert("RGBA"))
+        merged = images[0]
+        for image in images[1:]:
+            if image.size != merged.size:
+                image = image.resize(merged.size)
+            merged = Image.alpha_composite(merged, image)
+        _atomic_save_tga(merged, decal_path)
+    written.append(decal_path)
+    logging.info(
+        "League decal applied to %s: %s => %s",
+        label,
+        " + ".join(source.name for source in sources),
+        decal_path.name,
+    )
+    return written
+
+
+def apply_league_library(
+    session: Session,
+    users: Iterable[SessionUser],
+    paints_dir: Path,
+    library: Iterable[LeagueLibraryEntry],
+) -> list[Path]:
+    league_id = int(getattr(session, "league_id", 0) or 0)
+    if league_id == 0:
+        return []
+    league_entries = [entry for entry in library if int(entry.league_id) == league_id]
+    if not league_entries:
+        return []
+    written: list[Path] = []
+    for user in sorted(users, key=lambda item: int(item.user_id)):
+        if user.is_ai:
+            continue
+        try:
+            written.extend(_apply_league_library_for_user(session, user, paints_dir, league_entries))
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("League library could not be applied to %s: %s", user.display_name or user.user_id, exc)
+            logging.debug("League library traceback for %s\n%s", user.user_id, traceback.format_exc())
+    return written
+
+
+# --- Paint theme tags ------------------------------------------------------
+@dataclass(frozen=True)
+class TagThemeFile:
+    theme: str
+    car_folder: str
+    file_type: str
+    path: Path
+
+    @property
+    def type(self) -> str:
+        return self.file_type
+
+    @property
+    def kind(self) -> str:
+        return self.file_type
+
+
+def parse_tag_theme_file(name: str | Path) -> TagThemeFile | None:
+    """Parse ``<Theme>.<type>.<ext>`` or ``<Theme>.<car folder>.<type>.<ext>``."""
+    filename = Path(str(name or "")).name
+    parts = filename.split(".")
+    if len(parts) < 3:
+        return None
+    file_type = parts[-2].strip().lower()
+    extension = parts[-1].strip().lower()
+    if file_type not in TAG_THEME_TYPES:
+        return None
+    if extension != TAG_THEME_EXTENSIONS.get(file_type, "tga"):
+        return None
+    leading = parts[:-2]
+    theme = str(leading[0] or "").strip()
+    car_folder = ""
+    if len(leading) > 1:
+        # Only the theme may not contain dots; the car folder may contain both
+        # dots and spaces (for example "dirtlatemodel 350" or "weird.car.name").
+        car_folder = ".".join(leading[1:]).strip()
+    if not theme or (len(leading) > 1 and not car_folder):
+        return None
+    return TagThemeFile(theme=theme, car_folder=car_folder, file_type=file_type, path=Path(filename))
+
+
+def load_tag_themes(folder: Path | None = None) -> dict[str, list[TagThemeFile]]:
+    resolved = Path(folder) if folder is not None else default_tag_themes_dir()
+    themes: dict[str, list[TagThemeFile]] = {}
+    display_names: dict[str, str] = {}
+    try:
+        candidates = sorted(resolved.iterdir(), key=lambda item: item.name.casefold())
+    except OSError:
+        return themes
+    for candidate in candidates:
+        if not candidate.is_file():
+            continue
+        parsed = parse_tag_theme_file(candidate.name)
+        if parsed is None:
+            continue
+        key = parsed.theme.casefold()
+        display = display_names.setdefault(key, parsed.theme)
+        themes.setdefault(display, []).append(
+            TagThemeFile(theme=display, car_folder=parsed.car_folder, file_type=parsed.file_type, path=candidate)
+        )
+    return themes
+
+
+def tag_theme_files_for(theme_files: Iterable[TagThemeFile], car_folder: str) -> dict[str, Path]:
+    """Return the files for one car; a car-specific file wins over a generic one."""
+    wanted = str(car_folder or "").strip().casefold()
+    generic: dict[str, Path] = {}
+    specific: dict[str, Path] = {}
+    for entry in theme_files:
+        if not entry.car_folder:
+            generic[entry.file_type] = entry.path
+        elif wanted and entry.car_folder.strip().casefold() == wanted:
+            specific[entry.file_type] = entry.path
+    generic.update(specific)
+    return generic
+
+
+def _tag_theme_entries(themes: dict[str, list[TagThemeFile]], theme_name: str) -> list[TagThemeFile] | None:
+    wanted = str(theme_name or "").strip().casefold()
+    if not wanted:
+        return None
+    for name, entries in themes.items():
+        if name.casefold() == wanted:
+            return entries
+    return None
+
+
+def _tag_target_id(user: SessionUser) -> int:
+    if session_user_uses_team_target(user):
+        return int(user.team_id or 0)
+    return int(user.user_id)
+
+
+def _tag_target_path(user: SessionUser, paints_dir: Path, paint_type: PaintType) -> Path:
+    return save_path_for(
+        DownloadId(
+            user_id=_tag_target_id(user),
+            directory=user.directory,
+            paint_type=paint_type,
+            is_team_paint=session_user_uses_team_target(user),
+            ext=user.paint_ext if _is_car_related_paint_type(paint_type) else "",
+        ),
+        paints_dir,
+    )
+
+
+def _tag_paint_variant_paths(user: SessionUser, paints_dir: Path) -> list[Path]:
+    paths: list[Path] = []
+    target_ids = {(int(user.user_id), False)}
+    if user.team_id:
+        target_ids.add((int(user.team_id), True))
+    for target_id, is_team in target_ids:
+        for paint_type in (PaintType.CAR, PaintType.CAR_NUMBER):
+            for superspeedway in (False, True):
+                paths.append(
+                    save_path_for(
+                        DownloadId(
+                            user_id=target_id,
+                            directory=user.directory,
+                            paint_type=paint_type,
+                            is_team_paint=is_team,
+                            is_superspeedway_variant=superspeedway,
+                            ext=user.paint_ext,
+                        ),
+                        paints_dir,
+                    )
+                )
+    return list(dict.fromkeys(paths))
+
+
+def _copy_theme_file(source: Path, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    _write_bytes_atomically(destination, source.read_bytes())
+
+
+def _apply_tag_theme_for_user(
+    session: Session,
+    user: SessionUser,
+    paints_dir: Path,
+    entries: list[TagThemeFile],
+    theme_name: str,
+) -> list[Path]:
+    if session_user_is_local_target(session, user):
+        return []
+    files = tag_theme_files_for(entries, user.directory)
+    if not files:
+        return []
+    written: list[Path] = []
+    label = user.display_name or str(user.user_id)
+    car_path = _tag_target_path(user, paints_dir, PaintType.CAR)
+    number_path = _tag_target_path(user, paints_dir, PaintType.CAR_NUMBER)
+    spec_path = _tag_target_path(user, paints_dir, PaintType.CAR_SPEC)
+    decal_path = _tag_target_path(user, paints_dir, PaintType.CAR_DECAL)
+
+    paint_paths: list[Path] = []
+    if "car" in files:
+        _copy_theme_file(files["car"], car_path)
+        written.append(car_path)
+        paint_paths.append(car_path)
+    if "num" in files:
+        _copy_theme_file(files["num"], number_path)
+        written.append(number_path)
+        paint_paths.append(number_path)
+    if paint_paths:
+        # Theme paints are self-contained: anything the theme does not supply
+        # would otherwise be stacked on top of it.
+        for other in _tag_paint_variant_paths(user, paints_dir):
+            if other not in paint_paths:
+                other.unlink(missing_ok=True)
+        if "spec" in files:
+            _copy_theme_file(files["spec"], spec_path)
+            written.append(spec_path)
+        else:
+            spec_path.unlink(missing_ok=True)
+        if "decal" in files:
+            _copy_theme_file(files["decal"], decal_path)
+            written.append(decal_path)
+        else:
+            decal_path.unlink(missing_ok=True)
+    else:
+        if "spec" in files:
+            _copy_theme_file(files["spec"], spec_path)
+            written.append(spec_path)
+        if "decal" in files:
+            _copy_theme_file(files["decal"], decal_path)
+            written.append(decal_path)
+    if "helmet" in files:
+        helmet_path = _tag_target_path(user, paints_dir, PaintType.HELMET)
+        _copy_theme_file(files["helmet"], helmet_path)
+        written.append(helmet_path)
+    if "suit" in files:
+        suit_path = _tag_target_path(user, paints_dir, PaintType.SUIT)
+        _copy_theme_file(files["suit"], suit_path)
+        written.append(suit_path)
+    if written:
+        logging.info("Theme %s applied to %s", theme_name, label)
+    return written
+
+
+def apply_tag_themes(
+    session: Session,
+    users: Iterable[SessionUser],
+    paints_dir: Path,
+    themes: dict[str, list[TagThemeFile]] | None = None,
+    assignments: dict[str, str] | None = None,
+    themes_dir: Path | None = None,
+) -> list[Path]:
+    theme_map = themes if themes is not None else load_tag_themes(themes_dir)
+    tags = assignments if assignments is not None else tags_from_people(load_people())
+    written: list[Path] = []
+    for user in sorted(users, key=lambda item: int(item.user_id)):
+        if user.is_ai:
+            continue
+        theme_name = str(tags.get(str(user.user_id)) or "").strip()
+        if not theme_name:
+            continue
+        entries = _tag_theme_entries(theme_map, theme_name)
+        if entries is None:
+            logging.debug("Theme %s assigned to %s is not in the themes folder", theme_name, user.user_id)
+            continue
+        try:
+            written.extend(_apply_tag_theme_for_user(session, user, paints_dir, entries, theme_name))
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("Theme %s could not be applied to %s: %s", theme_name, user.display_name or user.user_id, exc)
+            logging.debug("Theme traceback for %s\n%s", user.user_id, traceback.format_exc())
+    return written
+
+
+# --- iRating / SR warning decals ------------------------------------------
+def normalize_warning_decal_mode(value: object) -> str:
+    mode = str(value or "off").strip().lower()
+    return mode if mode in WARNING_DECAL_MODES else "off"
+
+
+def warning_decal_mode_label(value: object) -> str:
+    labels = {"off": "Off", "and": "AND", "or": "OR"}
+    return labels[normalize_warning_decal_mode(value)]
+
+
+def warning_decal_mode_from_label(value: object) -> str:
+    return normalize_warning_decal_mode(str(value or "").strip().lower())
+
+
+def clamp_warning_decal_irating(value: object, fallback: int = 1500) -> int:
+    try:
+        number = int(float(value))
+    except (TypeError, ValueError):
+        number = int(fallback)
+    return max(1000, min(10000, number))
+
+
+def clamp_warning_decal_safety(value: object, fallback: float = 2.0) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        number = float(fallback)
+    return max(0.1, min(5.0, number))
+
+
+def _warning_licence_parts(user: SessionUser) -> tuple[str, float | None]:
+    label = str(getattr(user, "license_label", "") or "").strip()
+    letter = label[:1].upper() if label else ""
+    if not letter.isalpha():
+        letter = ""
+    sr_text = str(getattr(user, "safety_rating", "") or "").strip().replace(",", ".")
+    sr_value: float | None = None
+    try:
+        sr_value = float(sr_text)
+    except ValueError:
+        parts = label.split()
+        if len(parts) >= 2:
+            try:
+                sr_value = float(parts[1].replace(",", "."))
+            except ValueError:
+                sr_value = None
+    return letter, sr_value
+
+
+def warning_decal_applies(user: SessionUser, mode: str, irating_limit: int, safety_limit: float) -> bool:
+    """Whether this driver's iRating/SR puts them below the warning thresholds."""
+    normalized_mode = normalize_warning_decal_mode(mode)
+    if normalized_mode == "off" or user.is_ai:
+        return False
+    letter, safety_rating = _warning_licence_parts(user)
+    if not letter or letter == "R" or safety_rating is None:
+        return False
+    try:
+        irating = int(user.irating) if user.irating is not None else None
+    except (TypeError, ValueError):
+        irating = None
+    irating_matches = irating is not None and irating <= int(irating_limit)
+    safety_matches = safety_rating <= float(safety_limit)
+    if normalized_mode == "and":
+        return irating_matches and safety_matches
+    return irating_matches or safety_matches
+
+
+def warning_decal_source(car_folder: str, themes_dir: Path | None = None) -> Path | None:
+    folder = Path(themes_dir) if themes_dir is not None else default_tag_themes_dir()
+    wanted = str(car_folder or "").strip()
+    candidates = [f"{WARNING_DECAL_THEME_NAME}.decal.tga"]
+    if wanted:
+        candidates.insert(0, f"{WARNING_DECAL_THEME_NAME}.{wanted}.decal.tga")
+    for name in candidates:
+        direct = folder / name
+        if direct.is_file():
+            return direct
+        try:
+            lowered = name.casefold()
+            for candidate in folder.iterdir():
+                if candidate.is_file() and candidate.name.casefold() == lowered:
+                    return candidate
+        except OSError:
+            continue
+    return None
+
+
+def _warning_apply_one(
+    session: Session,
+    user: SessionUser,
+    paints_dir: Path,
+    source: Path,
+) -> Path | None:
+    if session_user_is_local_target(session, user):
+        return None
+    destination = _tag_target_path(user, paints_dir, PaintType.CAR_DECAL)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if not destination.exists():
+        _copy_theme_file(source, destination)
+    else:
+        Image = _load_pillow_image_module()
+        if Image is None:
+            logging.warning("Warning decal for %s was not composited because Pillow is unavailable", user.display_name or user.user_id)
+            return None
+        with Image.open(destination) as existing_image:
+            existing = existing_image.convert("RGBA")
+        with Image.open(source) as warning_image:
+            warning = warning_image.convert("RGBA")
+        if warning.size != existing.size:
+            warning = warning.resize(existing.size)
+        _atomic_save_tga(Image.alpha_composite(existing, warning), destination)
+    logging.info("Warning decal applied to %s", user.display_name or user.user_id)
+    return destination
+
+
+def apply_warning_decals(
+    session: Session,
+    users: Iterable[SessionUser],
+    paints_dir: Path,
+    mode: "AppConfig | str | None" = None,
+    irating_limit: int | None = None,
+    safety_limit: float | None = None,
+    themes_dir: Path | None = None,
+) -> list[Path]:
+    if hasattr(mode, "warning_decal_mode"):
+        config = mode
+        selected_mode = normalize_warning_decal_mode(getattr(config, "warning_decal_mode", "off"))
+        irating_value = clamp_warning_decal_irating(getattr(config, "warning_decal_irating", 1500))
+        safety_value = clamp_warning_decal_safety(getattr(config, "warning_decal_safety", 2.0))
+    else:
+        selected_mode = normalize_warning_decal_mode(mode)
+        irating_value = clamp_warning_decal_irating(1500 if irating_limit is None else irating_limit)
+        safety_value = clamp_warning_decal_safety(2.0 if safety_limit is None else safety_limit)
+    if selected_mode == "off":
+        return []
+    written: list[Path] = []
+    for user in sorted(users, key=lambda item: int(item.user_id)):
+        if not warning_decal_applies(user, selected_mode, irating_value, safety_value):
+            continue
+        try:
+            source = warning_decal_source(user.directory, themes_dir)
+            if source is None:
+                continue
+            path = _warning_apply_one(session, user, paints_dir, source)
+            if path is not None:
+                written.append(path)
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("Warning decal could not be applied to %s: %s", user.display_name or user.user_id, exc)
+            logging.debug("Warning decal traceback for %s\n%s", user.user_id, traceback.format_exc())
+    return written
+
+
+def find_default_spec_map(directory: str, spec_dir: Path | None = None) -> Path | None:
+    """The user's spec map for a car folder, matching the file stem case-insensitively."""
+    stem = str(directory or "").strip()
+    if not stem:
+        return None
+    folder = Path(spec_dir) if spec_dir is not None else default_spec_maps_dir()
+    try:
+        candidates = sorted(folder.iterdir(), key=lambda item: item.name.lower())
+    except OSError:
+        return None
+    for candidate in candidates:
+        if candidate.is_file() and candidate.suffix.lower() == ".mip" and candidate.stem.lower() == stem.lower():
+            return candidate
+    return None
+
+
+def _user_car_paint_paths(user: SessionUser, paints_dir: Path) -> list[Path]:
+    is_team = session_user_uses_team_target(user)
+    target_id = int(user.team_id or 0) if is_team else int(user.user_id)
+    paths: list[Path] = []
+    for paint_type in (PaintType.CAR, PaintType.CAR_NUMBER):
+        try:
+            paths.append(
+                save_path_for(
+                    DownloadId(
+                        user_id=target_id,
+                        directory=user.directory,
+                        paint_type=paint_type,
+                        is_team_paint=is_team,
+                        ext=user.paint_ext,
+                    ),
+                    paints_dir,
+                )
+            )
+        except Exception:
+            logging.debug("Could not resolve %s path for %s", paint_type.value, user.user_id, exc_info=True)
+    return paths
+
+
+def apply_default_spec_maps(
+    session: Session,
+    users: Iterable[SessionUser],
+    paints_dir: Path,
+    *,
+    spec_dir: Path | None = None,
+) -> list[Path]:
+    """Copy the user's default spec map to every driver paint that has none."""
+    del session  # only the user's target kind and the paint folder decide the paths
+    written: list[Path] = []
+    paints_root = Path(paints_dir)
+    for user in sorted(users, key=lambda item: (int(item.user_id), str(item.directory).lower())):
+        try:
+            if not any(path.exists() for path in _user_car_paint_paths(user, paints_root)):
+                continue
+            is_team = session_user_uses_team_target(user)
+            target_id = int(user.team_id or 0) if is_team else int(user.user_id)
+            spec_path = save_path_for(
+                DownloadId(
+                    user_id=target_id,
+                    directory=user.directory,
+                    paint_type=PaintType.CAR_SPEC,
+                    is_team_paint=is_team,
+                    ext=user.paint_ext,
+                ),
+                paints_root,
+            )
+            if spec_path.exists():
+                continue
+            source = find_default_spec_map(user.directory, spec_dir)
+            if source is None:
+                continue
+            spec_path.parent.mkdir(parents=True, exist_ok=True)
+            _write_bytes_atomically(spec_path, source.read_bytes())
+            written.append(spec_path)
+            logging.info(
+                "Default spec map applied to %s (%s)",
+                user.display_name or user.user_id,
+                user.car_name or user.directory,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("Default spec map could not be applied to %s: %s", user.display_name or user.user_id, exc)
+            logging.debug("Default spec map traceback for %s\n%s", user.user_id, traceback.format_exc())
+    return written
+
+
+def apply_post_save_extras(
+    session: Session,
+    users: Iterable[SessionUser],
+    paints_dir: Path,
+    *,
+    use_default_spec_maps: bool = True,
+) -> list[Path]:
+    """Per-session file adjustments after every paint is saved, in stacking order: league library, theme tags, warning decals, then default spec maps."""
+    users = list(users)
+    written: list[Path] = []
+    try:
+        library = load_league_library(default_league_library_dir())
+        written.extend(apply_league_library(session, users, paints_dir, library))
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("League library adjustments failed; the session paints are unaffected: %s", exc)
+        logging.debug("League library adjustment traceback\n%s", traceback.format_exc())
+    try:
+        written.extend(apply_tag_themes(session, users, paints_dir))
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("Theme tag adjustments failed; the session paints are unaffected: %s", exc)
+        logging.debug("Theme tag traceback\n%s", traceback.format_exc())
+    try:
+        config = ConfigStore().load()
+        written.extend(apply_warning_decals(session, users, paints_dir, config))
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("Warning decal adjustments failed; the session paints are unaffected: %s", exc)
+        logging.debug("Warning decal traceback\n%s", traceback.format_exc())
+    if use_default_spec_maps:
+        try:
+            written.extend(apply_default_spec_maps(session, users, paints_dir))
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("Default spec map adjustments failed; the session paints are unaffected: %s", exc)
+            logging.debug("Default spec map adjustment traceback\n%s", traceback.format_exc())
+    return written
+
+
+def car_thumbnail_name(user: SessionUser, *, local: bool) -> str:
+    try:
+        folder = Path(str(user.directory or "").strip()).name
+    except (TypeError, ValueError):
+        folder = ""
+    folder = folder.replace(" ", "_") or "car"
+    if local:
+        return f"{folder}.png"
+    return f"{int(user.user_id)}_{folder}.png"
+
+
+def _thumbnail_is_current(thumbnail: Path, car_tga: Path) -> bool:
+    try:
+        return thumbnail.stat().st_mtime >= car_tga.stat().st_mtime
+    except OSError:
+        return False
+
+
+def _generate_car_thumbnail_for_user(
+    user: SessionUser,
+    paints_dir: Path,
+    *,
+    local: bool,
+    thumbnails_root: Path,
+    url_for: Callable[..., str],
+    fetch: Callable[[str, Path], Path | None],
+    merge: Callable[[Path, Path, Path], Path | None],
+) -> Path | None:
+    car_tga, car_kind = _session_preview_car_selection(user, paints_dir)
+    if car_tga is None:
+        return None
+    destination = thumbnails_root / car_thumbnail_name(user, local=local)
+    if _thumbnail_is_current(destination, car_tga):
+        return None
+    decal_tga = _session_preview_paint_file(user, paints_dir, PaintType.CAR_DECAL)
+    with tempfile.TemporaryDirectory(prefix="nishizumi-thumb-") as temp_dir:
+        render_tga = car_tga
+        if decal_tga is not None:
+            merged = merge(car_tga, decal_tga, Path(temp_dir) / "car.tga")
+            if merged is not None:
+                render_tga = Path(merged)
+        url = url_for(
+            car_kind,
+            render_tga,
+            car_path=user.directory,
+            design=user.car_design,
+            number=user.number if car_kind == "car" else None,
+        )
+        return fetch(url, destination)
+
+
+def generate_car_thumbnails(
+    session: Session,
+    users: Iterable[SessionUser],
+    paints_dir: Path,
+    *,
+    create_own: bool = True,
+    create_session: bool = False,
+    thumbnails_dir: Path | None = None,
+    service_available: Callable[[], bool] | None = None,
+    render_url: Callable[..., str] | None = None,
+    fetch_png: Callable[[str, Path], Path | None] | None = None,
+    merge_decal: Callable[[Path, Path, Path], Path | None] | None = None,
+) -> list[Path]:
+    """Render car thumbnails for the local car and, when enabled, the rest of the session."""
+    if not (create_own or create_session):
+        return []
+    available = service_available or iracing_render_service_available
+    if not available():
+        return []
+    url_for = render_url or iracing_render_url
+    fetch = fetch_png or fetch_iracing_render_png
+    merge = merge_decal or merge_decal_onto_tga
+    thumbnails_root = Path(thumbnails_dir) if thumbnails_dir is not None else default_car_thumbnails_dir()
+    try:
+        thumbnails_root.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        logging.warning("Could not create the car thumbnails folder %s: %s", thumbnails_root, exc)
+        return []
+    paints_root = Path(paints_dir)
+    written: list[Path] = []
+    for user in sorted(users, key=lambda item: (int(item.user_id), str(item.directory).lower())):
+        try:
+            local = session_user_is_local_target(session, user)
+            if local and not create_own:
+                continue
+            if not local and (user.is_ai or not create_session):
+                continue
+            thumbnail = _generate_car_thumbnail_for_user(
+                user,
+                paints_root,
+                local=local,
+                thumbnails_root=thumbnails_root,
+                url_for=url_for,
+                fetch=fetch,
+                merge=merge,
+            )
+            if thumbnail is not None:
+                written.append(thumbnail)
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("Car thumbnail failed for %s: %s", user.display_name or user.user_id, exc)
+            logging.debug("Car thumbnail traceback for %s\n%s", user.user_id, traceback.format_exc())
+    return written
+
+
+def schedule_car_thumbnails(
+    session: Session,
+    users: Iterable[SessionUser],
+    paints_dir: Path,
+    *,
+    create_own: bool = True,
+    create_session: bool = False,
+    generator: Callable[..., list[Path]] | None = None,
+    thread_factory: Callable[..., threading.Thread] | None = None,
+    settle_seconds: float = 0.0,
+) -> threading.Thread | None:
+    """Run thumbnail rendering off the paint pipeline's thread.
+
+    ``settle_seconds`` gives iRacing time to finish reading the TGAs after a texture
+    reload. Reading them for a render while the sim is still loading made cars render
+    blank, so the production caller waits a moment before touching the same files.
+    """
+    if not (create_own or create_session):
+        return None
+    user_list = list(users)
+    generate = generator or generate_car_thumbnails
+
+    def _work() -> None:
+        try:
+            delay = max(0.0, float(settle_seconds))
+            if delay:
+                time.sleep(delay)
+            generate(session, user_list, paints_dir, create_own=create_own, create_session=create_session)
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("Car thumbnails could not be generated: %s", exc)
+            logging.debug("Car thumbnail scheduling traceback\n%s", traceback.format_exc())
+
+    factory = thread_factory or threading.Thread
+    thread = factory(target=_work, name="car-thumbnails", daemon=True)
+    thread.start()
+    return thread
+
+
+
+def _saved_files_for_extra_paths(session: Session, paints_dir: Path, paths: Iterable[Path]) -> list[SavedFile]:
+    saved: list[SavedFile] = []
+    paint_types = {
+        "decal": PaintType.CAR_DECAL,
+        "car_decal": PaintType.CAR_DECAL,
+        "car_num": PaintType.CAR_NUMBER,
+        "car_spec": PaintType.CAR_SPEC,
+        "car": PaintType.CAR,
+    }
+    users_by_id = {int(user.user_id): user for user in session.users}
+    users_by_team_id = {
+        int(user.team_id): user
+        for user in session.users
+        if user.team_id is not None and session_user_uses_team_target(user)
+    }
+    for path in paths:
+        match = re.match(
+            r"^(car_decal|decal|car_num|car_spec|car)_(team_)?(\d+)(?:_([A-Za-z0-9]+))?",
+            Path(path).name,
+            re.IGNORECASE,
+        )
+        if match is None:
+            continue
+        target_id = int(match.group(3))
+        is_team = bool(match.group(2))
+        user = (users_by_team_id if is_team else users_by_id).get(target_id)
+        if user is None:
+            continue
+        paint_type = paint_types[match.group(1).lower()]
+        ext = str(match.group(4) or "").lower()
+        if ext == "ss":
+            ext = ""
+        saved.append(
+            SavedFile(
+                session_id=session.session_id,
+                download_id=DownloadId(
+                    user_id=target_id,
+                    directory=user.directory,
+                    paint_type=paint_type,
+                    is_team_paint=is_team,
+                    ext=ext,
+                ),
+                file_path=Path(path),
+            )
+        )
+    return saved
+
+
+# --- TP Download tab -------------------------------------------------------
+
+_TP_DOWNLOAD_PAINT_TYPES = {
+    PaintType.CAR,
+    PaintType.CAR_DECAL,
+    PaintType.CAR_SPEC,
+    PaintType.CAR_NUMBER,
+}
+_TP_DOWNLOAD_PREVIEW_DIRNAME = "preview"
+_TP_DOWNLOAD_TEMP_DIRNAME = "tp_download"
+
+
+def tp_download_car_groups(files: list[DownloadFile]) -> dict[str, list[DownloadFile]]:
+    """Group a member's car paint files by car directory, sorted by that directory.
+
+    Trading Paints returns helmets and suits in the same manifest; this tab only
+    browses cars. Directories differing only in case are one car, and the first
+    spelling seen is the one shown.
+    """
+    groups: dict[str, list[DownloadFile]] = {}
+    spellings: dict[str, str] = {}
+    for item in files:
+        download_id = item.download_id
+        if download_id.paint_type not in _TP_DOWNLOAD_PAINT_TYPES:
+            continue
+        directory = str(download_id.directory or "").strip()
+        if not directory:
+            continue
+        key = directory.lower()
+        spellings.setdefault(key, directory)
+        groups.setdefault(key, []).append(item)
+    return {spellings[key]: groups[key] for key in sorted(groups, key=lambda name: (spellings[name].lower(), name))}
+
+
+def pick_tp_preview_items(
+    items: list[DownloadFile], prefer_team: bool
+) -> tuple[DownloadFile | None, DownloadFile | None]:
+    """Pick the car and decal to preview, preferring team paints when asked."""
+    def first(paint_type: PaintType) -> DownloadFile | None:
+        candidates = [item for item in items if item.download_id.paint_type is paint_type]
+        if not candidates:
+            return None
+        candidates.sort(
+            key=lambda item: (
+                0 if (prefer_team and item.download_id.is_team_paint) else 1,
+                0 if not item.download_id.is_superspeedway_variant else 1,
+            )
+        )
+        return candidates[0]
+
+    # A custom-number paint is still a car paint; the caller renders it as car_num.
+    return first(PaintType.CAR) or first(PaintType.CAR_NUMBER), first(PaintType.CAR_DECAL)
+
+
+def tp_download_context_payload(
+    member_id: int,
+    team_id: int,
+    directory: str,
+    *,
+    night: str,
+    series_id: int,
+    league_id: int,
+    custom_numbers: bool,
+    number: str = "64",
+    paint_ext: str = "",
+) -> dict[str, str]:
+    member = int(member_id or 0)
+    team = int(team_id or 0)
+    return {
+        "team": "1" if team > 0 else "0",
+        "user": str(member) or "0",
+        "night": night or "10:00 am",
+        "series": str(int(series_id or 0)),
+        "league": str(int(league_id or 0)),
+        "numbers": "True" if custom_numbers else "False",
+        "list": f"{member}={directory}={team}={normalize_trading_paints_number(number)}={paint_ext}",
+    }
+
+
+def _build_context_download_file(member_id: int, car: ET.Element) -> DownloadFile | None:
+    file_url = (car.findtext("file") or "").strip()
+    directory = (car.findtext("directory") or "").strip()
+    type_raw = (car.findtext("type") or "").strip().lower()
+    if not file_url or not directory or not type_raw:
+        return None
+    _observe_tp_manifest_directory(directory)
+    try:
+        paint_type = PaintType(type_raw)
+    except ValueError:
+        logging.debug("Skipping unknown contextual paint type '%s' for user %s", type_raw, member_id)
+        return None
+    team_id_text = (car.findtext("teamid") or "0").strip() or "0"
+    response_team_id = _to_int_or_none(team_id_text) or 0
+    is_team_paint = bool(response_team_id > 0 and paint_type in TEAM_PAINT_TYPES)
+    return DownloadFile(
+        download_id=DownloadId(
+            user_id=response_team_id if is_team_paint else member_id,
+            directory=directory,
+            paint_type=paint_type,
+            is_team_paint=is_team_paint,
+            is_superspeedway_variant=_manifest_file_url_is_superspeedway_variant(file_url, paint_type),
+            ext=_manifest_entry_ext(car),
+        ),
+        url=file_url,
+        expected_size=_manifest_entry_size(car),
+    )
+
+
+def fetch_tp_download_context(payload: dict[str, str], member_id: int, team_id: int) -> list[DownloadFile]:
+    """Ask the session-aware context manifest for one car folder, for a member or a team."""
+    member = str(int(member_id or 0))
+    team = str(int(team_id or 0))
+    for url in tp_fetch_context_urls():
+        try:
+            http = get_thread_http_session()
+            response = http.post(url, data=payload, timeout=TP_PAINT_DOWNLOAD_TIMEOUT_SECONDS)
+            if response.status_code != 200:
+                logging.debug("TP download context via %s returned HTTP %s", url, response.status_code)
+                continue
+            root = _parse_tp_manifest_xml(response.text)
+        except Exception as exc:
+            logging.debug("TP download context via %s failed: %s", url, exc)
+            continue
+        _note_tp_fetch_url_result(url, None)
+        files: list[DownloadFile] = []
+        for car in root.findall(".//Car"):
+            manifest_user = (car.findtext("userid") or "").strip()
+            manifest_team = (car.findtext("teamid") or "0").strip() or "0"
+            if int(team_id or 0) > 0:
+                accepted = manifest_user == member or manifest_team == team
+            else:
+                accepted = manifest_user == member and manifest_team == "0"
+            if not accepted:
+                continue
+            item = _build_context_download_file(int(member_id or 0), car)
+            if item is not None:
+                files.append(item)
+        return files
+    return []
+
+
+def download_tp_paint_to(item: DownloadFile, paints_dir: Path, *, session=None) -> Path | None:
+    """Download one paint file straight to its canonical name under ``paints_dir``."""
+    try:
+        destination = save_path_for(item.download_id, Path(paints_dir))
+        destination.parent.mkdir(parents=True, exist_ok=True)
+    except (OSError, ValueError) as exc:
+        logging.debug("Could not create the paint path under %s: %s", paints_dir, exc)
+        return None
+    http = session or get_thread_http_session()
+    try:
+        response = http.get(item.url, timeout=TP_PAINT_DOWNLOAD_TIMEOUT_SECONDS)
+    except Exception as exc:
+        logging.debug("Paint download failed for %s: %s", item.url, exc)
+        return None
+    status_code = getattr(response, "status_code", 0)
+    if status_code in {403, 404}:
+        logging.debug("Paint download for %s returned HTTP %s", item.url, status_code)
+        return None
+    if status_code != 200:
+        logging.debug("Paint download for %s returned HTTP %s", item.url, status_code)
+        return None
+    content = response.content or b""
+    if not content:
+        logging.debug("Paint download for %s returned an empty body", item.url)
+        return None
+    compressed = urllib.parse.urlsplit(str(item.url)).path.lower().endswith(".bz2")
+    token = uuid.uuid4().hex
+    temp_path = destination.with_name(f"{destination.name}.{token}.tmp")
+    compressed_path = destination.with_name(f"{destination.name}.{token}.bz2")
+    try:
+        if compressed:
+            compressed_path.write_bytes(content)
+            with temp_path.open("wb") as out_handle:
+                _copy_bz2_capped(compressed_path, out_handle)
+        else:
+            temp_path.write_bytes(content)
+        payload_path = compressed_path if compressed else temp_path
+        if not _paint_payload_looks_valid(payload_path, item.download_id.paint_type) or _looks_like_html_payload(temp_path):
+            logging.warning(
+                "Refusing to save an invalid paint payload as %s (HTTP %s)",
+                destination.name,
+                status_code,
+            )
+            return None
+        os.replace(temp_path, destination)
+    except Exception as exc:
+        logging.debug("Could not save paint %s: %s", destination, exc)
+        return None
+    finally:
+        temp_path.unlink(missing_ok=True)
+        compressed_path.unlink(missing_ok=True)
+    return destination
+
+
+# --- Showroom URL preview --------------------------------------------------
+
+_TP_SHOWROOM_VIEW_URL_RE = re.compile(
+    r"(?:https?://)?(?:www\.)?tradingpaints\.com/showroom/view/(\d+)(?:[/?#]|$)",
+    re.IGNORECASE,
+)
+_SHOWROOM_TEMP_DIRNAME = "showroom"
+
+
+def parse_tp_showroom_asset_id(text: str) -> str:
+    """The numeric asset id of a Trading Paints showroom view link, or ``""``."""
+    candidate = str(text or "").strip().strip("<>\"'()[]{}").strip()
+    match = _TP_SHOWROOM_VIEW_URL_RE.search(candidate)
+    return str(match.group(1)) if match else ""
+
+
+def _copy_file_atomically(source: Path, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = destination.with_name(f"{destination.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        shutil.copy2(source, temp_path)
+        os.replace(temp_path, destination)
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
+def _download_showroom_file(http, url: str, destination: Path, *, decompress: bool) -> Path | None:
+    token = uuid.uuid4().hex
+    temp_path = destination.with_name(f"{destination.name}.{token}.tmp")
+    compressed_path = destination.with_name(f"{destination.name}.{token}.bz2")
+    try:
+        response = http.get(url, timeout=TP_PAINT_DOWNLOAD_TIMEOUT_SECONDS)
+        status_code = getattr(response, "status_code", 0)
+        if status_code != 200:
+            logging.debug("Showroom asset %s returned HTTP %s", url, status_code)
+            return None
+        content = response.content or b""
+        if not content:
+            logging.debug("Showroom asset %s returned an empty body", url)
+            return None
+        if decompress:
+            compressed_path.write_bytes(content)
+            with temp_path.open("wb") as out_handle:
+                _copy_bz2_capped(compressed_path, out_handle)
+        else:
+            temp_path.write_bytes(content)
+        os.replace(temp_path, destination)
+    except Exception as exc:
+        logging.debug("Could not download showroom asset %s: %s", url, exc)
+        return None
+    finally:
+        temp_path.unlink(missing_ok=True)
+        compressed_path.unlink(missing_ok=True)
+    return destination
+
+
+def download_tp_showroom_asset(asset_id: str, dest_dir: Path, *, session=None) -> tuple[Path | None, Path | None]:
+    """Download a showroom paint and its optional MIP; a missing MIP is not an error."""
+    asset = str(asset_id or "").strip()
+    if not asset.isdigit():
+        return None, None
+    destination_dir = Path(dest_dir)
+    try:
+        destination_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        logging.debug("Could not create the showroom folder %s: %s", destination_dir, exc)
+        return None, None
+    http = session or get_thread_http_session()
+    tga = _download_showroom_file(
+        http,
+        TRADING_PAINTS_SHOWROOM_COMPRESSED_URL.format(asset_id=asset),
+        destination_dir / f"{asset}.tga",
+        decompress=True,
+    )
+    if tga is None:
+        return None, None
+    mip = _download_showroom_file(
+        http,
+        TRADING_PAINTS_SHOWROOM_MIP_URL.format(asset_id=asset),
+        destination_dir / f"{asset}.mip",
+        decompress=False,
+    )
+    return tga, mip
+
+
+def install_showroom_paint(
+    tga: Path,
+    mip: Path | None,
+    *,
+    paints_dir: Path,
+    car_directory: str,
+    member_id: int,
+) -> list[Path]:
+    """Copy a showroom paint into the iRacing paint folder, keeping any existing decal."""
+    paints = Path(paints_dir)
+    member = int(member_id)
+    written: list[Path] = []
+    car_target = save_path_for(DownloadId(member, car_directory, PaintType.CAR), paints)
+    spec_target = save_path_for(DownloadId(member, car_directory, PaintType.CAR_SPEC), paints)
+    try:
+        _copy_file_atomically(Path(tga), car_target)
+        written.append(car_target)
+    except Exception as exc:
+        logging.debug("Could not install showroom paint %s: %s", tga, exc)
+        return written
+    if mip is None:
+        # A spec map left from a different paint would not match this one.
+        try:
+            spec_target.unlink(missing_ok=True)
+        except OSError as exc:
+            logging.debug("Could not remove the stale showroom spec map %s: %s", spec_target, exc)
+        return written
+    try:
+        _copy_file_atomically(Path(mip), spec_target)
+        written.append(spec_target)
+    except Exception as exc:
+        logging.debug("Could not install showroom spec map %s: %s", mip, exc)
+        try:
+            spec_target.unlink(missing_ok=True)
+        except OSError:
+            logging.debug("Could not remove the stale showroom spec map %s", spec_target)
+    return written
+
+
+def showroom_install_allowed(panel_member_id: object, own_member_id: object, car_directory: object) -> bool:
+    """A showroom paint may be installed only for the user's own car folder."""
+    try:
+        panel = int(panel_member_id or 0)
+        own = int(own_member_id or 0)
+    except (TypeError, ValueError):
+        return False
+    return panel > 0 and own > 0 and panel == own and bool(str(car_directory or "").strip())
+
+
+class TpPreviewTempFiles:
+    """Files written only to preview a paint, and therefore safe to delete again."""
+
+    def __init__(self) -> None:
+        self._paths: list[Path] = []
+        self._lock = threading.Lock()
+
+    def track(self, path: Path, existed_before: bool, is_own: bool) -> None:
+        if existed_before or is_own:
+            return
+        try:
+            resolved = Path(path)
+        except TypeError:
+            return
+        with self._lock:
+            if resolved not in self._paths:
+                self._paths.append(resolved)
+
+    def untrack_directory(self, directory: Path) -> None:
+        try:
+            root = os.path.normcase(os.path.abspath(str(directory)))
+        except (TypeError, ValueError):
+            return
+        with self._lock:
+            kept: list[Path] = []
+            for path in self._paths:
+                try:
+                    current = os.path.normcase(os.path.abspath(str(path)))
+                    common = os.path.commonpath([root, current])
+                except (TypeError, ValueError):
+                    kept.append(path)
+                    continue
+                if common != root:
+                    kept.append(path)
+            self._paths = kept
+
+    def cleanup(self) -> None:
+        with self._lock:
+            paths = self._paths
+            self._paths = []
+        for path in paths:
+            try:
+                path.unlink(missing_ok=True)
+            except Exception:
+                logging.debug("Could not remove preview file %s", path)
+
+
+_PaintPreviewPanelBase = _TTK_MODULE.Frame if _TTK_MODULE is not None else object
+
+
+class PaintPreviewPanel(_PaintPreviewPanelBase):
+    """A 3-D render and a TGA preview of one car paint, filled off the UI thread."""
+
+    def __init__(self, master=None, *, app=None, **kwargs):
+        if _TTK_MODULE is None:
+            raise RuntimeError("Tk is not available, so paint previews cannot be shown.")
+        super().__init__(master, **kwargs)
+        self._app = app
+        self._version = 0
+        self._temp_paths: list[Path] = []
+        self._driver_temp_paths: list[Path] = []
+        self._temp_lock = threading.Lock()
+        self._car_image = None
+        self._tga_car_image = None
+        self._tga_decal_image = None
+        self._current_member_id = 0
+        self._current_car_directory = ""
+        self._current_decal_tga: Path | None = None
+        self._current_number: str | None = None
+        self._current_render_kind = "car"
+        self._driver_version = 0
+        self._car_render_bytes: bytes | None = None
+        self._helmet_render_bytes: bytes | None = None
+        self._suit_render_bytes: bytes | None = None
+        self._export_status_var = _TK_MODULE.StringVar(master=self, value="")
+        self._design_caption_var = _TK_MODULE.StringVar(master=self, value="")
+        self._showroom_status_var = _TK_MODULE.StringVar(master=self, value="")
+        self._notebook = _TTK_MODULE.Notebook(self)
+        self._notebook.pack(fill="both", expand=True)
+        self._car_tab = _TTK_MODULE.Frame(self._notebook, padding=6)
+        self._tga_tab = _TTK_MODULE.Frame(self._notebook, padding=6)
+        self._driver_tab = _TTK_MODULE.Frame(self._notebook, padding=6)
+        self._notebook.add(self._car_tab, text="Car")
+        self._notebook.add(self._tga_tab, text="TGA")
+        self._notebook.add(self._driver_tab, text="Driver")
+        self._car_label = _TTK_MODULE.Label(self._car_tab, text="No preview yet.")
+        self._car_label.pack(fill="both", expand=True)
+        self._tga_tab.columnconfigure(0, weight=1)
+        self._tga_tab.columnconfigure(1, weight=1)
+        self._tga_tab.rowconfigure(0, weight=1)
+        self._tga_car_label = _TTK_MODULE.Label(self._tga_tab, text="No TGA preview yet.")
+        self._tga_car_label.grid(row=0, column=0, sticky="nsew")
+        self._tga_decal_label = _TTK_MODULE.Label(self._tga_tab, text="No decal preview yet.")
+        self._tga_decal_label.grid(row=0, column=1, sticky="nsew")
+        _TTK_MODULE.Label(self._tga_tab, text="Car + decal", foreground="#555555").grid(row=1, column=0)
+        _TTK_MODULE.Label(self._tga_tab, text="Decal", foreground="#555555").grid(row=1, column=1)
+        self._driver_tab.columnconfigure(0, weight=1)
+        self._driver_tab.columnconfigure(1, weight=1)
+        self._driver_tab.rowconfigure(0, weight=1)
+        self._helmet_label = _TTK_MODULE.Label(self._driver_tab, text="No helmet preview yet.")
+        self._helmet_label.grid(row=0, column=0, sticky="nsew")
+        self._suit_label = _TTK_MODULE.Label(self._driver_tab, text="No suit preview yet.")
+        self._suit_label.grid(row=0, column=1, sticky="nsew")
+        _TTK_MODULE.Label(self._driver_tab, text="Helmet", foreground="#555555").grid(row=1, column=0)
+        _TTK_MODULE.Label(self._driver_tab, text="Suit", foreground="#555555").grid(row=1, column=1)
+        _TTK_MODULE.Label(
+            self,
+            textvariable=self._design_caption_var,
+            foreground="#555555",
+            wraplength=620,
+            justify="left",
+        ).pack(fill="x", pady=(6, 0))
+        _TTK_MODULE.Label(
+            self,
+            text="Drag a Trading Paints showroom link here (or paste it) to try it on your car.",
+            foreground="#555555",
+            wraplength=620,
+            justify="left",
+        ).pack(fill="x", pady=(6, 0))
+        _TTK_MODULE.Label(
+            self,
+            textvariable=self._showroom_status_var,
+            foreground="#0b63b6",
+            wraplength=620,
+            justify="left",
+        ).pack(fill="x")
+        _TTK_MODULE.Button(self, text="Paste showroom URL", command=self.paste_showroom_url).pack(anchor="w", pady=(4, 0))
+        export_row = _TTK_MODULE.Frame(self)
+        export_row.pack(fill="x", pady=(4, 0))
+        _TTK_MODULE.Button(export_row, text="Export images", command=self.export_images).pack(side="left")
+        _TTK_MODULE.Label(
+            export_row,
+            textvariable=self._export_status_var,
+            foreground="#555555",
+            wraplength=520,
+            justify="left",
+        ).pack(side="left", padx=(8, 0))
+        paste_targets = (self, self._car_label, self._tga_car_label, self._tga_decal_label)
+        for widget in paste_targets:
+            widget.bind("<Control-v>", self._on_paste_showroom_event, add="+")
+            widget.bind("<Control-V>", self._on_paste_showroom_event, add="+")
+            widget.bind("<Button-1>", self._focus_for_showroom_paste, add="+")
+        self._enable_showroom_drop()
+
+    def _enable_showroom_drop(self) -> bool:
+        """Load tkinterdnd2 onto the existing root, one failed attempt is enough."""
+        try:
+            from tkinterdnd2 import DND_TEXT, TkinterDnD
+
+            root = self.winfo_toplevel()
+            TkinterDnD._require(root)
+            for widget in (self._car_label, self._tga_car_label, self._tga_decal_label):
+                widget.tk.call("tkdnd::drop_target", "register", widget._w, (DND_TEXT,))
+                widget.bind("<<Drop>>", self._on_showroom_drop, add="+")
+            return True
+        except Exception:
+            logging.info("Drag and drop unavailable; paste the showroom URL instead.")
+            return False
+
+    def _focus_for_showroom_paste(self, _event=None) -> None:
+        try:
+            self.focus_set()
+        except Exception:
+            pass
+
+    def _on_paste_showroom_event(self, _event=None):
+        self.paste_showroom_url()
+        return "break"
+
+    def _on_showroom_drop(self, event):
+        text = str(getattr(event, "data", "") or "").strip()
+        if len(text) >= 2 and text.startswith("{") and text.endswith("}"):
+            text = text[1:-1].strip()
+        self.accept_showroom_url(text)
+        return getattr(event, "action", None)
+
+    def _set_showroom_status(self, text: str) -> None:
+        try:
+            self._showroom_status_var.set(str(text or ""))
+        except Exception:
+            logging.debug("Could not update the showroom status", exc_info=True)
+
+    def paste_showroom_url(self) -> None:
+        try:
+            text = self.clipboard_get()
+        except Exception:
+            text = ""
+        self.accept_showroom_url(text)
+
+    def accept_showroom_url(self, url: str) -> None:
+        asset_id = parse_tp_showroom_asset_id(url)
+        if not asset_id:
+            self._set_showroom_status("That is not a Trading Paints showroom link.")
+            return
+        car_directory = str(self._current_car_directory or "")
+        member_id = int(self._current_member_id or 0)
+        decal_tga = self._current_decal_tga
+        number = self._current_number
+        self._cleanup_temp_files()
+        self._set_showroom_status("Downloading showroom paint…")
+        try:
+            worker = threading.Thread(
+                target=self._showroom_worker,
+                args=(asset_id, car_directory, member_id, decal_tga, number),
+                name="NishizumiShowroomPaint",
+                daemon=True,
+            )
+            worker.start()
+        except Exception:
+            logging.debug("Could not start the showroom paint worker", exc_info=True)
+            self._set_showroom_status("Could not download that showroom paint.")
+
+    def _showroom_worker(
+        self,
+        asset_id: str,
+        car_directory: str,
+        member_id: int,
+        decal_tga: Path | None,
+        number: str | None,
+    ) -> None:
+        destination_dir = default_temp_dir() / _SHOWROOM_TEMP_DIRNAME
+        tga, mip = download_tp_showroom_asset(asset_id, destination_dir)
+        installed = False
+        if tga is not None and self._app is not None:
+            try:
+                own_member_id, _source = resolve_iracing_ui_preview_member_id(self._app.config)
+            except Exception:
+                logging.debug("Could not resolve the user's own ID for the showroom paint", exc_info=True)
+                own_member_id = 0
+            if showroom_install_allowed(member_id, own_member_id, car_directory):
+                try:
+                    written = install_showroom_paint(
+                        tga,
+                        mip,
+                        paints_dir=default_paints_dir(self._app.config),
+                        car_directory=car_directory,
+                        member_id=member_id,
+                    )
+                    installed = bool(written)
+                except Exception:
+                    logging.debug("Could not install the showroom paint", exc_info=True)
+            if installed:
+                trigger = getattr(self._app, "_reload_showroom_texture_for_member", None)
+                if callable(trigger):
+                    try:
+                        trigger(member_id, car_directory)
+                    except Exception:
+                        logging.debug("Could not reload the installed showroom paint", exc_info=True)
+        try:
+            self.after(
+                0,
+                lambda: self._finish_showroom(
+                    tga,
+                    mip,
+                    decal_tga,
+                    car_directory,
+                    member_id,
+                    number,
+                    installed,
+                ),
+            )
+        except Exception:
+            self._discard_temp_files(tga, mip)
+
+    def _finish_showroom(
+        self,
+        tga: Path | None,
+        mip: Path | None,
+        decal_tga: Path | None,
+        car_directory: str,
+        member_id: int,
+        number: str | None,
+        installed: bool,
+    ) -> None:
+        if tga is None:
+            self._set_showroom_status("Could not download that showroom paint.")
+            return
+        try:
+            self.show(
+                tga,
+                decal_tga=decal_tga,
+                car_path=car_directory,
+                number=number,
+                member_id=member_id,
+            )
+        except Exception:
+            logging.debug("Could not show the showroom paint preview", exc_info=True)
+        self._track_temp(tga)
+        if mip is not None:
+            self._track_temp(mip)
+        if installed:
+            car_name = car_directory or "car"
+            self._set_showroom_status(
+                f"Copied to Documents\\iRacing\\paint\\{car_name}. In the sim, press Ctrl+R to reload paints."
+            )
+        else:
+            self._set_showroom_status("Preview only: this is not your own car paint.")
+
+    def show(
+        self,
+        car_tga: Path | None,
+        *,
+        decal_tga: Path | None = None,
+        car_path: str = "",
+        design: str = "",
+        number: str | None = None,
+        member_id: int = 0,
+        render_kind: str = "car",
+    ) -> None:
+        self._current_member_id = int(member_id or 0)
+        self._current_car_directory = str(car_path or "").strip()
+        self._current_decal_tga = Path(decal_tga) if decal_tga else None
+        self._current_number = number
+        self._current_render_kind = "car_num" if render_kind == "car_num" else "car"
+        self._car_render_bytes = None
+        self._set_design_caption(
+            "No livery: iRacing pattern and colours"
+            if car_tga is None and str(car_path or "").strip()
+            else ""
+        )
+        self._version += 1
+        version = self._version
+        self._cleanup_temp_files()
+        try:
+            worker = threading.Thread(
+                target=self._preview_worker,
+                args=(
+                    version,
+                    Path(car_tga) if car_tga else None,
+                    Path(decal_tga) if decal_tga else None,
+                    car_path,
+                    design,
+                    number,
+                    self._current_render_kind,
+                ),
+                name="NishizumiPaintPreview",
+                daemon=True,
+            )
+            worker.start()
+        except Exception:
+            logging.debug("Could not start the paint preview worker", exc_info=True)
+
+    def show_driver(self, helmet_tga: Path | None, suit_tga: Path | None) -> None:
+        """Render the driver's helmet and suit paints in the Driver tab."""
+        self._driver_version += 1
+        version = self._driver_version
+        self._cleanup_driver_temp_files()
+        self._helmet_render_bytes = None
+        self._suit_render_bytes = None
+        try:
+            self._helmet_image = None
+            self._suit_image = None
+            self._helmet_label.configure(
+                image="",
+                text="Loading helmet…" if helmet_tga else "No helmet preview yet.",
+            )
+            self._suit_label.configure(
+                image="",
+                text="Loading suit…" if suit_tga else "No suit preview yet.",
+            )
+        except Exception:
+            logging.debug("Could not reset the driver preview", exc_info=True)
+        try:
+            worker = threading.Thread(
+                target=self._driver_preview_worker,
+                args=(
+                    version,
+                    Path(helmet_tga) if helmet_tga else None,
+                    Path(suit_tga) if suit_tga else None,
+                ),
+                name="NishizumiDriverPreview",
+                daemon=True,
+            )
+            worker.start()
+        except Exception:
+            logging.debug("Could not start the driver preview worker", exc_info=True)
+
+    def _set_design_caption(self, text: str) -> None:
+        try:
+            self._design_caption_var.set(str(text or ""))
+        except Exception:
+            logging.debug("Could not update the design caption", exc_info=True)
+
+    def _preview_worker(
+        self,
+        version: int,
+        car_tga: Path | None,
+        decal_tga: Path | None,
+        car_path: str,
+        design: str,
+        number: str | None,
+        render_kind: str,
+    ) -> None:
+        render_png: Path | None = None
+        merged_tga: Path | None = None
+        car_png: bytes | None = None
+        decal_png: bytes | None = None
+        service_available = False
+        pillow_available = False
+        # With no livery the iRacing renderer draws the plain car in the driver's
+        # paint pattern and colours, so only the empty custom paint path is sent.
+        design_only = car_tga is None and bool(str(car_path or "").strip())
+        try:
+            preview_dir = default_temp_dir() / _TP_DOWNLOAD_PREVIEW_DIRNAME
+            preview_dir.mkdir(parents=True, exist_ok=True)
+            render_source = car_tga
+            if car_tga is not None and decal_tga is not None:
+                merged = preview_dir / f"merged_{version}_{uuid.uuid4().hex}.tga"
+                if merge_decal_onto_tga(car_tga, decal_tga, merged) is not None:
+                    merged_tga = merged
+                    self._track_temp(merged)
+                    render_source = merged
+            if render_source is not None or design_only:
+                service_available = iracing_render_service_available()
+                if service_available:
+                    url = iracing_render_url(
+                        "car_num" if render_kind == "car_num" else "car",
+                        render_source if render_source is not None else "",
+                        car_path=car_path,
+                        design=design,
+                        number=number if render_kind != "car_num" else None,
+                    )
+                    destination = preview_dir / f"render_{version}_{uuid.uuid4().hex}.png"
+                    if fetch_iracing_render_png(url, destination) is not None:
+                        render_png = destination
+                        self._track_temp(destination)
+            pillow_available = _load_pillow_image_module() is not None
+            if pillow_available and render_source is not None:
+                car_png = tga_to_png_bytes(render_source, max_size=512)
+            if pillow_available and decal_tga is not None:
+                decal_png = tga_to_png_bytes(decal_tga, max_size=512)
+        except Exception:
+            logging.debug("Could not build the paint preview", exc_info=True)
+        if self._version != version:
+            self._discard_temp_files(render_png, merged_tga)
+            return
+        render_bytes = car_png
+        if render_png is not None:
+            try:
+                render_bytes = render_png.read_bytes()
+            except OSError:
+                logging.debug("Could not read the rendered preview", exc_info=True)
+
+        def _finish() -> None:
+            if version != self._version:
+                return
+            self._car_render_bytes = render_bytes
+            self._apply_preview_result(
+                version,
+                render_png=render_png,
+                car_png=car_png,
+                decal_png=decal_png,
+                service_available=service_available,
+                pillow_available=pillow_available,
+                has_car=car_tga is not None or design_only,
+            )
+
+        try:
+            self.after(0, _finish)
+        except Exception:
+            self._discard_temp_files(render_png, merged_tga)
+
+    def _driver_preview_worker(
+        self,
+        version: int,
+        helmet_tga: Path | None,
+        suit_tga: Path | None,
+    ) -> None:
+        helmet_png: bytes | None = None
+        suit_png: bytes | None = None
+        created_paths: list[Path] = []
+        try:
+            preview_dir = default_temp_dir() / _TP_DOWNLOAD_PREVIEW_DIRNAME
+            preview_dir.mkdir(parents=True, exist_ok=True)
+            for kind, tga_path in (("helmet", helmet_tga), ("suit", suit_tga)):
+                if tga_path is None or not iracing_render_service_available():
+                    continue
+                url = iracing_render_url(kind, tga_path)
+                destination = preview_dir / f"{kind}_{version}_{uuid.uuid4().hex}.png"
+                if fetch_iracing_render_png(url, destination) is None:
+                    continue
+                self._track_driver_temp(destination)
+                created_paths.append(destination)
+                payload = destination.read_bytes()
+                if kind == "helmet":
+                    helmet_png = payload
+                else:
+                    suit_png = payload
+        except Exception:
+            logging.debug("Could not build the driver preview", exc_info=True)
+        if self._driver_version != version:
+            self._discard_driver_temp_files(*created_paths)
+            return
+        try:
+            self.after(0, lambda: self._apply_driver_result(version, helmet_png, suit_png))
+        except Exception:
+            logging.debug("Could not display the driver preview", exc_info=True)
+
+    def _apply_driver_result(
+        self,
+        version: int,
+        helmet_png: bytes | None,
+        suit_png: bytes | None,
+    ) -> None:
+        if version != self._driver_version:
+            return
+        try:
+            self._helmet_render_bytes = helmet_png
+            self._suit_render_bytes = suit_png
+            self._set_tga_image(self._helmet_label, helmet_png, "helmet_image", "No helmet preview.")
+            self._set_tga_image(self._suit_label, suit_png, "suit_image", "No suit preview.")
+        except Exception:
+            logging.debug("Could not display the driver preview", exc_info=True)
+
+    def export_images(self) -> None:
+        member_id = int(self._current_member_id or 0)
+        payloads = {
+            "car": self._car_render_bytes,
+            "helmet": self._helmet_render_bytes,
+            "suit": self._suit_render_bytes,
+        }
+        available = {kind: payload for kind, payload in payloads.items() if payload}
+        if member_id <= 0 or not available:
+            self._set_export_status("No preview images to export.")
+            return
+        names = preview_export_names(member_id, self._current_car_directory)
+        destination_dir = default_preview_export_dir()
+        self._set_export_status("Exporting images…")
+
+        def _worker() -> None:
+            error = ""
+            try:
+                destination_dir.mkdir(parents=True, exist_ok=True)
+                for kind, payload in available.items():
+                    (destination_dir / names[kind]).write_bytes(payload)
+            except OSError as exc:
+                logging.debug("Could not export preview images: %s", exc)
+                error = str(exc)
+            self.after(0, lambda: self._finish_export(destination_dir, error))
+
+        threading.Thread(target=_worker, name="NishizumiPreviewExport", daemon=True).start()
+
+    def _finish_export(self, destination_dir: Path, error: str) -> None:
+        if error:
+            self._set_export_status(f"Could not export images: {error}")
+            return
+        self._set_export_status(f"Exported images to {destination_dir}")
+        try:
+            if hasattr(os, "startfile"):
+                os.startfile(str(destination_dir))
+        except OSError:
+            logging.debug("Could not open the preview export folder", exc_info=True)
+
+    def _set_export_status(self, text: str) -> None:
+        try:
+            self._export_status_var.set(str(text or ""))
+        except Exception:
+            logging.debug("Could not update the export status", exc_info=True)
+
+    def _apply_preview_result(
+        self,
+        version: int,
+        *,
+        render_png: Path | None,
+        car_png: bytes | None,
+        decal_png: bytes | None,
+        service_available: bool,
+        pillow_available: bool,
+        has_car: bool,
+    ) -> None:
+        if version != self._version:
+            return
+        try:
+            if not has_car:
+                self._set_car_text("Select a car to see its preview.")
+            elif not service_available:
+                self._set_car_text("Open the iRacing UI to see the 3-D preview.")
+                self._notebook.select(self._tga_tab)
+            elif render_png is None:
+                self._set_car_text("Could not load the 3-D preview.")
+            else:
+                png_bytes = None
+                try:
+                    png_bytes = render_png.read_bytes()
+                except Exception:
+                    logging.debug("Could not read the 3-D render %s", render_png, exc_info=True)
+                if png_bytes is None:
+                    self._set_car_text("Open the iRacing UI to see the 3-D preview.")
+                else:
+                    self._car_image = self._photo_image(png_bytes)
+                    if self._car_image is not None:
+                        self._car_label.configure(image=self._car_image, text="")
+                    else:
+                        self._set_car_text("Could not load the 3-D preview.")
+        except Exception:
+            logging.debug("Could not display the 3-D paint preview", exc_info=True)
+        try:
+            if not pillow_available:
+                self._tga_car_image = None
+                self._tga_decal_image = None
+                self._tga_car_label.configure(image="", text="Install Pillow to see TGA previews.")
+                self._tga_decal_label.configure(image="", text="")
+            else:
+                self._set_tga_image(self._tga_car_label, car_png, "tga_car_image", "No TGA preview.")
+                self._set_tga_image(self._tga_decal_label, decal_png, "tga_decal_image", "No decal preview.")
+        except Exception:
+            logging.debug("Could not display the TGA paint preview", exc_info=True)
+
+    def _set_tga_image(self, label, payload: bytes | None, attribute: str, fallback: str) -> None:
+        setattr(self, f"_{attribute}", None)
+        if not payload:
+            label.configure(image="", text=fallback)
+            return
+        photo = self._photo_image(payload)
+        if photo is None:
+            label.configure(image="", text=fallback)
+            return
+        setattr(self, f"_{attribute}", photo)
+        label.configure(image=photo, text="")
+
+    def _photo_image(self, png: bytes | None):
+        if not png:
+            return None
+        encoded = base64.b64encode(png).decode("ascii")
+        return _TK_MODULE.PhotoImage(master=self, data=encoded)
+
+    def _set_car_text(self, text: str) -> None:
+        self._car_image = None
+        self._car_label.configure(image="", text=text)
+
+    def obtain_temp_paths(self) -> list[Path]:
+        """The files this panel made, for tests and for callers that clean up early."""
+        with self._temp_lock:
+            return list(self._temp_paths) + list(self._driver_temp_paths)
+
+    def clear(self) -> None:
+        self._version += 1
+        self._driver_version += 1
+        self._current_member_id = 0
+        self._current_car_directory = ""
+        self._current_decal_tga = None
+        self._current_number = None
+        self._car_render_bytes = None
+        self._helmet_render_bytes = None
+        self._suit_render_bytes = None
+        self._car_image = None
+        self._tga_car_image = None
+        self._tga_decal_image = None
+        try:
+            self._car_label.configure(image="", text="No preview yet.")
+            self._tga_car_label.configure(image="", text="No TGA preview yet.")
+            self._tga_decal_label.configure(image="", text="No decal preview yet.")
+            self._helmet_label.configure(image="", text="No helmet preview yet.")
+            self._suit_label.configure(image="", text="No suit preview yet.")
+            self._design_caption_var.set("")
+            self._export_status_var.set("")
+            self._showroom_status_var.set("")
+        except Exception:
+            pass
+        self._cleanup_temp_files()
+        self._cleanup_driver_temp_files()
+
+    def destroy(self) -> None:
+        self._version += 1
+        self._driver_version += 1
+        self._cleanup_temp_files()
+        self._cleanup_driver_temp_files()
+        try:
+            super().destroy()
+        except Exception:
+            pass
+
+    def _track_temp(self, path: Path) -> None:
+        with self._temp_lock:
+            if path not in self._temp_paths:
+                self._temp_paths.append(path)
+
+    def _track_driver_temp(self, path: Path) -> None:
+        with self._temp_lock:
+            if path not in self._driver_temp_paths:
+                self._driver_temp_paths.append(path)
+
+    def _discard_driver_temp_files(self, *paths: Path | None) -> None:
+        with self._temp_lock:
+            for path in paths:
+                if path is not None and path in self._driver_temp_paths:
+                    self._driver_temp_paths.remove(path)
+        for path in paths:
+            if path is None:
+                continue
+            try:
+                path.unlink(missing_ok=True)
+            except Exception:
+                logging.debug("Could not remove driver preview file %s", path)
+
+    def _cleanup_driver_temp_files(self) -> None:
+        with self._temp_lock:
+            paths = self._driver_temp_paths
+            self._driver_temp_paths = []
+        for path in paths:
+            try:
+                path.unlink(missing_ok=True)
+            except Exception:
+                logging.debug("Could not remove driver preview file %s", path)
+
+    def _discard_temp_files(self, *paths: Path | None) -> None:
+        with self._temp_lock:
+            for path in paths:
+                if path is not None and path in self._temp_paths:
+                    self._temp_paths.remove(path)
+        for path in paths:
+            if path is None:
+                continue
+            try:
+                path.unlink(missing_ok=True)
+            except Exception:
+                logging.debug("Could not remove preview file %s", path)
+
+    def _cleanup_temp_files(self) -> None:
+        with self._temp_lock:
+            paths = self._temp_paths
+            self._temp_paths = []
+        for path in paths:
+            try:
+                path.unlink(missing_ok=True)
+            except Exception:
+                logging.debug("Could not remove preview file %s", path)
+
+
 def _to_int_or_none(value: object) -> int | None:
     try:
         if value in (None, ""):
@@ -3844,10 +7130,31 @@ def _merge_preserve_targets(
         merged.add((True, int(fallback_team_id)))
     return merged
 
+def _local_driver_car_short_name(
+    drivers: list[dict],
+    local_user_id: int | None,
+    driver_car_idx: int | None,
+) -> str:
+    car_match: dict | None = None
+    for driver in drivers:
+        if not isinstance(driver, dict):
+            continue
+        user_id = _to_int_or_none(driver.get('UserID'))
+        if local_user_id is not None and user_id == local_user_id:
+            car_match = driver
+            break
+        if car_match is None and driver_car_idx is not None and _to_int_or_none(driver.get('CarIdx')) == driver_car_idx:
+            car_match = driver
+    if car_match is None:
+        return ""
+    return str(car_match.get('CarScreenNameShort') or car_match.get('CarScreenName') or '').strip()
+
+
 def _build_session_from_parts(
     weekend: object,
     driver_info: object,
     load_num_textures: bool = False,
+    session_info: object = None,
 ) -> Session | None:
     if not isinstance(weekend, dict):
         return None
@@ -3864,10 +7171,43 @@ def _build_session_from_parts(
     team_racing = _to_boolish(weekend.get('TeamRacing'), default=False)
     weekend_options = weekend.get('WeekendOptions') if isinstance(weekend.get('WeekendOptions'), dict) else {}
     event_time_raw = str(weekend.get('EventTimeRaw') or weekend.get('EventTime') or weekend_options.get('TimeOfDay') or "10:00 am").strip() or "10:00 am"
+    event_date_raw = str(
+        weekend.get('EventDate')
+        or weekend.get('EventDateRaw')
+        or weekend.get('Date')
+        or weekend_options.get('Date')
+        or weekend.get('SessionDate')
+        or ''
+    ).strip()
     series_id = _to_int_or_none(weekend.get('SeriesID')) or 0
+    season_id = _to_int_or_none(weekend.get('SeasonID')) or 0
     league_id = _to_int_or_none(weekend.get('LeagueID')) or 0
+    race_week = _to_int_or_none(weekend.get('RaceWeek')) or 0
+    category = str(weekend.get('Category') or weekend_options.get('Category') or '').strip()
+    session_type = str(weekend.get('SessionType') or weekend.get('EventType') or '').strip()
+    if isinstance(session_info, dict):
+        sessions = session_info.get('Sessions')
+        if isinstance(sessions, list):
+            current_number = _to_int_or_none(session_info.get('CurrentSessionNum'))
+            current_entry: dict | None = None
+            for entry in sessions:
+                if not isinstance(entry, dict):
+                    continue
+                if current_number is None or _to_int_or_none(entry.get('SessionNum')) == current_number:
+                    current_entry = entry
+                    break
+            if current_entry is None and sessions:
+                first = sessions[0]
+                current_entry = first if isinstance(first, dict) else None
+            if current_entry is not None:
+                session_type = str(
+                    current_entry.get('SessionType')
+                    or current_entry.get('SessionName')
+                    or session_type
+                ).strip()
     track_name = str(weekend.get('TrackName') or '').strip()
-    track_display_name = str(weekend.get('TrackDisplayName') or weekend.get('TrackDisplayShortName') or '').strip()
+    track_display_short_name = str(weekend.get('TrackDisplayShortName') or '').strip()
+    track_display_name = str(weekend.get('TrackDisplayName') or track_display_short_name or '').strip()
     track_config_name = str(weekend.get('TrackConfigName') or weekend.get('TrackConfig') or '').strip()
     is_superspeedway_track = _is_superspeedway_track(track_name, track_display_name, track_config_name)
     ai_roster_id = str(weekend.get('AIRosterID') or '').strip()
@@ -3878,6 +7218,7 @@ def _build_session_from_parts(
     users: set[SessionUser] = set()
     driver_car_idx = _to_int_or_none(driver_info.get('DriverCarIdx'))
     local_user_id, local_team_id = _resolve_local_driver_identity(driver_info, drivers, driver_car_idx)
+    local_car_short_name = _local_driver_car_short_name(drivers, local_user_id, driver_car_idx)
     ai_driver_count = 0
     ai_drivers: list[dict] = []
     for d in drivers:
@@ -3924,6 +7265,10 @@ def _build_session_from_parts(
                     irating=_driver_irating(d),
                     license_label=_driver_license_parts(d)[0],
                     safety_rating=_driver_license_parts(d)[1],
+                    car_class=str(d.get('CarClassShortName') or '').strip(),
+                    car_design=str(d.get('CarDesignStr') or '').strip(),
+                    helmet_design=str(d.get('HelmetDesignStr') or '').strip(),
+                    suit_design=str(d.get('SuitDesignStr') or '').strip(),
                 )
             )
     return Session(
@@ -3944,6 +7289,34 @@ def _build_session_from_parts(
         ai_roster_id=ai_roster_id,
         ai_roster_name=ai_roster_name,
         ai_drivers=tuple(ai_drivers),
+        season_id=season_id,
+        race_week=race_week,
+        category=category,
+        event_date_raw=event_date_raw,
+        track_display_short_name=track_display_short_name,
+        local_car_short_name=local_car_short_name,
+        session_type=session_type,
+        sim_date=str(weekend.get('Date') or weekend.get('EventDate') or '').strip(),
+        sim_time=str(weekend.get('EventTime') or weekend.get('EventTimeRaw') or '').strip(),
+        air_temp=str(weekend.get('TrackAirTemp') or '').strip(),
+        track_temp=str(weekend.get('TrackSurfaceTemp') or weekend.get('TrackTemp') or '').strip(),
+        humidity=str(weekend.get('TrackRelativeHumidity') or '').strip(),
+        wind_speed=str(weekend.get('TrackWindVel') or '').strip(),
+        wind_direction=str(weekend.get('TrackWindDir') or '').strip(),
+        fog=str(weekend.get('TrackFogLevel') or '').strip(),
+        skies=str(weekend.get('TrackSkies') or '').strip(),
+        rain=str(weekend.get('TrackPrecipitation') or '').strip(),
+        track_length=str(weekend.get('TrackLength') or '').strip(),
+        turns=str(weekend.get('TrackNumTurns') or '').strip(),
+        altitude=str(weekend.get('TrackAltitude') or '').strip(),
+        city=str(weekend.get('TrackCity') or '').strip(),
+        country=str(weekend.get('TrackCountry') or '').strip(),
+        pit_speed_limit=str(
+            weekend.get('TrackPitSpeedLimit') or weekend.get('PitSpeedLimit') or weekend_options.get('PitSpeedLimit') or ''
+        ).strip(),
+        pace_speed_limit=str(
+            weekend.get('TrackPaceSpeed') or weekend.get('PaceSpeed') or weekend_options.get('PaceSpeed') or ''
+        ).strip(),
     )
 def _parse_tp_manifest_xml(xml_text: str) -> ET.Element:
     """Parse a Trading Paints manifest; an HTML page is a parse error, not an empty manifest.
@@ -3955,6 +7328,15 @@ def _parse_tp_manifest_xml(xml_text: str) -> ET.Element:
     if str(root.tag).lower().rsplit("}", 1)[-1] == "html":
         raise ET.ParseError("Trading Paints answered with an HTML page instead of a manifest.")
     return root
+
+
+def _manifest_entry_ext(car: ET.Element) -> str:
+    return normalize_paint_extension(car.findtext("ext"))
+
+
+def _manifest_entry_size(car: ET.Element) -> int | None:
+    value = _to_int_or_none((car.findtext("filesize") or "").strip())
+    return value if value is not None and value > 0 else None
 
 
 def _parse_fetch_user_manifest_xml(user_id: int, xml_text: str) -> list[DownloadFile]:
@@ -3988,8 +7370,10 @@ def _parse_fetch_user_manifest_xml(user_id: int, xml_text: str) -> list[Download
                     paint_type=paint_type,
                     is_team_paint=is_team_paint,
                     is_superspeedway_variant=_manifest_file_url_is_superspeedway_variant(file_url, paint_type),
+                    ext=_manifest_entry_ext(car),
                 ),
                 url=file_url,
+                expected_size=_manifest_entry_size(car),
             )
         )
     return files
@@ -4963,6 +8347,547 @@ def save_random_paint_preferences(preferences: dict[str, object], path: Path | N
     finally:
         temp.unlink(missing_ok=True)
 
+def _empty_people() -> dict[str, object]:
+    return {"version": 1, "friends": {}, "driver_aliases": {}, "team_aliases": {}, "tags": {}}
+
+def _normalize_people_bucket(value: object) -> dict[str, str]:
+    normalized: dict[str, str] = {}
+    if not isinstance(value, dict):
+        return normalized
+    for raw_id, raw_text in value.items():
+        member_id = str(raw_id or "").strip()
+        text = str(raw_text or "").strip()
+        if member_id and text:
+            normalized[member_id] = text
+    return normalized
+
+def load_people(path: Path | None = None) -> dict[str, object]:
+    resolved = Path(path) if path is not None else default_people_path()
+    if not resolved.exists():
+        return _empty_people()
+    try:
+        raw = json.loads(resolved.read_text(encoding="utf-8"))
+    except Exception:
+        logging.debug("Could not read people file %s", resolved, exc_info=True)
+        return _empty_people()
+    if not isinstance(raw, dict):
+        return _empty_people()
+    normalized = _empty_people()
+    for bucket_name in ("friends", "driver_aliases", "team_aliases", "tags"):
+        normalized[bucket_name] = _normalize_people_bucket(raw.get(bucket_name))
+    # Keep files written before tags existed byte-for-byte equivalent when read
+    # back, instead of adding an empty bucket they never had.
+    if "tags" not in raw:
+        normalized.pop("tags", None)
+    return normalized
+
+def save_people(data: dict[str, object], path: Path | None = None) -> None:
+    resolved = Path(path) if path is not None else default_people_path()
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    safe = _empty_people()
+    for bucket_name in ("friends", "driver_aliases", "team_aliases", "tags"):
+        bucket = data.get(bucket_name) if isinstance(data, dict) else None
+        safe[bucket_name] = _normalize_people_bucket(bucket)
+    if not isinstance(data, dict) or "tags" not in data:
+        safe.pop("tags", None)
+    temp = resolved.with_name(f"{resolved.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temp.write_text(json.dumps(safe, indent=2, sort_keys=True), encoding="utf-8")
+        os.replace(temp, resolved)
+    finally:
+        temp.unlink(missing_ok=True)
+
+def set_friend(member_id: int | str, name: str, enabled: bool, path: Path | None = None) -> dict[str, object]:
+    person_id = str(member_id or "").strip()
+    with _PAINT_PREFERENCE_FILES_LOCK:
+        people = load_people(path)
+        friends = dict(people.get("friends") or {})
+        if enabled and person_id:
+            friends[person_id] = str(name or "").strip() or person_id
+        else:
+            friends.pop(person_id, None)
+        people["friends"] = friends
+        save_people(people, path)
+    return people
+
+def set_alias(kind: str, target_id: int | str, alias: str, path: Path | None = None) -> dict[str, object]:
+    bucket_name = "driver_aliases" if str(kind or "").strip().lower() == "driver" else "team_aliases"
+    target_key = str(target_id or "").strip()
+    text = str(alias or "").strip()
+    with _PAINT_PREFERENCE_FILES_LOCK:
+        people = load_people(path)
+        bucket = dict(people.get(bucket_name) or {})
+        if text and target_key:
+            bucket[target_key] = text
+        else:
+            bucket.pop(target_key, None)
+        people[bucket_name] = bucket
+        save_people(people, path)
+    return people
+
+def set_tag(member_id: int | str, theme: str, path: Path | None = None) -> dict[str, object]:
+    """Assign one paint theme to a member, or remove it when theme is empty."""
+    member_key = str(member_id or "").strip()
+    theme_name = str(theme or "").strip()
+    with _PAINT_PREFERENCE_FILES_LOCK:
+        people = load_people(path)
+        tags = dict(people.get("tags") or {})
+        if member_key and theme_name:
+            tags[member_key] = theme_name
+        else:
+            tags.pop(member_key, None)
+        people["tags"] = tags
+        save_people(people, path)
+    return people
+
+def set_tags(tags: dict[str, str], path: Path | None = None, *, replace: bool = False) -> dict[str, object]:
+    with _PAINT_PREFERENCE_FILES_LOCK:
+        people = load_people(path)
+        current = {} if replace else dict(people.get("tags") or {})
+        for member_id, theme in (tags or {}).items():
+            member_key = str(member_id or "").strip()
+            theme_name = str(theme or "").strip()
+            if member_key and theme_name:
+                current[member_key] = theme_name
+        people["tags"] = current
+        save_people(people, path)
+    return people
+
+def tags_from_people(people: dict[str, object] | None) -> dict[str, str]:
+    if not isinstance(people, dict):
+        return {}
+    return dict(_normalize_people_bucket(people.get("tags")))
+
+def load_tags(path: Path | None = None) -> dict[str, str]:
+    return tags_from_people(load_people(path))
+
+def format_tags_clipboard(tags: dict[str, str], names: dict[str, str] | None = None) -> str:
+    """Serialise tags as ``Tags(<id>=<Theme>,<name>|...)``."""
+    names = names or {}
+    parts: list[str] = []
+    ordered = [str(key) for key in (tags or {})]
+    ordered.sort(key=lambda value: (0, int(value), "") if value.isdigit() else (1, 0, value.casefold()))
+    for member_id in ordered:
+        theme = str((tags or {}).get(member_id) or "").strip()
+        if not theme:
+            continue
+        name = str(names.get(member_id) or "").strip()
+        parts.append(f"{member_id}={theme},{name}")
+    return f"Tags({'|'.join(parts)})"
+
+def parse_tags_clipboard(text: object) -> dict[str, str]:
+    """Read the text written by :func:`format_tags_clipboard` back into id/theme pairs."""
+    raw = str(text or "").strip()
+    match = re.match(r"^Tags\((.*)\)$", raw, re.IGNORECASE | re.DOTALL)
+    if match is None:
+        return {}
+    tags: dict[str, str] = {}
+    for part in match.group(1).split("|"):
+        part = part.strip()
+        if not part:
+            continue
+        member_id, separator, rest = part.partition("=")
+        if not separator:
+            continue
+        member_key = member_id.strip()
+        theme = rest.split(",", 1)[0].strip()
+        if member_key and theme:
+            tags[member_key] = theme
+    return tags
+
+# Backwards-compatible names for callers that use the menu wording.
+def export_tags_text(tags: dict[str, str], names: dict[str, str] | None = None) -> str:
+    return format_tags_clipboard(tags, names)
+
+def import_tags_text(text: object) -> dict[str, str]:
+    return parse_tags_clipboard(text)
+
+def export_tags_to_clipboard_text(tags: dict[str, str], names: dict[str, str] | None = None) -> str:
+    return format_tags_clipboard(tags, names)
+
+def import_tags_from_clipboard_text(text: object) -> dict[str, str]:
+    return parse_tags_clipboard(text)
+
+def display_name_with_alias(
+    name: str,
+    user_id: int | str | None,
+    team_id: int | str | None,
+    people: dict[str, object] | None,
+) -> str:
+    base_name = str(name or "").strip()
+    if not base_name or not isinstance(people, dict):
+        return base_name
+    alias = ""
+    team_key = str(team_id or "").strip()
+    if team_key and team_key != "0":
+        alias = str((people.get("team_aliases") or {}).get(team_key) or "").strip()
+    if not alias:
+        user_key = str(user_id or "").strip()
+        alias = str((people.get("driver_aliases") or {}).get(user_key) or "").strip()
+    return f"{alias} ({base_name})" if alias else base_name
+
+def download_friends_paints(
+    friend_ids: Iterable[int | str],
+    fetch_files: Callable[[int], list["DownloadFile"]],
+    download_file: Callable[["DownloadFile", Path], Path | None],
+    destination: Path,
+    *,
+    progress: Callable[[int, int, int], None] | None = None,
+) -> dict[str, object]:
+    """Fetch and download every friend's car paints, skipping friends that fail."""
+    friend_list: list[int] = []
+    for raw_id in friend_ids:
+        try:
+            member_id = int(raw_id)
+        except (TypeError, ValueError):
+            continue
+        if member_id > 0:
+            friend_list.append(member_id)
+    total = len(friend_list)
+    completed = 0
+    file_count = 0
+    failed: list[int] = []
+    for member_id in friend_list:
+        try:
+            files = list(fetch_files(member_id) or [])
+            groups = tp_download_car_groups(files)
+            for group in groups.values():
+                _remove_stale_spec_maps_for_download_items(group, destination)
+                for item in group:
+                    try:
+                        if download_file(item, destination) is not None:
+                            file_count += 1
+                    except Exception:
+                        logging.debug("Could not download friend paint %s", getattr(item, "url", ""), exc_info=True)
+        except Exception:
+            logging.debug("Could not fetch paints for friend %s", member_id, exc_info=True)
+            failed.append(member_id)
+        completed += 1
+        if progress is not None:
+            try:
+                progress(completed, total, file_count)
+            except Exception:
+                logging.debug("Friends download progress callback failed", exc_info=True)
+    return {"friends_total": total, "friends_done": completed, "files": file_count, "failed": failed}
+
+_FORBIDDEN_TP_PAINTS_CACHE_LOCK = threading.Lock()
+_FORBIDDEN_TP_PAINTS_CACHE: tuple[str, tuple[int, int] | None, dict[str, object]] | None = None
+_FORBIDDEN_CAR_PAINT_TYPES = {
+    PaintType.CAR,
+    PaintType.CAR_DECAL,
+    PaintType.CAR_NUMBER,
+    PaintType.CAR_SPEC,
+}
+
+def _empty_forbidden_tp_paints() -> dict[str, object]:
+    return {"version": 1, "entries": {}}
+
+def forbidden_tp_paint_key(target_kind: str, target_id: object, kind: str, directory: str = "") -> str:
+    normalized_kind = _driver_paint_override_kind(kind)
+    if not normalized_kind:
+        return ""
+    normalized_target_kind = "team" if str(target_kind or "").strip().lower() == "team" else "user"
+    try:
+        safe_target_id = max(0, int(target_id or 0))
+    except (TypeError, ValueError):
+        safe_target_id = 0
+    normalized_directory = str(directory or "").strip().lower() if normalized_kind == "car" else ""
+    return f"{normalized_target_kind}:{safe_target_id}:{normalized_kind}:{normalized_directory}"
+
+def _normalize_forbidden_tp_paint_entry(entry: object) -> dict[str, object] | None:
+    if not isinstance(entry, dict):
+        return None
+    kind = _driver_paint_override_kind(str(entry.get("kind") or ""))
+    if not kind:
+        return None
+    target_kind = "team" if str(entry.get("target_kind") or "").strip().lower() == "team" else "user"
+    try:
+        target_id = max(0, int(entry.get("target_id") or 0))
+    except (TypeError, ValueError):
+        target_id = 0
+    directory = str(entry.get("directory") or "").strip().lower() if kind == "car" else ""
+    key = forbidden_tp_paint_key(target_kind, target_id, kind, directory)
+    if not key:
+        return None
+    return {
+        "key": key,
+        "target_kind": target_kind,
+        "target_id": target_id,
+        "kind": kind,
+        "directory": directory,
+        "display_name": str(entry.get("display_name") or "").strip(),
+        "created_at": _number_or_default(entry.get("created_at") or time.time(), time.time()),
+    }
+
+def load_forbidden_tp_paints(path: Path | None = None) -> dict[str, object]:
+    resolved = Path(path) if path is not None else default_forbidden_tp_paints_path()
+    with _PAINT_PREFERENCE_FILES_LOCK:
+        if not resolved.exists():
+            return _empty_forbidden_tp_paints()
+        try:
+            raw = json.loads(resolved.read_text(encoding="utf-8"))
+        except Exception:
+            return _empty_forbidden_tp_paints()
+    if not isinstance(raw, dict):
+        return _empty_forbidden_tp_paints()
+    normalized = _empty_forbidden_tp_paints()
+    entries = raw.get("entries")
+    if not isinstance(entries, dict):
+        return normalized
+    normalized_entries: dict[str, dict[str, object]] = {}
+    for key, value in entries.items():
+        if not isinstance(value, dict):
+            continue
+        candidate = dict(value)
+        candidate.setdefault("key", str(key or ""))
+        entry = _normalize_forbidden_tp_paint_entry(candidate)
+        if entry is not None:
+            normalized_entries[str(entry["key"])] = entry
+    normalized["entries"] = normalized_entries
+    return normalized
+
+def _save_forbidden_tp_paints(paints: dict[str, object], path: Path | None = None) -> None:
+    resolved = Path(path) if path is not None else default_forbidden_tp_paints_path()
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    safe = _empty_forbidden_tp_paints()
+    entries = paints.get("entries") if isinstance(paints, dict) else None
+    if isinstance(entries, dict):
+        safe_entries: dict[str, dict[str, object]] = {}
+        for value in entries.values():
+            entry = _normalize_forbidden_tp_paint_entry(value)
+            if entry is not None:
+                safe_entries[str(entry["key"])] = entry
+        safe["entries"] = safe_entries
+    temp = resolved.with_name(f"{resolved.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temp.write_text(json.dumps(safe, indent=2, sort_keys=True), encoding="utf-8")
+        os.replace(temp, resolved)
+    finally:
+        temp.unlink(missing_ok=True)
+
+def _forbidden_tp_paints_cache_token(path: Path) -> tuple[int, int] | None:
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return stat.st_mtime_ns, stat.st_size
+
+def _cached_forbidden_tp_paints(path: Path | None = None) -> dict[str, object]:
+    global _FORBIDDEN_TP_PAINTS_CACHE
+    resolved = Path(path) if path is not None else default_forbidden_tp_paints_path()
+    token = _forbidden_tp_paints_cache_token(resolved)
+    with _FORBIDDEN_TP_PAINTS_CACHE_LOCK:
+        cached = _FORBIDDEN_TP_PAINTS_CACHE
+        if cached is not None and cached[0] == str(resolved) and cached[1] == token:
+            return cached[2]
+    loaded = load_forbidden_tp_paints(resolved)
+    with _FORBIDDEN_TP_PAINTS_CACHE_LOCK:
+        _FORBIDDEN_TP_PAINTS_CACHE = (str(resolved), token, loaded)
+    return loaded
+
+def _invalidate_forbidden_tp_paints_cache(path: Path | None = None) -> None:
+    global _FORBIDDEN_TP_PAINTS_CACHE
+    resolved = Path(path) if path is not None else default_forbidden_tp_paints_path()
+    with _FORBIDDEN_TP_PAINTS_CACHE_LOCK:
+        if _FORBIDDEN_TP_PAINTS_CACHE is None or _FORBIDDEN_TP_PAINTS_CACHE[0] == str(resolved):
+            _FORBIDDEN_TP_PAINTS_CACHE = None
+
+def set_tp_paint_forbidden(
+    target_kind: str,
+    target_id: object,
+    kind: str,
+    directory: str,
+    display_name: str,
+    forbidden: bool,
+    path: Path | None = None,
+) -> bool:
+    key = forbidden_tp_paint_key(target_kind, target_id, kind, directory)
+    if not key:
+        return False
+    normalized_kind = _driver_paint_override_kind(kind)
+    normalized_target_kind = "team" if str(target_kind or "").strip().lower() == "team" else "user"
+    try:
+        safe_target_id = max(0, int(target_id or 0))
+    except (TypeError, ValueError):
+        safe_target_id = 0
+    normalized_directory = str(directory or "").strip().lower() if normalized_kind == "car" else ""
+    with _PAINT_PREFERENCE_FILES_LOCK:
+        paints = load_forbidden_tp_paints(path)
+        entries = paints.setdefault("entries", {})
+        if not isinstance(entries, dict):
+            entries = {}
+            paints["entries"] = entries
+        if forbidden:
+            entries[key] = {
+                "key": key,
+                "target_kind": normalized_target_kind,
+                "target_id": safe_target_id,
+                "kind": normalized_kind,
+                "directory": normalized_directory,
+                "display_name": str(display_name or "").strip(),
+                "created_at": time.time(),
+            }
+        else:
+            entries.pop(key, None)
+        _save_forbidden_tp_paints(paints, path)
+    _invalidate_forbidden_tp_paints_cache(path)
+    return bool(forbidden)
+
+@dataclass(frozen=True)
+class ManagerTagRow:
+    member_id: int
+    name: str
+    theme: str
+
+
+@dataclass(frozen=True)
+class ManagerThemeRow:
+    theme: str
+    car_folder: str
+    file_type: str
+    path: Path
+
+
+@dataclass(frozen=True)
+class ManagerForbiddenRow:
+    key: str
+    target_kind: str
+    target_id: int
+    kind: str
+    directory: str
+    display_name: str
+
+    @property
+    def target_label(self) -> str:
+        return f"{self.target_kind} {self.target_id}"
+
+    @property
+    def car_label(self) -> str:
+        return self.directory or "-"
+
+
+def build_manager_tables(
+    people: dict[str, object] | None,
+    themes: dict[str, list[TagThemeFile]] | None,
+    forbidden: dict[str, object] | None,
+) -> tuple[list[ManagerTagRow], list[ManagerThemeRow], list[ManagerForbiddenRow]]:
+    """The three read-only manager tables, assembled from the stored files."""
+    aliases = dict((people or {}).get("driver_aliases") or {}) if isinstance(people, dict) else {}
+    forbidden_entries = (forbidden or {}).get("entries") if isinstance(forbidden, dict) else {}
+    if not isinstance(forbidden_entries, dict):
+        forbidden_entries = {}
+    names_by_user: dict[str, str] = {}
+    for entry in forbidden_entries.values():
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("target_kind") or "").strip().lower() != "user":
+            continue
+        user_key = str(entry.get("target_id") or "").strip()
+        display_name = str(entry.get("display_name") or "").strip()
+        if user_key and display_name and user_key not in names_by_user:
+            names_by_user[user_key] = display_name
+
+    tags = dict((people or {}).get("tags") or {}) if isinstance(people, dict) else {}
+    tag_rows: list[ManagerTagRow] = []
+    for raw_id, raw_theme in tags.items():
+        member_key = str(raw_id or "").strip()
+        theme = str(raw_theme or "").strip()
+        if not member_key or not theme:
+            continue
+        try:
+            member_id = int(member_key)
+        except (TypeError, ValueError):
+            continue
+        name = str(aliases.get(member_key) or names_by_user.get(member_key) or "").strip()
+        tag_rows.append(ManagerTagRow(member_id=member_id, name=name, theme=theme))
+    tag_rows.sort(key=lambda row: (row.member_id, row.theme.casefold()))
+
+    theme_rows: list[ManagerThemeRow] = []
+    for theme_name, files in (themes or {}).items():
+        for entry in files:
+            theme_rows.append(
+                ManagerThemeRow(
+                    theme=str(entry.theme or theme_name),
+                    car_folder=str(entry.car_folder or ""),
+                    file_type=str(entry.file_type or ""),
+                    path=Path(entry.path),
+                )
+            )
+    theme_rows.sort(
+        key=lambda row: (row.theme.casefold(), row.car_folder.casefold(), row.file_type.casefold(), str(row.path).casefold())
+    )
+
+    forbidden_rows: list[ManagerForbiddenRow] = []
+    for entry in forbidden_entries.values():
+        if not isinstance(entry, dict):
+            continue
+        key = str(entry.get("key") or "").strip()
+        if not key:
+            continue
+        try:
+            target_id = max(0, int(entry.get("target_id") or 0))
+        except (TypeError, ValueError):
+            target_id = 0
+        forbidden_rows.append(
+            ManagerForbiddenRow(
+                key=key,
+                target_kind="team" if str(entry.get("target_kind") or "").strip().lower() == "team" else "user",
+                target_id=target_id,
+                kind=str(entry.get("kind") or "").strip(),
+                directory=str(entry.get("directory") or "").strip(),
+                display_name=str(entry.get("display_name") or "").strip(),
+            )
+        )
+    forbidden_rows.sort(key=lambda row: (row.target_kind, row.target_id, row.kind, row.directory.casefold()))
+    return tag_rows, theme_rows, forbidden_rows
+
+
+def is_tp_paint_forbidden(
+    target_kind: str,
+    target_id: object,
+    kind: str,
+    directory: str = "",
+    *,
+    forbidden: dict[str, object] | None = None,
+    path: Path | None = None,
+) -> bool:
+    key = forbidden_tp_paint_key(target_kind, target_id, kind, directory)
+    if not key:
+        return False
+    paints = forbidden if isinstance(forbidden, dict) else _cached_forbidden_tp_paints(path)
+    entries = paints.get("entries") if isinstance(paints, dict) else None
+    return isinstance(entries, dict) and key in entries
+
+def filter_forbidden_tp_items(items: list[DownloadFile], forbidden: dict[str, object]) -> list[DownloadFile]:
+    entries = forbidden.get("entries") if isinstance(forbidden, dict) else None
+    if not isinstance(entries, dict) or not entries:
+        return list(items)
+    kept: list[DownloadFile] = []
+    for item in items:
+        download_id = item.download_id
+        # Random pools, collections, driver overrides and the local AI roster are
+        # fallbacks, not the driver's real Trading Paints manifest paint.
+        if bool(getattr(download_id, "preserve_on_cleanup", False)) or str(getattr(download_id, "tp_source", "") or "").strip():
+            kept.append(item)
+            continue
+        if download_id.paint_type in _FORBIDDEN_CAR_PAINT_TYPES:
+            kind = "car"
+            directory = download_id.directory
+        elif download_id.paint_type is PaintType.HELMET:
+            kind = "helmet"
+            directory = ""
+        elif download_id.paint_type is PaintType.SUIT:
+            kind = "suit"
+            directory = ""
+        else:
+            kept.append(item)
+            continue
+        target_kind = "team" if bool(download_id.is_team_paint) else "user"
+        key = forbidden_tp_paint_key(target_kind, download_id.user_id, kind, directory)
+        if not key or key not in entries:
+            kept.append(item)
+    return kept
+
 def _random_preference_entry_for_source(
     *,
     kind: str,
@@ -5547,6 +9472,7 @@ def _apply_cached_driver_paint_override_for_user(
         "user_id": target_id,
         "directory": user.directory,
         "is_team_paint": target_is_team,
+        "ext": user.paint_ext,
         "preserve_on_cleanup": True,
         "tp_scheme_id": str(normalized.get("scheme_id") or "").strip(),
         "tp_title": str(normalized.get("title") or "").strip(),
@@ -6031,6 +9957,7 @@ def _apply_local_tp_random_fallback_assets_for_user(
         "directory": user.directory,
         "is_team_paint": target_is_team,
         "is_superspeedway_variant": False,
+        "ext": user.paint_ext,
     }
 
     if need_car:
@@ -9062,8 +12989,10 @@ def _parse_tp_team_fetch_manifest_root(root: ET.Element, target: TPTeamPaintTarg
                     is_superspeedway_variant=_manifest_file_url_is_superspeedway_variant(file_url, paint_type),
                     preserve_on_cleanup=True,
                     tp_source="team_manual",
+                    ext=_manifest_entry_ext(car),
                 ),
                 url=file_url,
+                expected_size=_manifest_entry_size(car),
             )
         )
     return files
@@ -9771,14 +13700,14 @@ def _candidate_local_tp_paths(
             result.extend([
                 base / f"car_{uid}.tga",
                 base / f"car_spec_{uid}.mip",
-                base / f"decal_{uid}.tga",
+                base / f"car_decal_{uid}.tga",
             ])
         if local_team_id is not None and local_team_id > 0:
             tid = int(local_team_id)
             result.extend([
                 base / f"car_team_{tid}.tga",
                 base / f"car_spec_team_{tid}.mip",
-                base / f"decal_team_{tid}.tga",
+                base / f"car_decal_team_{tid}.tga",
             ])
 
     dedup: list[Path] = []
@@ -9809,8 +13738,7 @@ def _candidate_local_driver_accessory_paths(
             result.append(paints_dir / f"suit_{uid}.tga")
     if local_team_id is not None and local_team_id > 0:
         tid = int(local_team_id)
-        if wanted_all or normalized_kind == "helmet":
-            result.append(paints_dir / f"helmet_team_{tid}.tga")
+        # iRacing has no team helmet slot; the driver's helmet_<user>.tga is above.
         if wanted_all or normalized_kind == "suit":
             result.append(paints_dir / f"suit_team_{tid}.tga")
     dedup: list[Path] = []
@@ -9891,7 +13819,7 @@ def _wait_for_local_tp_sync(paths: list[Path], before: dict[str, float], timeout
             name = path.name.lower()
             if name.startswith("car_spec_") and not spec:
                 spec = str(path)
-            elif name.startswith("decal_") and not decal:
+            elif name.startswith(("car_decal_", "decal_")) and not decal:
                 decal = str(path)
             elif name.startswith("car_") and not car:
                 car = str(path)
@@ -10577,7 +14505,8 @@ def _select_manifest_variants_for_track(is_superspeedway_track: bool, items: lis
     )
 
 def _select_manifest_variants_for_session(session: Session, items: list[DownloadFile]) -> list[DownloadFile]:
-    return _select_manifest_variants_for_track(bool(session.is_superspeedway_track), items)
+    selected = _select_manifest_variants_for_track(bool(session.is_superspeedway_track), items)
+    return filter_forbidden_tp_items(selected, _cached_forbidden_tp_paints())
 
 def _manifest_has_car_related_items(items: list[DownloadFile]) -> bool:
     return any(_is_car_related_paint_type(item.download_id.paint_type) for item in items or [])
@@ -10896,6 +14825,7 @@ def _tp_retarget_manifest_items_for_user(session: Session, user: SessionUser, it
                 url=item.url,
                 ai_roster_optional_filename=item.ai_roster_optional_filename,
                 ai_roster_dir=item.ai_roster_dir,
+                expected_size=item.expected_size,
             )
         )
     return result
@@ -15828,6 +19758,42 @@ def _matches_context_manifest_entry(user: SessionUser, car: ET.Element) -> bool:
     if session_user_uses_team_target(user):
         return manifest_user == expected_user or manifest_team == expected_team
     return manifest_user == expected_user and manifest_team == expected_team
+
+def _context_download_file_for_car(user: SessionUser, car: ET.Element) -> DownloadFile | None:
+    file_url = (car.findtext("file") or '').strip()
+    type_raw = (car.findtext("type") or '').strip().lower()
+    directory = (car.findtext("directory") or '').strip()
+    team_id_text = (car.findtext("teamid") or "0").strip() or "0"
+    if not file_url or not type_raw:
+        return None
+    _observe_tp_manifest_directory(directory)
+    if not directory and type_raw.startswith("car"):
+        return None
+    try:
+        paint_type = PaintType(type_raw)
+    except ValueError:
+        logging.debug(
+            "Skipping unknown contextual paint type '%s' for user %s",
+            type_raw,
+            user.user_id,
+        )
+        return None
+    response_team_id = _to_int_or_none(team_id_text)
+    is_team_paint = bool(response_team_id and response_team_id > 0 and paint_type in TEAM_PAINT_TYPES)
+    target_user_id = int(response_team_id) if is_team_paint else user.user_id
+    target_directory = directory or user.directory
+    return DownloadFile(
+        download_id=DownloadId(
+            user_id=target_user_id,
+            directory=target_directory,
+            paint_type=paint_type,
+            is_team_paint=is_team_paint,
+            is_superspeedway_variant=_manifest_file_url_is_superspeedway_variant(file_url, paint_type),
+            ext=_manifest_entry_ext(car),
+        ),
+        url=file_url,
+        expected_size=_manifest_entry_size(car),
+    )
 _WINDOWS_RESERVED_FILE_NAMES = frozenset(
     {"con", "prn", "aux", "nul"} | {f"com{i}" for i in range(1, 10)} | {f"lpt{i}" for i in range(1, 10)}
 )
@@ -15846,6 +19812,10 @@ def _cleanup_ai_roster_dirs(ai_rosters_dir: Path) -> None:
     removed = 0
     for child in ai_rosters_dir.iterdir():
         if not child.is_dir():
+            continue
+        # iRacing creates empty "Generated Roster ..." folders and gets upset if
+        # they disappear. They are not ours to clean up.
+        if child.name.strip().lower().startswith("generated roster"):
             continue
         leftover_swap = child.name.endswith(AI_ROSTER_REPLACED_SUFFIX) and (child / AI_ROSTER_META_FILENAME).exists()
         if (child / "roster.json").exists() and not leftover_swap:
@@ -15914,6 +19884,7 @@ def _read_ai_roster_payload(roster_dir: Path) -> tuple[dict[str, list[dict]], li
     if not isinstance(drivers, list):
         raise ValueError("AI roster JSON did not contain a drivers list")
     normalized_drivers = [_normalize_ai_driver_entry(driver) for driver in drivers if isinstance(driver, dict)]
+    log_ai_roster_sanity_problems(normalized_drivers, roster_dir.name)
     with _AI_ROSTER_PAYLOAD_CACHE_LOCK:
         if len(_AI_ROSTER_PAYLOAD_CACHE) > 256:
             _AI_ROSTER_PAYLOAD_CACHE.clear()
@@ -16044,7 +20015,7 @@ def _download_ai_roster_asset(
         temp_extract.unlink(missing_ok=True)
         try:
             http = get_thread_http_session()
-            with http.get(url, timeout=(10, 90), stream=True) as response:
+            with http.get(url, timeout=(10, TP_PAINT_DOWNLOAD_TIMEOUT_SECONDS), stream=True) as response:
                 response.raise_for_status()
                 with temp_download.open("wb") as handle:
                     for chunk in response.iter_content(chunk_size=1024 * 1024):
@@ -16166,8 +20137,65 @@ def sync_ai_roster_collection_assets(
             optional_unavailable,
         )
     return downloaded, existing, optional_unavailable, failed
+_WINDOWS_INVALID_FILENAME_CHARS_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]+')
+
+
+def sanitize_ai_roster_driver_name(value: object) -> str:
+    """Drop the characters a Windows file name cannot contain."""
+    return _WINDOWS_INVALID_FILENAME_CHARS_RE.sub("", str(value or "")).strip()
+
+
+def ai_roster_sanity_problems(drivers: Iterable[object]) -> list[str]:
+    """Report duplicate numbers/names and names unusable as Windows file names."""
+    name_counts: Counter[str] = Counter()
+    number_counts: Counter[str] = Counter()
+    display_names: dict[str, str] = {}
+    display_numbers: dict[str, str] = {}
+    bad_names: list[str] = []
+    for driver in drivers or []:
+        if not isinstance(driver, dict):
+            continue
+        raw_name = str(driver.get("driverName") or driver.get("name") or "").strip()
+        name_key = _normalize_ai_match_text(raw_name)
+        if name_key:
+            name_counts[name_key] += 1
+            display_names.setdefault(name_key, raw_name)
+        if raw_name and _WINDOWS_INVALID_FILENAME_CHARS_RE.search(raw_name):
+            if raw_name not in bad_names:
+                bad_names.append(raw_name)
+        raw_number = str(driver.get("carNumber") or "").strip()
+        if raw_number:
+            number_key = _normalize_ai_car_number(raw_number)
+            number_counts[number_key] += 1
+            display_numbers.setdefault(number_key, raw_number)
+    problems: list[str] = []
+    for key, count in name_counts.items():
+        if count > 1:
+            problems.append(f"duplicate driver name {display_names.get(key, key)!r} used by {count} entries")
+    for key, count in number_counts.items():
+        if count > 1:
+            problems.append(f"duplicate car number {display_numbers.get(key, key)!r} used by {count} entries")
+    for name in bad_names:
+        problems.append(f"driver name {name!r} contains characters Windows file names cannot hold")
+    return problems
+
+
+def log_ai_roster_sanity_problems(drivers: Iterable[object], source: str = "") -> list[str]:
+    problems = ai_roster_sanity_problems(drivers)
+    label = f"AI roster {source}: " if source else "AI roster: "
+    for problem in problems:
+        logging.warning("%s%s", label, problem)
+    return problems
+
+
 def _normalize_ai_match_text(value: object) -> str:
-    return re.sub(r"\s+", " ", str(value or '').strip()).casefold()
+    # iRacing and Trading Paints do not always agree on punctuation in driver
+    # names ("O'Neil" vs "ONeil", "J. Smith" vs "J Smith"). Remove punctuation
+    # before comparing so a roster still matches the session drivers.
+    text = unicodedata.normalize("NFKC", str(value or "").strip())
+    text = _WINDOWS_INVALID_FILENAME_CHARS_RE.sub("", text)
+    text = re.sub(r"[^\w\s]+", "", text, flags=re.UNICODE)
+    return re.sub(r"\s+", " ", text).casefold().strip()
 def _normalize_ai_car_path(value: object) -> str:
     return normalize_directory(str(value or '').replace("\\", " "))
 def _normalize_ai_car_number(value: object) -> str:
@@ -16611,6 +20639,7 @@ def _canonicalize_ai_roster_payload(raw_json: str) -> tuple[dict[str, list[dict]
     for driver in drivers:
         if isinstance(driver, dict):
             normalized_drivers.append(_normalize_ai_driver_entry(driver))
+    log_ai_roster_sanity_problems(normalized_drivers)
     return {"drivers": normalized_drivers}, normalized_drivers
 def _build_ai_roster_notes(drivers: list[dict]) -> str:
     lines = ["Summary:", "", "", "", "Drivers:"]
@@ -17173,33 +21202,116 @@ def create_generic_ai_roster_from_random_fallbacks(
         f"Created local AI roster '{AI_GENERIC_RANDOM_ROSTER_NAME}' at {roster_dir} with {cars_with_paint}/{len(ai_users)} car paint(s) "
         f"and {accessories_with_paint} helmet/suit file(s). Recreate the AI race and select this roster to see the random paints."
     )
-def import_saved_paint_groups_to_ai_livery(saved: list[SavedFile], session: Session | None, ai_livery_root: Path, only_local_user: bool = False) -> tuple[int, int]:
-    grouped: dict[tuple[str, int, bool], dict[PaintType, Path]] = {}
+def import_saved_paint_groups_to_ai_livery(
+    saved: list[SavedFile],
+    session: Session | None,
+    ai_livery_root: Path,
+    only_local_user: bool = False,
+    target_keys: set[tuple[int, bool]] | None = None,
+) -> tuple[int, int]:
+    copied_sets, copied_files, _car_paths = _copy_saved_paint_groups_to_ai_livery(
+        saved,
+        session,
+        ai_livery_root,
+        only_local_user=only_local_user,
+        target_keys=target_keys,
+    )
+    return copied_sets, copied_files
+
+def import_selected_paint_groups_to_ai_livery(
+    saved: list[SavedFile],
+    session: Session | None,
+    ai_livery_root: Path,
+    target_keys: set[tuple[int, bool]] | None = None,
+    only_local_user: bool = False,
+) -> tuple[int, int, list[Path]]:
+    return _copy_saved_paint_groups_to_ai_livery(
+        saved,
+        session,
+        ai_livery_root,
+        only_local_user=only_local_user,
+        target_keys=target_keys,
+    )
+
+def _copy_saved_paint_groups_to_ai_livery(
+    saved: list[SavedFile],
+    session: Session | None,
+    ai_livery_root: Path,
+    *,
+    only_local_user: bool = False,
+    target_keys: set[tuple[int, bool]] | None = None,
+) -> tuple[int, int, list[Path]]:
+    grouped: dict[tuple[str, int, bool], dict[PaintType, SavedFile]] = {}
     local_user_id = session.local_user_id if session is not None else None
     for saved_file in saved:
         paint_type = saved_file.download_id.paint_type
-        if paint_type not in {PaintType.CAR, PaintType.CAR_SPEC, PaintType.CAR_DECAL}:
+        if paint_type not in {PaintType.CAR, PaintType.CAR_NUMBER, PaintType.CAR_SPEC, PaintType.CAR_DECAL}:
             continue
         if only_local_user and (local_user_id is None or saved_file.download_id.user_id != local_user_id):
             continue
+        if target_keys is not None:
+            target_key = (int(saved_file.download_id.user_id), bool(saved_file.download_id.is_team_paint))
+            if target_key not in target_keys:
+                continue
         key = (saved_file.download_id.directory, saved_file.download_id.user_id, saved_file.download_id.is_team_paint)
-        grouped.setdefault(key, {})[paint_type] = saved_file.file_path
+        grouped.setdefault(key, {})[paint_type] = saved_file
     copied_sets = 0
     copied_files = 0
+    car_paths: list[Path] = []
     for (directory, _target_id, _is_team), file_map in grouped.items():
-        car_src = file_map.get(PaintType.CAR)
-        if car_src is None or not car_src.exists():
+        # A custom-number paint is a complete car paint. If no plain car paint was
+        # downloaded, use it for the AI livery instead of skipping the driver.
+        car_item = file_map.get(PaintType.CAR) or file_map.get(PaintType.CAR_NUMBER)
+        if car_item is None or not car_item.file_path.exists():
             continue
         car_dir = ai_livery_root / directory
         new_id = _next_ai_cache_id(car_dir)
-        if _copy_optional_file(car_src, car_dir / f"car_{new_id}.tga"):
+        while (car_dir / f"car_{new_id}.tga").exists():
+            new_id = str(int(new_id) + 1)
+        car_dest = car_dir / f"car_{new_id}.tga"
+        if _copy_optional_file(car_item.file_path, car_dest):
             copied_files += 1
-        if _copy_optional_file(file_map.get(PaintType.CAR_SPEC), car_dir / f"car_spec_{new_id}.mip"):
+            car_paths.append(car_dest)
+            _write_ai_livery_source_note(car_dest.with_suffix(".ini"), file_map, session)
+        spec_item = file_map.get(PaintType.CAR_SPEC)
+        if _copy_optional_file(spec_item.file_path if spec_item is not None else None, car_dir / f"car_spec_{new_id}.mip"):
             copied_files += 1
-        if _copy_optional_file(file_map.get(PaintType.CAR_DECAL), car_dir / f"decal_{new_id}.tga"):
+        decal_item = file_map.get(PaintType.CAR_DECAL)
+        if _copy_optional_file(decal_item.file_path if decal_item is not None else None, car_dir / f"decal_{new_id}.tga"):
             copied_files += 1
         copied_sets += 1
-    return copied_sets, copied_files
+    return copied_sets, copied_files, car_paths
+
+def _write_ai_livery_source_note(note_path: Path, file_map: dict[PaintType, SavedFile], session: Session | None) -> None:
+    # Only groups that came from Trading Paints metadata get a note, so plain
+    # saved paints stay as bare car files.
+    metadata_items = [
+        item
+        for item in file_map.values()
+        if str(getattr(item.download_id, "tp_source_link", "") or "").strip()
+        or str(getattr(item.download_id, "tp_title", "") or "").strip()
+    ]
+    if not metadata_items:
+        return
+    download_id = metadata_items[0].download_id
+    matched_user = _find_session_user_for_download_id(session, download_id)
+    display_name = str(getattr(matched_user, "display_name", "") or "").strip() if matched_user is not None else ""
+    parser = configparser.ConfigParser()
+    parser.optionxform = str  # Keep the documented key casing.
+    parser["TradingPaints"] = {
+        "Url": str(getattr(download_id, "tp_source_link", "") or "").strip(),
+        "Title": str(getattr(download_id, "tp_title", "") or "").strip(),
+        "Source": str(getattr(download_id, "tp_source", "") or "").strip(),
+        "CopiedFrom": display_name or str(int(download_id.user_id)),
+    }
+    try:
+        note_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = note_path.with_name(note_path.name + ".tmp")
+        with temp_path.open("w", encoding="utf-8") as handle:
+            parser.write(handle)
+        os.replace(temp_path, note_path)
+    except Exception:
+        logging.warning("Could not write AI livery source note %s", note_path, exc_info=True)
 
 def _parse_saved_paint_filename(path: Path, paints_root: Path | None = None) -> tuple[PaintType, str, int, bool, bool] | None:
     # The car directory is the file's folder relative to the paint root, so
@@ -17219,10 +21331,12 @@ def _parse_saved_paint_filename(path: Path, paints_root: Path | None = None) -> 
         directory = "__accessories__" if parent_name.lower() == "paint" else parent_name
     name = path.name.lower()
     patterns: list[tuple[PaintType, str]] = [
-        (PaintType.CAR, r"^car_(team_)?(\d+)(?:(_ss))?\.tga$"),
-        (PaintType.CAR_NUMBER, r"^car_num_(team_)?(\d+)(?:(_ss))?\.tga$"),
-        (PaintType.CAR_SPEC, r"^car_spec_(team_)?(\d+)(?:_spec)?(?:(_ss))?\.mip$"),
-        (PaintType.CAR_DECAL, r"^decal_(team_)?(\d+)(?:(_ss))?\.tga$"),
+        (PaintType.CAR, r"^car_(team_)?(\d+)(?:_([a-z0-9]+))?(_ss)?\.tga$"),
+        (PaintType.CAR_NUMBER, r"^car_num_(team_)?(\d+)(?:_([a-z0-9]+))?(_ss)?\.tga$"),
+        (PaintType.CAR_SPEC, r"^car_spec_(team_)?(\d+)(?:_spec)?(?:_([a-z0-9]+))?(_ss)?\.mip$"),
+        # The old app name is still recognised so leftovers can be found and migrated.
+        (PaintType.CAR_DECAL, r"^car_decal_(team_)?(\d+)(?:_([a-z0-9]+))?(_ss)?\.tga$"),
+        (PaintType.CAR_DECAL, r"^decal_(team_)?(\d+)(?:_([a-z0-9]+))?(_ss)?\.tga$"),
         (PaintType.HELMET, r"^helmet_(team_)?(\d+)\.tga$"),
         (PaintType.SUIT, r"^suit_(team_)?(\d+)\.tga$"),
     ]
@@ -17232,9 +21346,47 @@ def _parse_saved_paint_filename(path: Path, paints_root: Path | None = None) -> 
             continue
         is_team = bool(match.group(1))
         target_id = int(match.group(2))
-        is_ss = bool(match.group(3)) if match.lastindex and match.lastindex >= 3 else False
+        groups = match.groups()
+        ext_token = str(groups[2] or "").lower() if len(groups) > 2 else ""
+        is_ss = bool(groups[3]) if len(groups) > 3 else False
+        is_ss = is_ss or ext_token == "ss"
         return paint_type, directory, target_id, is_team, is_ss
     return None
+
+LEGACY_DECAL_FILENAME_RE = re.compile(r"^decal_(team_)?(\d+)(?:_([a-z0-9]+))?(_ss)?\.tga$", re.IGNORECASE)
+
+def migrate_legacy_decal_filenames(paints_dir: Path) -> tuple[int, int]:
+    """Rename this app's old ``decal_<id>.tga`` files to the name iRacing reads.
+
+    Only files matching our old decal pattern are touched. A hand-made file is
+    left alone, and a file whose new name already exists is removed as a leftover.
+    """
+    root = Path(paints_dir)
+    if not root.exists():
+        return 0, 0
+    renamed = 0
+    removed = 0
+    try:
+        candidates = list(root.rglob("*.tga"))
+    except OSError as exc:
+        logging.warning("Could not scan %s for old decal file names: %s", root, exc)
+        return 0, 0
+    for path in candidates:
+        if not path.is_file() or LEGACY_DECAL_FILENAME_RE.match(path.name) is None:
+            continue
+        target = path.with_name(f"car_{path.name}")
+        try:
+            if target.exists():
+                path.unlink()
+                removed += 1
+                logging.info("Removed old decal file %s because %s already exists", path, target.name)
+            else:
+                path.rename(target)
+                renamed += 1
+                logging.info("Renamed old decal file %s to %s", path, target.name)
+        except OSError as exc:
+            logging.warning("Could not migrate old decal file %s: %s", path, exc)
+    return renamed, removed
 
 def rebuild_random_pool_from_paints_root(
     paints_root: Path,
@@ -17314,40 +21466,9 @@ def fetch_context_files(
                 for car in root.findall(".//Car"):
                     if not _matches_context_manifest_entry(user, car):
                         continue
-                    file_url = (car.findtext("file") or '').strip()
-                    type_raw = (car.findtext("type") or '').strip().lower()
-                    directory = (car.findtext("directory") or '').strip()
-                    team_id_text = (car.findtext("teamid") or "0").strip() or "0"
-                    if not file_url or not type_raw:
-                        continue
-                    _observe_tp_manifest_directory(directory)
-                    if not directory and type_raw.startswith("car"):
-                        continue
-                    try:
-                        paint_type = PaintType(type_raw)
-                    except ValueError:
-                        logging.debug(
-                            "Skipping unknown contextual paint type '%s' for user %s",
-                            type_raw,
-                            user.user_id,
-                        )
-                        continue
-                    response_team_id = _to_int_or_none(team_id_text)
-                    is_team_paint = bool(response_team_id and response_team_id > 0 and paint_type in TEAM_PAINT_TYPES)
-                    target_user_id = int(response_team_id) if is_team_paint else user.user_id
-                    target_directory = directory or user.directory
-                    files.append(
-                        DownloadFile(
-                            download_id=DownloadId(
-                                user_id=target_user_id,
-                                directory=target_directory,
-                                paint_type=paint_type,
-                                is_team_paint=is_team_paint,
-                                is_superspeedway_variant=_manifest_file_url_is_superspeedway_variant(file_url, paint_type),
-                            ),
-                            url=file_url,
-                        )
-                    )
+                    item = _context_download_file_for_car(user, car)
+                    if item is not None:
+                        files.append(item)
                 if files:
                     logging.debug(
                         "Context fetch succeeded for user %s via %s with %s file(s) (list=%s)",
@@ -17387,6 +21508,120 @@ def fetch_context_files(
                     time.sleep(delay)
     assert last_exc is not None
     raise last_exc
+
+def _chunk_session_users(
+    users: Iterable[SessionUser],
+    chunk_size: int = TP_BATCH_MANIFEST_CHUNK_SIZE,
+) -> list[list[SessionUser]]:
+    ordered = list(users or ())
+    size = max(1, int(chunk_size))
+    return [ordered[index:index + size] for index in range(0, len(ordered), size)]
+
+def _build_fetch_context_payload_batch(
+    session: Session,
+    users: Iterable[SessionUser],
+    superspeedway_variant: bool = False,
+) -> dict[str, str] | None:
+    context = session.trading_paints_context()
+    user_list = list(users or ())
+    if context is None or not user_list:
+        return None
+    payload = dict(context)
+    # The official client sends every driver in one comma-separated list field.
+    payload["list"] = ",".join(user.trading_paints_list_value() for user in user_list)
+    if superspeedway_variant and session.is_superspeedway_track:
+        payload["ss"] = "1"
+    return payload
+
+def _assign_context_manifest_entries(users: Iterable[SessionUser], root: ET.Element) -> dict[tuple[str, int, str], list[DownloadFile]]:
+    user_list = list(users or ())
+    assigned: dict[tuple[str, int, str], list[DownloadFile]] = {
+        user.effective_target_key(): [] for user in user_list
+    }
+    for car in root.findall(".//Car"):
+        for user in user_list:
+            if not _matches_context_manifest_entry(user, car):
+                continue
+            item = _context_download_file_for_car(user, car)
+            if item is not None:
+                assigned[user.effective_target_key()].append(item)
+    return assigned
+
+def _fetch_context_manifest_batch_chunk(
+    users: list[SessionUser],
+    payload: dict[str, str],
+    retries: int,
+    retry_backoff_seconds: float,
+    cancel_event: threading.Event | None = None,
+) -> dict[tuple[str, int, str], list[DownloadFile]] | None:
+    last_exc: Exception | None = None
+    urls = tp_fetch_context_urls()
+    for url_index, url in enumerate(urls):
+        for attempt in range(1, retries + 1):
+            if _cancel_requested(cancel_event):
+                return None
+            try:
+                http = get_thread_http_session()
+                resp = http.post(url, data=payload, timeout=30)
+                resp.raise_for_status()
+                root = _parse_tp_manifest_xml(resp.text)
+                _note_tp_fetch_url_result(url, None)
+                return _assign_context_manifest_entries(users, root)
+            except (requests.RequestException, ET.ParseError, RuntimeError) as exc:
+                last_exc = exc
+                unreachable = _note_tp_fetch_url_result(url, exc, exhausted=attempt >= retries)
+                if attempt >= retries or (unreachable and url_index + 1 < len(urls)):
+                    break
+                delay = compute_retry_delay(retry_backoff_seconds, attempt)
+                if cancel_event is not None:
+                    cancel_event.wait(delay)
+                else:
+                    time.sleep(delay)
+    logging.debug("Batched context manifest fetch failed for %s driver(s): %s", len(users), last_exc)
+    return None
+
+def fetch_context_files_batch(
+    session: Session,
+    users: Iterable[SessionUser],
+    retries: int,
+    retry_backoff_seconds: float,
+    cancel_event: threading.Event | None = None,
+    superspeedway_variant: bool = False,
+) -> dict[tuple[str, int, str], list[DownloadFile]]:
+    """Fetch every driver's context manifest with as few fetch.php requests as possible.
+
+    The returned mapping only contains drivers the server answered with at least one
+    usable file. Everything else (a failed chunk or an empty entry) is left to the
+    unchanged per-driver path.
+    """
+    user_list = list(users or ())
+    if not user_list or session.trading_paints_context() is None:
+        return {}
+    answered: dict[tuple[str, int, str], list[DownloadFile]] = {}
+    for chunk in _chunk_session_users(user_list):
+        payload = _build_fetch_context_payload_batch(session, chunk, superspeedway_variant=superspeedway_variant)
+        if payload is None:
+            break
+        assigned = _fetch_context_manifest_batch_chunk(
+            chunk,
+            payload,
+            retries,
+            retry_backoff_seconds,
+            cancel_event=cancel_event,
+        )
+        if assigned is None:
+            continue
+        for user in chunk:
+            files = assigned.get(user.effective_target_key()) or []
+            if not files:
+                continue
+            # On a superspeedway the per-driver path retries the regular manifest when
+            # the _ss answer has no car asset, so leave that decision to it.
+            if superspeedway_variant and session.is_superspeedway_track and not _manifest_has_car_related_items(files):
+                continue
+            answered[user.effective_target_key()] = files
+    return answered
+
 def _apply_special_variant_flags(session: Session, user: SessionUser, items: list[DownloadFile]) -> list[DownloadFile]:
     _ = user
     return _select_manifest_variants_for_session(session, items)
@@ -17463,6 +21698,7 @@ def fetch_best_manifest_files(
     retry_backoff_seconds: float,
     ai_rosters_dir: Path | None = None,
     cancel_event: threading.Event | None = None,
+    prefetched_manifest: dict[tuple[str, int, str], list[DownloadFile]] | None = None,
 ) -> list[DownloadFile]:
     if _cancel_requested(cancel_event):
         return []
@@ -17476,6 +21712,10 @@ def fetch_best_manifest_files(
             user.user_id,
         )
         return []
+    if prefetched_manifest is not None:
+        target_key = user.effective_target_key()
+        if target_key in prefetched_manifest:
+            return _select_manifest_variants_for_session(session, list(prefetched_manifest[target_key]))
     context = session.trading_paints_context()
     if context is None:
         logging.debug(
@@ -17609,6 +21849,7 @@ def normalize_download_for_session_user(session_user: SessionUser, item: Downloa
         url=item.url,
         ai_roster_optional_filename=item.ai_roster_optional_filename,
         ai_roster_dir=item.ai_roster_dir,
+        expected_size=item.expected_size,
     )
 
 def _download_items_have_primary_slot(items: Iterable[DownloadFile], slot: str) -> bool:
@@ -17662,6 +21903,7 @@ def _retarget_personal_download_to_session_directory(session_user: SessionUser, 
         url=item.url,
         ai_roster_optional_filename=item.ai_roster_optional_filename,
         ai_roster_dir=item.ai_roster_dir,
+        expected_size=item.expected_size,
     )
 
 def _retarget_personal_download_for_team(session_user: SessionUser, item: DownloadFile) -> DownloadFile:
@@ -17679,6 +21921,7 @@ def _retarget_personal_download_for_team(session_user: SessionUser, item: Downlo
         url=item.url,
         ai_roster_optional_filename=item.ai_roster_optional_filename,
         ai_roster_dir=item.ai_roster_dir,
+        expected_size=item.expected_size,
     )
 
 _TEAM_DRIVER_PERSONAL_MANIFEST_CACHE_LOCK = threading.Lock()
@@ -17795,6 +22038,7 @@ def _team_driver_preload_candidate_download_ids(
                     directory=user.directory,
                     paint_type=paint_type,
                     is_superspeedway_variant=ss_variant,
+                    ext=user.paint_ext,
                 )
             )
         for numbered_spec in (False, True):
@@ -17805,6 +22049,7 @@ def _team_driver_preload_candidate_download_ids(
                     paint_type=PaintType.CAR_SPEC,
                     is_superspeedway_variant=ss_variant,
                     is_numbered_car_spec=numbered_spec,
+                    ext=user.paint_ext,
                 )
             )
     return candidates
@@ -18250,6 +22495,46 @@ def _select_team_session_downloads(
     if fallback_items:
         fallback_items = _select_manifest_variants_for_session(session, fallback_items)
     return team_items + fallback_items, applied_slots, still_missing_slots + disabled_missing_slots, cached_slots
+def alternate_tp_asset_url(url: str) -> str | None:
+    """The alternate Trading Paints CDN URL for an asset, or None for any other host."""
+    try:
+        parsed = urllib.parse.urlsplit(str(url or ""))
+    except ValueError:
+        return None
+    if parsed.scheme not in ("http", "https"):
+        return None
+    host = (parsed.hostname or "").lower()
+    if not host or host == TP_ALTERNATE_ASSET_HOST:
+        return None
+    if not host.endswith(TP_ASSET_HOST_SUFFIX) or host in TP_NON_ASSET_HOSTS:
+        return None
+    try:
+        port = f":{parsed.port}" if parsed.port is not None else ""
+    except ValueError:
+        return None
+    return urllib.parse.urlunsplit(parsed._replace(netloc=f"{TP_ALTERNATE_ASSET_HOST}{port}"))
+
+def _tp_download_error_allows_alternate(exc: BaseException | None) -> bool:
+    if isinstance(exc, (requests.ConnectionError, requests.Timeout)):
+        return True
+    response = getattr(exc, "response", None)
+    status_code = getattr(response, "status_code", None)
+    return isinstance(status_code, int) and (status_code == 404 or 500 <= status_code <= 599)
+
+def _stream_tp_asset_response(response, dest_file: Path, cancel_event: threading.Event | None) -> tuple[bool, int]:
+    cancelled = False
+    total = 0
+    with dest_file.open("wb") as f:
+        # 256 KiB reads: on a slow link a 1 MiB read held a cancel back for about 20 seconds.
+        for chunk in response.iter_content(chunk_size=256 * 1024):
+            if _cancel_requested(cancel_event):
+                cancelled = True
+                break
+            if chunk:
+                total += len(chunk)
+                f.write(chunk)
+    return cancelled, total
+
 def download_file(
     session_id: SessionId,
     temp_root: Path,
@@ -18312,19 +22597,10 @@ def download_file(
             )
             try:
                 session = get_thread_http_session()
-                cancelled_mid_stream = False
-                with session.get(item.url, timeout=(10, 90), stream=True) as response:
+                with session.get(item.url, timeout=(10, TP_PAINT_DOWNLOAD_TIMEOUT_SECONDS), stream=True) as response:
                     response.raise_for_status()
-                    with dest_file.open("wb") as f:
-                        # 256 KiB reads: on a slow link a 1 MiB read held a cancel back
-                        # for about 20 seconds.
-                        for chunk in response.iter_content(chunk_size=256 * 1024):
-                            if _cancel_requested(cancel_event):
-                                cancelled_mid_stream = True
-                                break
-                            if chunk:
-                                bytes_downloaded_total += len(chunk)
-                                f.write(chunk)
+                    cancelled_mid_stream, bytes_read = _stream_tp_asset_response(response, dest_file, cancel_event)
+                    bytes_downloaded_total += bytes_read
                 if cancelled_mid_stream:
                     # The file is closed now, so the partial download can go.
                     dest_file.unlink(missing_ok=True)
@@ -18369,6 +22645,51 @@ def download_file(
             except Exception:
                 dest_file.unlink(missing_ok=True)
                 raise
+        alternate_url = alternate_tp_asset_url(item.url)
+        if alternate_url is not None and _tp_download_error_allows_alternate(last_exc):
+            if _cancel_requested(cancel_event):
+                dest_file.unlink(missing_ok=True)
+                return None
+            skipped_unavailable_status = None
+            logging.info(
+                "%sRetrying %s from the alternate Trading Paints CDN host %s",
+                progress_prefix,
+                item.url,
+                alternate_url,
+            )
+            try:
+                session = get_thread_http_session()
+                with session.get(alternate_url, timeout=(10, TP_PAINT_DOWNLOAD_TIMEOUT_SECONDS), stream=True) as response:
+                    response.raise_for_status()
+                    cancelled_mid_stream, bytes_read = _stream_tp_asset_response(response, dest_file, cancel_event)
+                    bytes_downloaded_total += bytes_read
+                if cancelled_mid_stream:
+                    dest_file.unlink(missing_ok=True)
+                    return None
+                logging.debug("%sDownloaded from alternate CDN to temp file: %s", progress_prefix, dest_file)
+                success = True
+                return DownloadedFile(
+                    session_id=session_id,
+                    download_id=item.download_id,
+                    file_path=dest_file,
+                )
+            except requests.RequestException as exc:
+                last_exc = exc
+                dest_file.unlink(missing_ok=True)
+                response = getattr(exc, "response", None)
+                status_code = getattr(response, "status_code", None)
+                if isinstance(status_code, int) and status_code in TP_UNAVAILABLE_DOWNLOAD_STATUS_CODES:
+                    skipped_unavailable_status = status_code
+                logging.warning(
+                    "%sAlternate CDN retry failed for %s via %s: %s",
+                    progress_prefix,
+                    item.url,
+                    alternate_url,
+                    exc,
+                )
+            except Exception:
+                dest_file.unlink(missing_ok=True)
+                raise
         if skipped_unavailable_status is not None:
             if item.ai_roster_dir is not None and item.ai_roster_optional_filename:
                 _mark_ai_roster_asset_unavailable(
@@ -18392,28 +22713,126 @@ def download_file(
 def save_path_for(download_id: DownloadId, paints_dir: Path) -> Path:
     uid = download_id.user_id
     team_suffix = f"team_{uid}" if download_id.is_team_paint else str(uid)
-    ss_suffix = "_ss" if download_id.is_superspeedway_variant else ""
+    ext = normalize_paint_extension(download_id.ext)
+    is_ss = bool(download_id.is_superspeedway_variant)
+    if ext == "ss":
+        # A car configured with the superspeedway extension already names the slot.
+        ext = ""
+        is_ss = True
+    ext_suffix = f"_{ext}" if ext else ""
+    ss_suffix = "_ss" if is_ss else ""
     if download_id.paint_type is PaintType.CAR:
         safe_dir = sanitize_paint_directory(download_id.directory, fallback="misc")
-        return safe_join_under(paints_dir, safe_dir, f"car_{team_suffix}{ss_suffix}.tga")
+        return safe_join_under(paints_dir, safe_dir, f"car_{team_suffix}{ext_suffix}{ss_suffix}.tga")
     if download_id.paint_type is PaintType.CAR_DECAL:
         safe_dir = sanitize_paint_directory(download_id.directory, fallback="misc")
-        return safe_join_under(paints_dir, safe_dir, f"decal_{team_suffix}{ss_suffix}.tga")
+        return safe_join_under(paints_dir, safe_dir, f"car_decal_{team_suffix}{ext_suffix}{ss_suffix}.tga")
     if download_id.paint_type is PaintType.CAR_NUMBER:
         safe_dir = sanitize_paint_directory(download_id.directory, fallback="misc")
-        return safe_join_under(paints_dir, safe_dir, f"car_num_{team_suffix}{ss_suffix}.tga")
+        return safe_join_under(paints_dir, safe_dir, f"car_num_{team_suffix}{ext_suffix}{ss_suffix}.tga")
     if download_id.paint_type is PaintType.CAR_SPEC:
         safe_dir = sanitize_paint_directory(download_id.directory, fallback="misc")
         if download_id.is_numbered_car_spec:
-            return safe_join_under(paints_dir, safe_dir, f"car_spec_{team_suffix}_spec{ss_suffix}.mip")
-        return safe_join_under(paints_dir, safe_dir, f"car_spec_{team_suffix}{ss_suffix}.mip")
+            return safe_join_under(paints_dir, safe_dir, f"car_spec_{team_suffix}_spec{ext_suffix}{ss_suffix}.mip")
+        return safe_join_under(paints_dir, safe_dir, f"car_spec_{team_suffix}{ext_suffix}{ss_suffix}.mip")
     if download_id.paint_type is PaintType.HELMET:
-        return safe_join_under(paints_dir, f"helmet_{team_suffix}.tga")
+        # iRacing has no team helmet slot; team mode still writes the driver's helmet.
+        return safe_join_under(paints_dir, f"helmet_{uid}.tga")
     if download_id.paint_type is PaintType.SUIT:
         return safe_join_under(paints_dir, f"suit_{team_suffix}.tga")
     raise ValueError(f"Unsupported paint type: {download_id.paint_type}")
 def save_paths_for(download_id: DownloadId, paints_dir: Path) -> list[Path]:
     return [save_path_for(download_id, paints_dir)]
+def _session_preview_paint_file(user: SessionUser, paints_dir: Path, paint_type: PaintType) -> Path | None:
+    """The driver's installed paint file, preferring the team paint when there is one."""
+    candidates: list[DownloadId] = []
+    if session_user_uses_team_target(user):
+        candidates.append(
+            DownloadId(
+                user_id=int(user.team_id or 0),
+                directory=user.directory,
+                paint_type=paint_type,
+                is_team_paint=True,
+                ext=user.paint_ext if _is_car_related_paint_type(paint_type) else "",
+            )
+        )
+    candidates.append(
+        DownloadId(
+            user_id=int(user.user_id),
+            directory=user.directory,
+            paint_type=paint_type,
+            ext=user.paint_ext if _is_car_related_paint_type(paint_type) else "",
+        )
+    )
+    for download_id in candidates:
+        try:
+            path = save_path_for(download_id, Path(paints_dir))
+        except Exception:
+            logging.debug("Could not resolve a preview path for %s", download_id, exc_info=True)
+            continue
+        if path.exists():
+            return path
+    return None
+def _session_preview_car_selection(user: SessionUser, paints_dir: Path) -> tuple[Path | None, str]:
+    """The installed car paint and the render kind it needs.
+
+    A custom-number paint (``car_num_#.tga``) is a complete paint with the number
+    baked in, so it is rendered as ``car_num`` (number stamping disabled) instead of
+    being ignored when the driver has no plain ``car_#.tga``.
+    """
+    candidates: list[tuple[PaintType, str, bool, int]] = []
+    if session_user_uses_team_target(user):
+        team_id = int(user.team_id or 0)
+        candidates.append((PaintType.CAR, "car", True, team_id))
+        candidates.append((PaintType.CAR_NUMBER, "car_num", True, team_id))
+    candidates.append((PaintType.CAR, "car", False, int(user.user_id)))
+    candidates.append((PaintType.CAR_NUMBER, "car_num", False, int(user.user_id)))
+    for paint_type, render_kind, is_team, target_id in candidates:
+        try:
+            path = save_path_for(
+                DownloadId(
+                    user_id=target_id,
+                    directory=user.directory,
+                    paint_type=paint_type,
+                    is_team_paint=is_team,
+                    ext=user.paint_ext,
+                ),
+                Path(paints_dir),
+            )
+        except Exception:
+            logging.debug("Could not resolve a car preview path for %s", user.user_id, exc_info=True)
+            continue
+        if path.exists():
+            return path, render_kind
+    return None, "car"
+def session_preview_inputs(user: SessionUser, paints_dir: Path) -> dict[str, object]:
+    """Everything the preview panel needs to show one selected driver."""
+    car_tga, car_kind = _session_preview_car_selection(user, paints_dir)
+    number = str(user.number or "").strip()
+    return {
+        "car_tga": car_tga,
+        "car_kind": car_kind,
+        "decal_tga": _session_preview_paint_file(user, paints_dir, PaintType.CAR_DECAL),
+        "helmet_tga": _session_preview_paint_file(user, paints_dir, PaintType.HELMET),
+        "suit_tga": _session_preview_paint_file(user, paints_dir, PaintType.SUIT),
+        "car_path": str(user.directory or ""),
+        "design": str(user.car_design or ""),
+        "number": None if number in {"", "0"} else number,
+        "uses_design": car_tga is None,
+    }
+def preview_export_names(member_id: int, car_path: str) -> dict[str, str]:
+    """File names for the three exported preview images of one driver."""
+    try:
+        folder = Path(str(car_path or "").strip()).name
+    except (TypeError, ValueError):
+        folder = ""
+    folder = folder.replace(" ", "_") or "car"
+    prefix = str(int(member_id or 0))
+    return {
+        "car": f"{prefix}_{folder}.png",
+        "helmet": f"{prefix}_helmet.png",
+        "suit": f"{prefix}_suit.png",
+    }
 def _should_retry_save_exception(exc: Exception) -> bool:
     if isinstance(exc, PermissionError):
         return True
@@ -18477,6 +22896,9 @@ def move_or_extract(
                     # An empty reply (HTTP 200, no body) replaced a good paint with a
                     # zero-byte file. No paint is empty: keep the one in place.
                     raise RuntimeError(f"{src.name} is empty; keeping the current paint.")
+                payload_path = src if src.suffix.lower() == ".bz2" else temp_primary_dest
+                if not _paint_payload_looks_valid(payload_path, downloaded.download_id.paint_type) or _looks_like_html_payload(temp_primary_dest):
+                    raise RuntimeError(f"{src.name} is an invalid paint payload; keeping the current paint.")
                 _remember_once(primary_dest)
                 os.replace(temp_primary_dest, primary_dest)
                 saved_paths = [primary_dest]
@@ -18579,6 +23001,115 @@ def _hard_delete_file(path: Path, paints_root: Path | None = None, retries: int 
         return False
     _remove_empty_parent_dirs(path, stop_at=paints_root)
     return True
+
+
+def _remove_stale_spec_maps_for_download_items(items: Iterable[object], paints_dir: Path) -> int:
+    """Delete an old spec map when the incoming car paint has no spec map.
+
+    A spec map belongs to one paint. Keeping the previous ``car_spec_*.mip`` when a
+    paint without a spec replaces one with a spec makes the new car shiny/metallic.
+    The check is per (target, directory, superspeedway variant), so a batch that
+    includes its own spec map is left alone.
+    """
+    item_list = list(items)
+    spec_keys: set[tuple[bool, int, str, bool]] = set()
+    for item in item_list:
+        download_id = getattr(item, "download_id", None)
+        if download_id is None or download_id.paint_type is not PaintType.CAR_SPEC:
+            continue
+        spec_keys.add(
+            (
+                bool(download_id.is_team_paint),
+                int(download_id.user_id),
+                str(download_id.directory or "").strip().lower(),
+                bool(download_id.is_superspeedway_variant),
+            )
+        )
+    removed = 0
+    paints_root = Path(paints_dir)
+    for item in item_list:
+        download_id = getattr(item, "download_id", None)
+        if download_id is None or download_id.paint_type not in {PaintType.CAR, PaintType.CAR_NUMBER}:
+            continue
+        key = (
+            bool(download_id.is_team_paint),
+            int(download_id.user_id),
+            str(download_id.directory or "").strip().lower(),
+            bool(download_id.is_superspeedway_variant),
+        )
+        if key in spec_keys:
+            continue
+        for numbered_spec in (False, True):
+            spec_id = replace(
+                download_id,
+                paint_type=PaintType.CAR_SPEC,
+                is_numbered_car_spec=numbered_spec,
+            )
+            try:
+                spec_path = save_path_for(spec_id, paints_root)
+            except Exception:
+                continue
+            if spec_path.exists() and _hard_delete_file(spec_path, paints_root=paints_root):
+                removed += 1
+    if removed:
+        logging.info("Removed %s stale spec map(s) for paints that no longer have one", removed)
+    return removed
+
+
+def _remove_stale_spec_maps_for_saved(saved_items: Iterable[SavedFile], paints_dir: Path, session: Session) -> int:
+    """Delete old spec maps for fallback-saved cars that arrived without one.
+
+    The TP download batch checks its own incoming items, but a car installed by a
+    random/showroom/collection fallback never passes through that batch. Leaving
+    the previous driver's spec map makes the fallback paint render with their
+    shine. Local user and team targets are never touched.
+    """
+    item_list = list(saved_items)
+    spec_keys = {
+        (
+            bool(item.download_id.is_team_paint),
+            int(item.download_id.user_id),
+            str(item.download_id.directory or "").strip().lower(),
+        )
+        for item in item_list
+        if item.download_id.paint_type is PaintType.CAR_SPEC
+    }
+    paints_root = Path(paints_dir)
+    seen_car_keys: set[tuple[bool, int, str]] = set()
+    removed = 0
+    for item in item_list:
+        download_id = item.download_id
+        if download_id.paint_type not in {PaintType.CAR, PaintType.CAR_NUMBER}:
+            continue
+        is_team = bool(download_id.is_team_paint)
+        target_id = int(download_id.user_id)
+        key = (is_team, target_id, str(download_id.directory or "").strip().lower())
+        if key in spec_keys or key in seen_car_keys:
+            continue
+        seen_car_keys.add(key)
+        if is_team:
+            is_local = session.local_team_id is not None and target_id == int(session.local_team_id)
+        else:
+            is_local = _is_local_user_target(session, "user", target_id)
+        if is_local:
+            continue
+        for numbered_spec in (False, True):
+            spec_id = replace(
+                download_id,
+                paint_type=PaintType.CAR_SPEC,
+                is_numbered_car_spec=numbered_spec,
+            )
+            try:
+                spec_path = save_path_for(spec_id, paints_root)
+            except Exception:
+                continue
+            if spec_path.exists() and _hard_delete_file(spec_path, paints_root=paints_root):
+                removed += 1
+    if removed:
+        logging.info("Removed %s stale spec map(s) for fallback paints that no longer have one", removed)
+    return removed
+
+
 def _safe_replay_pack_name(name: str) -> str:
     cleaned = re.sub(r'[<>:"/\\|?*]+', '_', (name or '').strip())
     cleaned = cleaned.strip().strip('.')
@@ -18618,6 +23149,7 @@ def _download_id_to_dict(download_id: DownloadId) -> dict[str, object]:
         "is_team_paint": bool(download_id.is_team_paint),
         "is_superspeedway_variant": bool(download_id.is_superspeedway_variant),
         "is_numbered_car_spec": bool(download_id.is_numbered_car_spec),
+        "ext": str(getattr(download_id, "ext", "") or ""),
         "preserve_on_cleanup": bool(getattr(download_id, "preserve_on_cleanup", False)),
         "tp_scheme_id": str(getattr(download_id, "tp_scheme_id", "") or ""),
         "tp_title": str(getattr(download_id, "tp_title", "") or ""),
@@ -18633,6 +23165,7 @@ def _download_id_from_dict(payload: dict[str, object]) -> DownloadId:
         is_team_paint=bool(payload.get('is_team_paint')),
         is_superspeedway_variant=bool(payload.get('is_superspeedway_variant')),
         is_numbered_car_spec=bool(payload.get('is_numbered_car_spec')),
+        ext=str(payload.get('ext') or ''),
         preserve_on_cleanup=bool(payload.get('preserve_on_cleanup')),
         tp_scheme_id=str(payload.get("tp_scheme_id") or ""),
         tp_title=str(payload.get("tp_title") or ""),
@@ -18968,6 +23501,22 @@ def _load_replay_pack_manifest(pack_dir: Path) -> dict[str, object] | None:
         return None
     return raw if isinstance(raw, dict) else None
 
+def session_is_race_for_replay(session: Session | None) -> bool:
+    """Whether replay liveries/names should be handled for this session.
+
+    An unknown session type keeps the previous behaviour. Practice, qualifying,
+    warm-up and test sessions must not create replay liveries or copy a replay name.
+    """
+    if session is None:
+        return False
+    text = str(getattr(session, "session_type", "") or "").strip().lower()
+    if not text:
+        return True
+    if any(token in text for token in ("practice", "qualify", "qualifying", "warmup", "warm-up", "test")):
+        return False
+    return any(token in text for token in ("race", "heat", "feature"))
+
+
 def _copy_saved_files_into_replay_pack(
     replay_file: Path,
     session: Session | None,
@@ -19096,7 +23645,8 @@ def sync_replay_packs_for_folder(
                 replay_name = str(entry.get('replay_file_name') or Path(replay_key).name)
                 logging.info("Replay pack '%s' removed because replay file '%s' was deleted", pack_name, replay_name)
             dirty = True
-    if added_keys:
+    capture_allowed = session_is_race_for_replay(current_session)
+    if added_keys and capture_allowed:
         for replay_key in added_keys:
             replay_path = current_files[replay_key]['path']
             ok, message = _copy_saved_files_into_replay_pack(replay_path, current_session, saved, paints_root, replay_packs_dir)
@@ -19107,6 +23657,11 @@ def sync_replay_packs_for_folder(
         packs = _load_replay_pack_index(replay_packs_dir)
     elif dirty:
         _save_replay_pack_index(replay_packs_dir, packs)
+    if added_keys and not capture_allowed:
+        logging.debug(
+            "Skipped replay pack capture for %s new replay file(s): the active session is not a race.",
+            len(added_keys),
+        )
     return current_files, packs
 
 def restore_replay_pack_for_session(
@@ -19283,6 +23838,29 @@ def _saved_file_matches_session_target_key(
         return True
     return str(item.download_id.directory or "").lower() == str(wanted_directory or "").lower()
 
+def _is_local_user_target(session: Session, kind: str, target_id: int) -> bool:
+    return (
+        str(kind) == "user"
+        and session.local_user_id is not None
+        and int(target_id) == int(session.local_user_id)
+    )
+
+
+def _is_local_car_paint_path(path: Path) -> bool:
+    name = Path(path).name.lower()
+    return name.startswith(("car_", "car_num_")) and not name.startswith("car_spec_")
+
+
+def _is_local_car_paint_saved(session: Session, item: SavedFile) -> bool:
+    download_id = item.download_id
+    return (
+        not bool(download_id.is_team_paint)
+        and session.local_user_id is not None
+        and int(download_id.user_id) == int(session.local_user_id)
+        and download_id.paint_type in {PaintType.CAR, PaintType.CAR_NUMBER}
+    )
+
+
 def clear_session_target_files(
     *,
     session: Session,
@@ -19313,10 +23891,16 @@ def clear_session_target_files(
     kept: list[SavedFile] = []
     tracked_to_delete: list[SavedFile] = []
     for item in saved or []:
-        if any(_saved_file_matches_session_target_key(session, item, target_key) for target_key in changed):
-            tracked_to_delete.append(item)
-        else:
+        if not any(_saved_file_matches_session_target_key(session, item, target_key) for target_key in changed):
             kept.append(item)
+            continue
+        # iRacing's UI thumbnail reads car_<id>.tga / car_num_<id>.tga. A refresh
+        # must not delete the local player's own paint before the replacement is on
+        # disk; a failed/Forbidden download would otherwise leave the UI blank.
+        if _is_local_car_paint_saved(session, item):
+            kept.append(item)
+            continue
+        tracked_to_delete.append(item)
     deleted_paths: set[str] = set()
     preserved_paths: set[str] = set()
     if tracked_to_delete:
@@ -19332,13 +23916,108 @@ def clear_session_target_files(
         )
     for kind, target_id, directory in changed:
         target_is_team = kind == "team"
+        preserve_local_car = _is_local_user_target(session, kind, int(target_id))
         for path in _expected_session_target_paths(paints_dir, target_is_team, int(target_id), directory):
             key = str(path).lower()
             if key in deleted_paths or key in preserved_paths:
                 continue
+            if preserve_local_car and _is_local_car_paint_path(path):
+                continue
             if path.exists() and _hard_delete_file(path, paints_root=paints_dir):
                 deleted_paths.add(key)
     return kept, len(deleted_paths)
+
+PURGE_PAINT_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # Optional `_<ext>` is iRacing's custom paint extension (see save_path_for).
+    re.compile(r"^car_(team_)?(\d+)(?:_[a-z0-9]+)?(?:_ss)?\.tga$", re.IGNORECASE),
+    re.compile(r"^car_num_(team_)?(\d+)(?:_[a-z0-9]+)?(?:_ss)?\.tga$", re.IGNORECASE),
+    re.compile(r"^car_decal_(team_)?(\d+)(?:_[a-z0-9]+)?(?:_ss)?\.tga$", re.IGNORECASE),
+    # Decals saved before 7.4.0 used `decal_<id>.tga`.
+    re.compile(r"^decal_(team_)?(\d+)(?:_ss)?\.tga$", re.IGNORECASE),
+    re.compile(r"^car_spec_(team_)?(\d+)(?:_spec)?(?:_[a-z0-9]+)?(?:_ss)?\.mip$", re.IGNORECASE),
+    re.compile(r"^helmet_(team_)?(\d+)\.tga$", re.IGNORECASE),
+    re.compile(r"^suit_(team_)?(\d+)\.tga$", re.IGNORECASE),
+)
+
+
+def _purge_path_key(path: Path | str) -> str:
+    return os.path.normcase(os.path.abspath(os.path.normpath(str(path))))
+
+
+def _purge_base_name(name: str) -> str:
+    """Strip the compression/temp trailer the app adds around a paint file."""
+    base = str(name or "").strip().lower()
+    for suffix in (".bz2", ".tmp", ".part"):
+        if base.endswith(suffix):
+            base = base[: -len(suffix)]
+    # Atomic writes use "<paint name>.<uuid hex>.tmp".
+    return re.sub(r"\.[0-9a-f]{8,}$", "", base)
+
+
+def _purge_paint_target(base_name: str) -> tuple[bool, int] | None:
+    for pattern in PURGE_PAINT_PATTERNS:
+        match = pattern.fullmatch(base_name)
+        if match is not None:
+            return bool(match.group(1)), int(match.group(2))
+    return None
+
+
+def _purge_owned_target(base_name: str, own_member_id: int, own_team_id: int) -> bool:
+    target = _purge_paint_target(base_name)
+    if target is None:
+        return False
+    is_team, target_id = target
+    if is_team:
+        return own_team_id > 0 and target_id == int(own_team_id)
+    return own_member_id > 0 and target_id == int(own_member_id)
+
+
+def select_purge_files(
+    root: Path | str,
+    *,
+    own_member_id: int = 0,
+    own_team_id: int = 0,
+    protected_paths: Iterable[Path | str] = (),
+) -> list[Path]:
+    """Paint tree files the purge command may remove.
+
+    Only the app's own car, number, spec, decal, helmet and suit names (and the
+    ``.bz2``/temporary leftovers of those) qualify. The local user's targets,
+    iRacing UI preview files and anything with another name are kept.
+    """
+    root_path = Path(root)
+    if not root_path.is_dir():
+        return []
+    protected = {_purge_path_key(path) for path in protected_paths}
+    selected: list[Path] = []
+    for path in root_path.rglob("*"):
+        try:
+            if not path.is_file():
+                continue
+        except OSError:
+            continue
+        if _purge_path_key(path) in protected:
+            continue
+        base_name = _purge_base_name(path.name)
+        if _purge_paint_target(base_name) is None:
+            continue
+        if _purge_owned_target(base_name, int(own_member_id or 0), int(own_team_id or 0)):
+            continue
+        selected.append(path)
+    return sorted(selected, key=lambda item: str(item).lower())
+
+
+def purge_file_stats(paths: Iterable[Path]) -> tuple[int, int]:
+    count = 0
+    size = 0
+    for path in paths:
+        count += 1
+        try:
+            size += int(Path(path).stat().st_size)
+        except OSError:
+            continue
+    return count, size
+
 
 def clear_changed_team_driver_target_files(
     *,
@@ -19372,16 +24051,50 @@ def _collect_wanted_downloads(
     team_driver_personal_fallback_slots: Iterable[str],
     ai_rosters_dir: Path | None = None,
     cancel_event: threading.Event | None = None,
+    on_track_car_idxs: set[int] | None = None,
+    local_keys: Iterable[tuple[str, int, str]] | None = None,
 ) -> list[DownloadFile]:
     wanted_items: list[DownloadFile] = []
     users_sorted = sorted(session.users, key=lambda u: u.user_id)
+    users_ordered = order_session_targets(users_sorted, on_track_car_idxs or set(), local_keys or ())
     manifest_workers = max(1, int(manifest_workers))
     if not users_sorted:
         return wanted_items
+    batch_users = [user for user in users_ordered if not user.is_ai]
+    batched_manifests: dict[tuple[str, int, str], list[DownloadFile]] = {}
+    if batch_users and session.trading_paints_context() is not None:
+        batched_manifests = fetch_context_files_batch(
+            session,
+            batch_users,
+            retries,
+            retry_backoff_seconds,
+            cancel_event=cancel_event,
+            superspeedway_variant=session.is_superspeedway_track,
+        )
+    batch_requests = 0
+    if batch_users and session.trading_paints_context() is not None:
+        batch_requests = max(1, (len(batch_users) + TP_BATCH_MANIFEST_CHUNK_SIZE - 1) // TP_BATCH_MANIFEST_CHUNK_SIZE)
+    fallback_users = sum(1 for user in batch_users if user.effective_target_key() not in batched_manifests)
+    logging.info(
+        "Trading Paints manifest: %s drivers in %s batched request(s), %s per-driver fallbacks",
+        len(batch_users),
+        batch_requests,
+        fallback_users,
+    )
+    collected: dict[int, list[DownloadFile]] = {id(user): [] for user in users_ordered}
     with concurrent.futures.ThreadPoolExecutor(max_workers=manifest_workers) as executor:
         future_to_user = {
-            executor.submit(fetch_best_manifest_files, session, user, retries, retry_backoff_seconds, ai_rosters_dir, cancel_event): user
-            for user in users_sorted
+            executor.submit(
+                fetch_best_manifest_files,
+                session,
+                user,
+                retries,
+                retry_backoff_seconds,
+                ai_rosters_dir,
+                cancel_event,
+                batched_manifests,
+            ): user
+            for user in users_ordered
             if not _cancel_requested(cancel_event)
         }
         completed = 0
@@ -19469,17 +24182,20 @@ def _collect_wanted_downloads(
                 )
             elif not all_files:
                 logging.debug("Manifest returned no files for source user %s", user.user_id)
-            wanted_items.extend(user_wanted)
-    wanted_items.sort(
-        key=lambda f: (
-            f.download_id.is_team_paint,
-            f.download_id.user_id,
-            f.download_id.directory.lower(),
-            f.download_id.paint_type.value,
+            collected[id(user)] = user_wanted
+    for user in users_ordered:
+        user_items = collected.get(id(user), [])
+        user_items.sort(
+            key=lambda f: (
+                f.download_id.is_team_paint,
+                f.download_id.user_id,
+                f.download_id.directory.lower(),
+                f.download_id.paint_type.value,
+            )
         )
-    )
+        wanted_items.extend(user_items)
     return wanted_items
-def _dedupe_download_items(items: list[DownloadFile]) -> list[DownloadFile]:
+def _dedupe_download_items(items: list[DownloadFile], preserve_order: bool = False) -> list[DownloadFile]:
     unique: dict[tuple[int, str, PaintType], DownloadFile] = {}
     for item in items:
         key = (
@@ -19490,15 +24206,18 @@ def _dedupe_download_items(items: list[DownloadFile]) -> list[DownloadFile]:
             item.download_id.is_numbered_car_spec,
         )
         unique[key] = item
-    deduped = sorted(
-        unique.values(),
-        key=lambda f: (
-            f.download_id.is_team_paint,
-            f.download_id.user_id,
-            f.download_id.directory.lower(),
-            f.download_id.paint_type.value,
-        ),
-    )
+    if preserve_order:
+        deduped = list(unique.values())
+    else:
+        deduped = sorted(
+            unique.values(),
+            key=lambda f: (
+                f.download_id.is_team_paint,
+                f.download_id.user_id,
+                f.download_id.directory.lower(),
+                f.download_id.paint_type.value,
+            ),
+        )
     removed = len(items) - len(deduped)
     if removed > 0:
         logging.debug("Removed %s duplicate manifest item(s) before download", removed)
@@ -19724,6 +24443,9 @@ def process_session(
     auto_refresh_paints: bool = False,
     cancel_event: threading.Event | None = None,
     prior_saved: list[SavedFile] | None = None,
+    use_default_spec_maps: bool = True,
+    create_own_car_thumbnails: bool = False,
+    create_session_car_thumbnails: bool = False,
 ) -> tuple[list[SavedFile], ThroughputMonitorSnapshot, list[SessionDriverSnapshot]]:
     session_temp = temp_dir / session.session_id.folder_name()
     if session_temp.exists():
@@ -19781,8 +24503,10 @@ def process_session(
         team_driver_personal_fallback_slots=team_driver_personal_fallback_slots,
         ai_rosters_dir=ai_rosters_dir,
         cancel_event=cancel_event,
+        on_track_car_idxs=read_on_track_car_idxs(reload_reader),
+        local_keys=session_local_target_keys(session),
     )
-    wanted_items = _dedupe_download_items(wanted_items)
+    wanted_items = _dedupe_download_items(wanted_items, preserve_order=True)
     progress_statuses = build_session_stage_statuses(session, wanted_items, sync_my_livery_from_server)
     # A car's paint, spec, helmet and suit land a few hundred ms apart; waiting a second
     # reloads each car once instead of once per file, and every reload is a hitch in the sim.
@@ -19952,6 +24676,7 @@ def process_session(
             downloads_count=len(downloads),
             download_stats_snapshot=download_stats,
         )
+    _remove_stale_spec_maps_for_download_items(downloads, paints_dir)
     saved, save_stats = _save_downloads_parallel(
         downloads=downloads,
         paints_dir=paints_dir,
@@ -20233,8 +24958,34 @@ def process_session(
         )
     for line in fallback_logs:
         logging.info(line)
+    _remove_stale_spec_maps_for_saved(fallback_saved, paints_dir, session)
+    if use_default_spec_maps:
+        extra_paths = apply_post_save_extras(session, session.users, paints_dir)
+    else:
+        extra_paths = apply_post_save_extras(session, session.users, paints_dir, use_default_spec_maps=False)
+    extra_saved = _saved_files_for_extra_paths(session, paints_dir, extra_paths)
+    if extra_saved:
+        tracked_paths = {str(item.file_path).lower() for item in saved}
+        for item in extra_saved:
+            path_key = str(item.file_path).lower()
+            if path_key in tracked_paths:
+                continue
+            if _is_local_car_paint_saved(session, item):
+                item = replace(item, download_id=replace(item.download_id, preserve_on_cleanup=True))
+            saved.append(item)
+            tracked_paths.add(path_key)
+    if extra_saved and reload_debouncer is not None:
+        reload_debouncer.request_saved_items(extra_saved)
     if reload_debouncer is not None:
         reload_debouncer.flush(force=True)
+    schedule_car_thumbnails(
+        session,
+        session.users,
+        paints_dir,
+        create_own=create_own_car_thumbnails,
+        create_session=create_session_car_thumbnails,
+        settle_seconds=THUMBNAIL_RENDER_SETTLE_SECONDS,
+    )
     saved = _mark_saved_files_for_driver_overrides(session, saved)
     fallback_saved = _mark_saved_files_for_driver_overrides(session, fallback_saved)
     server_saved = list(saved)
@@ -20425,6 +25176,148 @@ def _read_session_info_update(sdk: object) -> int:
     except Exception:  # noqa: BLE001
         pass
     return 0
+_SESSION_YAML_NAME_KEYS = ("UserName", "TeamName", "AbbrevName", "Initials")
+_SESSION_YAML_EMPTY_DESIGN_KEYS = ("CarDesignStr", "HelmetDesignStr", "SuitDesignStr", "CarNumberDesignStr")
+_SESSION_YAML_UNSAFE_FIRST_CHARS = frozenset("*&!%@`")
+_YAML_DUMPED_SESSION_IDS: set[str] = set()
+_YAML_DUMP_LOCK = threading.Lock()
+
+
+def default_yaml_dump_dir() -> Path:
+    return default_log_dir() / YAML_DUMP_DIRNAME
+
+
+def _session_yaml_value_needs_quotes(value: str) -> bool:
+    if not value:
+        return False
+    if value[0] in _SESSION_YAML_UNSAFE_FIRST_CHARS:
+        return True
+    return ":" in value or "#" in value
+
+
+def _quote_yaml_value(value: str) -> str:
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def clean_session_yaml(text: str) -> str:
+    """Quote the session values that iRacing can emit as invalid bare YAML."""
+    had_trailing_newline = text.endswith(("\n", "\r"))
+    cleaned: list[str] = []
+    name_pattern = re.compile(
+        r"^(\s*(?:" + "|".join(_SESSION_YAML_NAME_KEYS) + r")\s*:\s*)(.*?)(\s*)$"
+    )
+    design_pattern = re.compile(
+        r"^(\s*(?:" + "|".join(_SESSION_YAML_EMPTY_DESIGN_KEYS) + r")\s*:\s*)(.*?)(\s*)$"
+    )
+    for line in text.splitlines():
+        name_match = name_pattern.match(line)
+        if name_match:
+            prefix, value, trailing = name_match.groups()
+            if value and not value.startswith(('"', "'")) and _session_yaml_value_needs_quotes(value):
+                line = f"{prefix}{_quote_yaml_value(value)}{trailing}"
+            cleaned.append(line)
+            continue
+        design_match = design_pattern.match(line)
+        if design_match:
+            prefix, value, trailing = design_match.groups()
+            if not value:
+                separator = "" if prefix.endswith((" ", "\t")) else " "
+                line = f'{prefix}{separator}""{trailing}'
+        cleaned.append(line)
+    result = "\n".join(cleaned)
+    return result + ("\n" if had_trailing_newline else "")
+
+
+def recover_session_info_yaml(text: str) -> dict | None:
+    """Parse cleaned session YAML into the SessionInfo mapping, or return None."""
+    try:
+        parsed = yaml.safe_load(clean_session_yaml(text))
+    except Exception:
+        return None
+    if isinstance(parsed, dict):
+        info = parsed.get("SessionInfo", parsed)
+        if isinstance(info, dict):
+            return info
+    return None
+
+
+def purge_yaml_dumps(
+    dump_dir: Path | str | None = None,
+    *,
+    max_age_days: int = YAML_DUMP_MAX_AGE_DAYS,
+    now: float | None = None,
+) -> int:
+    directory = Path(dump_dir) if dump_dir is not None else default_yaml_dump_dir()
+    cutoff = float(now if now is not None else time.time()) - max(0, int(max_age_days)) * 86400.0
+    removed = 0
+    try:
+        children = list(directory.iterdir())
+    except OSError:
+        return 0
+    for child in children:
+        if not child.is_file() or child.suffix.lower() != ".yaml":
+            continue
+        try:
+            if child.stat().st_mtime < cutoff:
+                child.unlink()
+                removed += 1
+        except OSError:
+            continue
+    return removed
+
+
+def dump_failed_session_yaml(
+    text: str,
+    session_id: object,
+    *,
+    dump_dir: Path | str | None = None,
+    dumped_session_ids: set[str] | None = None,
+    now: float | None = None,
+) -> Path | None:
+    """Write one raw session YAML per session id, for support after a failed parse."""
+    key = str(session_id or "unknown")
+    directory = Path(dump_dir) if dump_dir is not None else default_yaml_dump_dir()
+    purge_yaml_dumps(directory, now=now)
+    ids = dumped_session_ids if dumped_session_ids is not None else _YAML_DUMPED_SESSION_IDS
+    with _YAML_DUMP_LOCK:
+        if key in ids:
+            return None
+        ids.add(key)
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(float(now or time.time())))
+        path = directory / f"{stamp}.yaml"
+        suffix = 2
+        while path.exists():
+            path = directory / f"{stamp}-{suffix}.yaml"
+            suffix += 1
+        path.write_text(text, encoding="utf-8", errors="replace")
+        return path
+    except OSError:
+        logging.debug("Could not write the failed session YAML dump", exc_info=True)
+        return None
+
+
+def _read_raw_session_info_yaml(sdk: object) -> str | None:
+    """Read the raw SessionInfo YAML from pyirsdk without parsing it."""
+    getter = getattr(sdk, "_get_session_info_binary", None)
+    if not callable(getter):
+        return None
+    try:
+        data = getter("SessionInfo")
+    except Exception:
+        return None
+    if not data:
+        return None
+    try:
+        is_utf8 = bool(getattr(sdk, "is_session_info_utf8", True))
+        encoding = "utf-8" if is_utf8 else "cp1252"
+        return data.rstrip(b"\x00").decode(encoding, errors="replace")
+    except Exception:
+        return None
+
+
 def read_session_from_sdk(reader: IracingSdkReader) -> tuple[SdkPollState, Session | None]:
     sdk = reader.sdk
     try:
@@ -20472,7 +25365,27 @@ def read_session_from_sdk(reader: IracingSdkReader) -> tuple[SdkPollState, Sessi
         load_num_textures = _to_boolish(load_num_value, default=False)
     except Exception as exc:  # noqa: BLE001
         logging.debug("Could not read LoadNumTextures from SDK: %s", exc)
-    session = _build_session_from_parts(weekend, driver_info, load_num_textures=load_num_textures)
+    try:
+        session_info = sdk["SessionInfo"]
+    except Exception as exc:  # noqa: BLE001
+        logging.debug("Could not read SessionInfo from SDK: %s", exc)
+        session_info = None
+    if not isinstance(session_info, dict):
+        raw_session_yaml = _read_raw_session_info_yaml(sdk)
+        if raw_session_yaml:
+            session_info = recover_session_info_yaml(raw_session_yaml)
+            if isinstance(session_info, dict):
+                logging.warning("Recovered malformed session YAML after cleaning its driver names and design fields.")
+            else:
+                session_key = f"{weekend.get('SessionID') or 'unknown'}"
+                dump_failed_session_yaml(raw_session_yaml, session_key)
+                logging.warning("Session YAML could not be parsed even after cleaning; the raw copy was saved for support.")
+    session = _build_session_from_parts(
+        weekend,
+        driver_info,
+        load_num_textures=load_num_textures,
+        session_info=session_info,
+    )
     reader.last_update = update
     reader.last_full_session_refresh_at = now
     if session is not None and (session.local_user_id is None or session.local_user_id <= 0):
@@ -20492,7 +25405,7 @@ def read_session_from_sdk(reader: IracingSdkReader) -> tuple[SdkPollState, Sessi
     return SdkPollState.SESSION, session
 def start_session_cancel_monitor(
     *,
-    expected_fingerprint: tuple[SessionId, tuple[bool, str, int, int, bool, str, str, bool]],
+    expected_fingerprint: tuple[SessionId, tuple[bool, str, int, int, bool, str, str, bool, str]],
     cancel_event: threading.Event,
     stop_event: threading.Event,
     reader: IracingSdkReader | None = None,
@@ -20642,6 +25555,30 @@ def _read_ok_to_reload_textures(reader: IracingSdkReader) -> bool | None:
     if value is None:
         return None
     return bool(value)
+
+
+def _read_session_flags(reader: IracingSdkReader) -> int | None:
+    sdk = reader.sdk
+    try:
+        if not sdk.is_initialized:
+            if not sdk.startup():
+                return None
+    except Exception as exc:  # noqa: BLE001
+        logging.debug("SDK startup() failed while reading SessionFlags: %s", exc)
+        return None
+    if not sdk.is_connected:
+        return None
+    try:
+        sdk.freeze_var_buffer_latest()
+    except Exception:
+        pass
+    try:
+        value = sdk["SessionFlags"]
+    except Exception:
+        return None
+    return _to_int_or_none(value)
+
+
 def trigger_texture_reload(reader: IracingSdkReader, car_idx: int | None = None) -> bool:
     sdk = reader.sdk
     try:
@@ -20689,6 +25626,33 @@ def _read_sdk_int_var(sdk: object, key: str, default: int) -> int:
         return int(value)
     except (TypeError, ValueError):
         return int(default)
+
+def read_on_track_car_idxs(reader: IracingSdkReader | None) -> set[int]:
+    """Car indices iRacing reports in the world (CarIdxTrackSurface >= 0)."""
+    if reader is None:
+        return set()
+    try:
+        sdk = reader.sdk
+    except Exception:
+        return set()
+    try:
+        sdk.freeze_var_buffer_latest()
+    except Exception:
+        pass
+    try:
+        surfaces = sdk["CarIdxTrackSurface"]
+    except Exception:
+        return set()
+    if not isinstance(surfaces, (list, tuple)):
+        return set()
+    on_track: set[int] = set()
+    for car_idx, value in enumerate(surfaces):
+        try:
+            if int(value) >= 0:
+                on_track.add(car_idx)
+        except (TypeError, ValueError):
+            continue
+    return on_track
 
 def _sdk_camera_group_number_by_name(sdk: object, wanted_name: str) -> int | None:
     wanted = str(wanted_name or "").strip().lower()
@@ -20798,7 +25762,7 @@ def switch_camera_to_car_number(reader: IracingSdkReader, car_number: str, drive
 def maybe_trigger_pending_texture_reload(
     reader: IracingSdkReader,
     pending_reload: PendingTextureReload | None,
-    active_fingerprint: tuple[SessionId, tuple[tuple[str, int, str, int], ...], tuple[bool, str, int, int, bool, str, str, bool]] | None,
+    active_fingerprint: tuple[SessionId, tuple[tuple[str, int, str, int], ...], tuple[bool, str, int, int, bool, str, str, bool, str]] | None,
     force_after_seconds: float = 15.0,
 ) -> bool:
     if pending_reload is None:
@@ -20821,12 +25785,138 @@ def maybe_trigger_pending_texture_reload(
         logging.debug("OkToReloadTextures unavailable; trying texture reload anyway")
         pending_reload.wait_log_emitted = True
     return trigger_texture_reload(reader)
+class CloudSyncController:
+    """Pause OneDrive and Dropbox while the app runs, then restore them.
+
+    Only clients that were already running are stopped, and only clients that
+    this controller stopped are restarted, so the user's own choices are kept.
+    """
+
+    ONEDRIVE = "OneDrive.exe"
+    DROPBOX = "Dropbox.exe"
+    CLIENTS = (ONEDRIVE, DROPBOX)
+
+    def __init__(
+        self,
+        find_client: Callable[[str], Path | None] | None = None,
+        run_process: Callable[..., object] | None = None,
+        start_process: Callable[..., object] | None = None,
+    ) -> None:
+        self._find_client = find_client or self._find_client_with_powershell
+        self._run_process = run_process or subprocess.run
+        self._start_process = start_process or subprocess.Popen
+        self._paused: list[tuple[str, Path]] = []
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _client_label(image_name: str) -> str:
+        return Path(image_name).stem
+
+    @staticmethod
+    def _run_options() -> dict[str, object]:
+        return {
+            "capture_output": True,
+            "text": True,
+            "timeout": 5,
+            "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        }
+
+    @staticmethod
+    def _detached_options() -> dict[str, object]:
+        return {
+            "close_fds": True,
+            "creationflags": (
+                getattr(subprocess, "DETACHED_PROCESS", 0)
+                | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            ),
+        }
+
+    @staticmethod
+    def _command_succeeded(result: object) -> bool:
+        return getattr(result, "returncode", 0) in (None, 0)
+
+    def _find_client_with_powershell(self, image_name: str) -> Path | None:
+        base_name = Path(image_name).stem
+        try:
+            result = subprocess.run(
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    f"Get-Process -Name {base_name} | Select-Object -First 1 -ExpandProperty Path",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except Exception:
+            logging.exception("Cloud sync action failed")
+            return None
+        if getattr(result, "returncode", 0) != 0:
+            return None
+        output = str(getattr(result, "stdout", "") or "").strip()
+        if not output:
+            return None
+        return Path(output.splitlines()[0].strip())
+
+    def pause(self) -> None:
+        try:
+            for image_name in self.CLIENTS:
+                try:
+                    with self._lock:
+                        already_paused = any(name == image_name for name, _path in self._paused)
+                    if already_paused:
+                        continue
+                    path = self._find_client(image_name)
+                    if path is None:
+                        continue
+                    path = Path(path)
+                    if image_name == self.ONEDRIVE:
+                        command = [str(path), "/shutdown"]
+                    else:
+                        command = ["taskkill", "/IM", self.DROPBOX]
+                    result = self._run_process(command, **self._run_options())
+                    if not self._command_succeeded(result):
+                        logging.warning("Cloud sync action failed: %s did not stop", self._client_label(image_name))
+                        continue
+                    with self._lock:
+                        if not any(name == image_name for name, _path in self._paused):
+                            self._paused.append((image_name, path))
+                    logging.info("%s paused", self._client_label(image_name))
+                except Exception:
+                    logging.exception("Cloud sync action failed")
+        except Exception:
+            logging.exception("Cloud sync action failed")
+
+    def resume(self) -> None:
+        try:
+            with self._lock:
+                paused = list(self._paused)
+                self._paused.clear()
+            for image_name, path in paused:
+                try:
+                    if image_name == self.ONEDRIVE:
+                        command = [str(path), "/background"]
+                    else:
+                        command = [str(path)]
+                    self._start_process(command, **self._detached_options())
+                    logging.info("%s resumed", self._client_label(image_name))
+                except Exception:
+                    logging.exception("Cloud sync action failed")
+        except Exception:
+            logging.exception("Cloud sync action failed")
+
+
 @dataclass
 class AppConfig:
     ui_mode: str = "advanced"
     auto_start: bool = True
     start_minimized: bool = True
     minimize_to_tray_on_close: bool = True
+    trading_paints_warning_dont_ask: bool = False
+    manage_cloud_sync: bool = False
     auto_refresh_paints: bool = True
     cleanup_before_fetch: bool = True
     delete_downloaded_livery: bool = True
@@ -20894,6 +25984,14 @@ class AppConfig:
     retry_backoff_seconds: float = 1.0
     iracing_documents_dir: str = ""
     launch_mode_preference: str = "ask"
+    replay_name_template: str = DEFAULT_REPLAY_NAME_TEMPLATE
+    copy_replay_name_on_finish: bool = False
+    warning_decal_mode: str = "off"
+    warning_decal_irating: int = 1500
+    warning_decal_safety: float = 2.0
+    use_default_spec_maps: bool = True
+    create_own_car_thumbnails: bool = True
+    create_session_car_thumbnails: bool = False
 
 
 def team_driver_personal_fallback_slots_from_config(config: AppConfig) -> set[str]:
@@ -21104,6 +26202,8 @@ class ConfigStore:
         if config.iracing_documents_dir == default_docs_dir:
             config.iracing_documents_dir = ""
         config.verbose = bool(config.verbose)
+        config.trading_paints_warning_dont_ask = bool(getattr(config, "trading_paints_warning_dont_ask", False))
+        config.manage_cloud_sync = bool(getattr(config, "manage_cloud_sync", False))
         config.auto_refresh_paints = bool(config.auto_refresh_paints)
         config.cleanup_before_fetch = bool(config.cleanup_before_fetch)
         config.delete_downloaded_livery = bool(config.delete_downloaded_livery)
@@ -21190,6 +26290,14 @@ class ConfigStore:
         config.check_updates_automatically = bool(getattr(config, "check_updates_automatically", True))
         config.auto_install_updates = bool(getattr(config, "auto_install_updates", False))
         config.launch_mode_preference = normalize_launch_mode_preference(getattr(config, "launch_mode_preference", "ask"))
+        config.replay_name_template = str(getattr(config, "replay_name_template", DEFAULT_REPLAY_NAME_TEMPLATE))
+        config.copy_replay_name_on_finish = bool(getattr(config, "copy_replay_name_on_finish", False))
+        config.warning_decal_mode = normalize_warning_decal_mode(getattr(config, "warning_decal_mode", "off"))
+        config.warning_decal_irating = clamp_warning_decal_irating(getattr(config, "warning_decal_irating", 1500))
+        config.warning_decal_safety = clamp_warning_decal_safety(getattr(config, "warning_decal_safety", 2.0))
+        config.use_default_spec_maps = bool(getattr(config, "use_default_spec_maps", True))
+        config.create_own_car_thumbnails = bool(getattr(config, "create_own_car_thumbnails", True))
+        config.create_session_car_thumbnails = bool(getattr(config, "create_session_car_thumbnails", False))
         return config
     def save(self, config: AppConfig) -> None:
         safe = replace(config)
@@ -21201,6 +26309,7 @@ class ConfigStore:
         safe.manual_manifest_workers = max(1, min(100, int(safe.manual_manifest_workers)))
         safe.manual_save_workers = max(1, min(100, int(safe.manual_save_workers)))
         safe.max_concurrent_downloads = 8
+        safe.manage_cloud_sync = bool(getattr(safe, "manage_cloud_sync", False))
         safe.tp_fallback_mode = str(getattr(safe, "tp_fallback_mode", "online") or "online").strip().lower()
         if safe.tp_fallback_mode not in {"local", "online"}:
             safe.tp_fallback_mode = "online"
@@ -21260,6 +26369,14 @@ class ConfigStore:
         safe.iracing_documents_dir = normalize_optional_path(getattr(safe, "iracing_documents_dir", ""))
         if safe.iracing_documents_dir == str(default_iracing_documents_dir()):
             safe.iracing_documents_dir = ""
+        safe.replay_name_template = str(getattr(safe, "replay_name_template", DEFAULT_REPLAY_NAME_TEMPLATE))
+        safe.copy_replay_name_on_finish = bool(getattr(safe, "copy_replay_name_on_finish", False))
+        safe.warning_decal_mode = normalize_warning_decal_mode(getattr(safe, "warning_decal_mode", "off"))
+        safe.warning_decal_irating = clamp_warning_decal_irating(getattr(safe, "warning_decal_irating", 1500))
+        safe.warning_decal_safety = clamp_warning_decal_safety(getattr(safe, "warning_decal_safety", 2.0))
+        safe.use_default_spec_maps = bool(getattr(safe, "use_default_spec_maps", True))
+        safe.create_own_car_thumbnails = bool(getattr(safe, "create_own_car_thumbnails", True))
+        safe.create_session_car_thumbnails = bool(getattr(safe, "create_session_car_thumbnails", False))
         self._write_raw(asdict(safe))
 class BoundedLogQueue:
     def __init__(self, maxlen: int = LOG_QUEUE_LIMIT) -> None:
@@ -21319,7 +26436,7 @@ def build_tp_ceiling_hint(download_stats: StageTransferStats) -> str:
 # The iRacing UI renders a car in its 3D viewer (My Content -> Cars -> vehicle)
 # by reading the very same custom paint files the sim uses, taken from
 # ``Documents\iRacing\paint\<car directory>\car_<customer id>.tga`` (plus the
-# matching ``car_num_``, ``car_spec_`` and ``decal_`` files, and the root-level
+# matching ``car_num_``, ``car_spec_`` and ``car_decal_`` files, and the root-level
 # ``helmet_<customer id>.tga`` / ``suit_<customer id>.tga``). The UI reloads the
 # preview whenever those files change on disk.
 #
@@ -21511,6 +26628,118 @@ def normalize_iracing_ui_preview_refresh_minutes(value: object) -> int:
     return max(IRACING_UI_PREVIEW_MIN_REFRESH_MINUTES, min(IRACING_UI_PREVIEW_MAX_REFRESH_MINUTES, minutes))
 
 
+def read_iracing_ini_value(
+    documents_dir: Path | str | None,
+    section_name: str,
+    key_name: str,
+) -> str | None:
+    """Read one value from the iRacing ``app.ini`` without writing to it."""
+    try:
+        root = resolve_iracing_documents_dir(documents_dir)
+        ini_path = Path(root) / IRACING_APP_INI_FILENAME
+        if not ini_path.is_file():
+            return None
+        text = ini_path.read_text(encoding="utf-8", errors="surrogateescape")
+    except Exception:
+        return None
+    section = ""
+    target_section = str(section_name or "").strip().lower()
+    target_key = str(key_name or "").strip().lower()
+    for raw_line in text.splitlines():
+        line = raw_line.split(";", 1)[0].strip()
+        if not line:
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1].strip().lower()
+            continue
+        if section != target_section or "=" not in line:
+            continue
+        key, _sep, value = line.partition("=")
+        if key.strip().lower() == target_key:
+            return value.strip()
+    return None
+
+
+def read_iracing_sdk_memory_enabled(documents_dir: Path | str | None = None) -> bool | None:
+    value = read_iracing_ini_value(documents_dir, "Misc", "irsdkEnableMem")
+    if value is None:
+        return None
+    try:
+        return bool(int(float(value)))
+    except (TypeError, ValueError):
+        return value.strip().lower() in {"true", "yes", "on"}
+
+
+def _set_ini_value_in_text(text: str, section_name: str, key_name: str, value: str) -> str | None:
+    """Replace ``key`` inside ``section`` and keep the rest of the file untouched."""
+    lines = text.splitlines(keepends=True)
+    section = ""
+    target_section = str(section_name or "").strip().lower()
+    target_key = str(key_name or "").strip().lower()
+    for index, line in enumerate(lines):
+        newline = ""
+        body = line
+        if body.endswith("\r\n"):
+            body, newline = body[:-2], "\r\n"
+        elif body.endswith("\n"):
+            body, newline = body[:-1], "\n"
+        stripped = body.split(";", 1)[0].strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            section = stripped[1:-1].strip().lower()
+            continue
+        if section != target_section or "=" not in body:
+            continue
+        match = re.match(r"^(\s*" + re.escape(target_key) + r"\s*=\s*)([^;]*)(.*)$", body, re.IGNORECASE)
+        if not match:
+            continue
+        lines[index] = match.group(1) + str(value) + match.group(3) + newline
+        return "".join(lines)
+    return None
+
+
+def fix_iracing_sdk_memory_setting(
+    documents_dir: Path | str | None = None,
+    iracing_running: bool | None = None,
+) -> tuple[bool, str]:
+    """Set ``[Misc] irsdkEnableMem=1`` after backing up ``app.ini``.
+
+    iRacing rewrites its settings on exit, so the file is only changed while the
+    sim is closed. Returns ``(changed, message)``.
+    """
+    if iracing_running is None:
+        iracing_running = iracing_is_running(list_running_process_names())
+    if iracing_running:
+        return False, "Close iRacing before changing its SDK memory setting, then try again."
+    try:
+        root = resolve_iracing_documents_dir(documents_dir)
+        ini_path = Path(root) / IRACING_APP_INI_FILENAME
+    except Exception as exc:
+        return False, f"Could not find the iRacing app.ini: {exc}"
+    if not ini_path.is_file():
+        return False, f"iRacing app.ini was not found at {ini_path}."
+    try:
+        text = ini_path.read_text(encoding="utf-8", errors="surrogateescape")
+    except OSError as exc:
+        return False, f"Could not read {ini_path}: {exc}"
+    if read_iracing_ini_value(documents_dir, "Misc", "irsdkEnableMem") == "1":
+        return True, "iRacing SDK memory sharing is already enabled."
+    updated = _set_ini_value_in_text(text, "Misc", "irsdkEnableMem", "1")
+    if updated is None:
+        return False, f"irsdkEnableMem was not found in the [Misc] section of {ini_path}."
+    backup_path = ini_path.with_name(f"{ini_path.name}.bak")
+    try:
+        shutil.copy2(ini_path, backup_path)
+        temp_path = ini_path.with_name(f"{ini_path.name}.{os.getpid()}.tmp")
+        try:
+            temp_path.write_text(updated, encoding="utf-8", errors="surrogateescape")
+            os.replace(temp_path, ini_path)
+        finally:
+            temp_path.unlink(missing_ok=True)
+    except OSError as exc:
+        return False, f"Could not update {ini_path}: {exc}"
+    return True, f"Enabled iRacing SDK memory sharing and backed up the old app.ini to {backup_path.name}."
+
+
 def read_iracing_hide_car_numbers(documents_dir: Path | str | None = None) -> bool | None:
     """Read ``[Graphics] hideCarNum`` from the iRacing ``app.ini``.
 
@@ -21566,7 +26795,29 @@ def iracing_ui_preview_manifest_items(items: Iterable[DownloadFile], member_id: 
         and int(item.download_id.user_id) == target_id
         and not bool(item.download_id.is_superspeedway_variant)
     ]
-    return _select_manifest_variants_for_track(False, candidates)
+    selected = _select_manifest_variants_for_track(False, candidates)
+    # iRacing's UI renders car_<id>.tga, not car_num_<id>.tga. If Trading Paints
+    # only supplies a custom-number paint, mirror it as the sim-stamped car paint so
+    # the UI still has a thumbnail. A real car_<id>.tga always wins.
+    car_directories = {
+        str(item.download_id.directory or "").strip().lower()
+        for item in selected
+        if item.download_id.paint_type is PaintType.CAR
+    }
+    synthetic: list[DownloadFile] = []
+    for item in selected:
+        if item.download_id.paint_type is not PaintType.CAR_NUMBER:
+            continue
+        directory = str(item.download_id.directory or "").strip().lower()
+        if not directory or directory in car_directories:
+            continue
+        synthetic.append(
+            replace(
+                item,
+                download_id=replace(item.download_id, paint_type=PaintType.CAR),
+            )
+        )
+    return selected + synthetic
 
 
 def _iracing_ui_preview_member_cache_root(cache_dir: Path, member_id: int) -> Path:
@@ -21603,6 +26854,11 @@ def _iracing_ui_preview_store_download(downloaded: DownloadedFile, cache_root: P
                 _copy_bz2_capped(source, out)
         else:
             shutil.copy2(source, temp_path)
+        payload_path = source if source.suffix.lower() == ".bz2" else temp_path
+        if not _paint_payload_looks_valid(payload_path, downloaded.download_id.paint_type) or _looks_like_html_payload(temp_path):
+            logging.warning("Refusing to cache an invalid paint payload as UI preview paint %s", destination.name)
+            temp_path.unlink(missing_ok=True)
+            return None
         os.replace(temp_path, destination)
     except Exception as exc:  # noqa: BLE001
         logging.debug("Could not cache iRacing UI preview asset %s: %s", source, exc)
@@ -22077,6 +27333,8 @@ class DownloaderService:
         self._thread: threading.Thread | None = None
         self._status = "Stopped"
         self._status_callback: Callable[[str], None] | None = None
+        self._replay_name_clipboard_callback: Callable[[str], None] | None = None
+        self._replay_name_latch = ReplayNameLatch()
         self._log_queue = log_queue
         self._force_refresh_event = threading.Event()
         self._force_target_refresh_key: tuple[str, int, str] | None = None
@@ -22097,8 +27355,13 @@ class DownloaderService:
         self._session_refresh_by_key: dict[tuple[str, int, str], float] = {}
         self._team_driver_swap_candidates: dict[tuple[str, int, str], TeamDriverSwapCandidate] = {}
         self._team_driver_swap_retry_by_key: dict[tuple[str, int, str], TeamDriverSwapRetry] = {}
+        self._exit_cleanup: Callable[[], None] | None = None
+        self._exit_cleanup_lock = threading.Lock()
+        self._exit_cleanup_done = False
     def set_status_callback(self, callback: Callable[[str], None]) -> None:
         self._status_callback = callback
+    def set_replay_name_clipboard_callback(self, callback: Callable[[str], None] | None) -> None:
+        self._replay_name_clipboard_callback = callback
     def _set_status(self, value: str) -> None:
         if self._status == value:
             return
@@ -22346,6 +27609,36 @@ class DownloaderService:
     def get_config(self) -> AppConfig:
         with self._lock:
             return replace(self._config)
+    def _copy_replay_name_on_finish(
+        self,
+        config: AppConfig,
+        reader: IracingSdkReader | None,
+        session: Session | None,
+    ) -> None:
+        if not bool(getattr(config, "copy_replay_name_on_finish", False)) or session is None or reader is None:
+            self._replay_name_latch.update(None, 0)
+            return
+        flags = _read_session_flags(reader)
+        if flags is None:
+            return
+        session_key = f"{session.session_id.folder_name()}:{str(session.session_type or '').strip().lower()}"
+        if not self._replay_name_latch.update(session_key, flags):
+            return
+        if not session_is_race_for_replay(session):
+            return
+        text = render_replay_name(
+            str(getattr(config, "replay_name_template", DEFAULT_REPLAY_NAME_TEMPLATE)),
+            replay_name_values(session),
+        )
+        if not text:
+            return
+        callback = self._replay_name_clipboard_callback
+        if callback is None:
+            return
+        try:
+            callback(text)
+        except Exception:
+            logging.warning("Could not hand the replay name to the window", exc_info=True)
     def register_manual_saved_paints(
         self,
         session: Session,
@@ -22867,14 +28160,46 @@ class DownloaderService:
             if thread.is_alive():
                 logging.warning("The service is still stopping; it starts again once the current step ends.")
                 return
+        with self._exit_cleanup_lock:
+            self._exit_cleanup = None
+            self._exit_cleanup_done = False
         self._stop_event.clear()
         self._thread = threading.Thread(target=self._run_forever, name="NishizumiPaintsService", daemon=True)
         self._thread.start()
-    def stop(self, join_timeout: float = 5.0) -> None:
+    def _register_exit_cleanup(self, cleanup: Callable[[], None]) -> None:
+        with self._exit_cleanup_lock:
+            self._exit_cleanup = cleanup
+            self._exit_cleanup_done = False
+    def _run_exit_cleanup_once(self, *, from_stop: bool = False) -> bool:
+        with self._exit_cleanup_lock:
+            if self._exit_cleanup_done:
+                return False
+            cleanup = self._exit_cleanup
+            if cleanup is None:
+                return False
+            self._exit_cleanup_done = True
+        if from_stop:
+            logging.warning(
+                "The paint service did not finish stopping; running its exit cleanup from stop() so session paints are removed."
+            )
+        try:
+            cleanup()
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("Paint service exit cleanup failed: %s", exc)
+            logging.debug("Paint service exit cleanup traceback\n%s", traceback.format_exc())
+        return True
+    def stop(self, join_timeout: float = SERVICE_STOP_JOIN_TIMEOUT_SECONDS) -> None:
         self._stop_event.set()
         thread = self._thread
         if thread is not None and thread.is_alive():
             thread.join(timeout=join_timeout)
+            if thread.is_alive():
+                logging.warning(
+                    "The paint service did not finish its cleanup within %.1fs; "
+                    "it will keep running until the process exits.",
+                    join_timeout,
+                )
+                self._run_exit_cleanup_once(from_stop=True)
         if thread is None or not thread.is_alive():
             self._thread = None
         self._set_status("Stopped")
@@ -22951,6 +28276,17 @@ class DownloaderService:
         temp_dir.mkdir(parents=True, exist_ok=True)
         replay_dir.mkdir(parents=True, exist_ok=True)
         replay_packs_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            renamed_decals, removed_decals = migrate_legacy_decal_filenames(paints_dir)
+            if renamed_decals or removed_decals:
+                logging.info(
+                    "Migrated old decal file names under %s: %s renamed, %s removed",
+                    paints_dir,
+                    renamed_decals,
+                    removed_decals,
+                )
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("Could not migrate old decal file names under %s: %s", paints_dir, exc)
         logging.info("Using iRacing documents folder: %s", resolve_iracing_documents_dir(startup_config))
         cleanup_stale_temp_dirs(temp_dir)
         sdk_reader: IracingSdkReader | None = None
@@ -22958,7 +28294,7 @@ class DownloaderService:
         last_session: SessionId | None = None
         current_session: Session | None = None
         last_processed_session: Session | None = None
-        last_session_fingerprint: tuple[SessionId, tuple[tuple[str, int, str, int], ...], tuple[bool, str, int, int, bool, str, str, bool]] | None = None
+        last_session_fingerprint: tuple[SessionId, tuple[tuple[str, int, str, int], ...], tuple[bool, str, int, int, bool, str, str, bool, str]] | None = None
         last_session_preserve_targets: set[tuple[bool, int]] = set()
         last_saved: list[SavedFile] = []
         session_rows: list[SessionDriverSnapshot] = []
@@ -23040,6 +28376,27 @@ class DownloaderService:
             last_replay_dir_token = _replay_dir_change_token(replay_dir)
             next_replay_pack_full_scan_at = now + REPLAY_PACK_FULL_SCAN_SECONDS
         self._update_runtime_snapshot(current_session, last_saved, last_known_member_id, session_rows=session_rows, replay_mode_active=replay_mode_active)
+
+        def _exit_cleanup() -> None:
+            nonlocal last_saved
+            final_config = self.get_config()
+            if last_saved and final_config.delete_downloaded_livery:
+                # After leaving a session the preserve targets are already reset, so the
+                # remembered member/team id is what keeps the user's own livery here.
+                last_saved = self._cleanup_saved(
+                    saved=last_saved,
+                    keep_my_livery_locally=final_config.keep_my_livery_locally,
+                    preserve_targets=last_session_preserve_targets,
+                    reason="Cleaning up session paints before exit",
+                    paints_root=paints_dir,
+                    fallback_member_id=last_known_member_id,
+                    fallback_team_id=last_known_team_id,
+                )
+            self._update_runtime_snapshot(None, last_saved, last_known_member_id, session_rows=[])
+            close_sdk_reader(sdk_reader)
+            self._set_status("Stopped")
+
+        self._register_exit_cleanup(_exit_cleanup)
         try:
             while not self._stop_event.is_set():
                 config = self.get_config()
@@ -23126,6 +28483,13 @@ class DownloaderService:
                         self._stop_event.wait(max(config.poll_seconds, 0.5))
                         continue
                 poll_state, session = read_session_from_sdk(sdk_reader)
+                if poll_state is SdkPollState.SESSION:
+                    replay_name_session = session
+                elif poll_state is SdkPollState.UNCHANGED:
+                    replay_name_session = current_session
+                else:
+                    replay_name_session = None
+                self._copy_replay_name_on_finish(config, sdk_reader, replay_name_session)
                 if poll_state != last_poll_state:
                     logging.debug("Poll state changed: %s -> %s", last_poll_state, poll_state)
                     last_poll_state = poll_state
@@ -23188,9 +28552,18 @@ class DownloaderService:
                     last_saved = list(runtime_snapshot.last_saved)
                     session_rows = list(runtime_snapshot.session_rows)
                 base_session_rows = build_session_driver_rows(session)
-                if session.local_user_id is not None and session.local_user_id > 0:
+                replay_playback_active = False
+                if sdk_reader is not None:
+                    try:
+                        replay_playback_active = _read_replay_mode_active(sdk_reader)
+                    except Exception:  # noqa: BLE001
+                        logging.debug("Could not determine whether a replay is playing", exc_info=True)
+                # A saved replay can belong to somebody else. Its DriverUserID is not
+                # proof of who is running the app, so it must not replace the member ID
+                # used for keep-my-livery, AI roster sync or UI previews.
+                if not replay_playback_active and session.local_user_id is not None and session.local_user_id > 0:
                     last_known_member_id = session.local_user_id
-                if session.local_team_id is not None and session.local_team_id > 0:
+                if not replay_playback_active and session.local_team_id is not None and session.local_team_id > 0:
                     last_known_team_id = session.local_team_id
                 if session.ai_driver_count > 0:
                     logging.info(
@@ -23215,8 +28588,7 @@ class DownloaderService:
                 current_user_map = _session_user_map(session)
                 replay_mode_active = bool(
                     getattr(config, "auto_manage_replay_packs", True)
-                    and sdk_reader is not None
-                    and _read_replay_mode_active(sdk_reader)
+                    and replay_playback_active
                     and has_replay_pack_for_session(session, replay_packs_dir, replay_pack_index)
                 )
                 forced_refresh = self._force_refresh_event.is_set()
@@ -23599,6 +28971,9 @@ class DownloaderService:
                             auto_refresh_paints=bool(config.auto_refresh_paints),
                             cancel_event=session_cancel_event,
                             prior_saved=last_saved,
+                            use_default_spec_maps=bool(getattr(config, "use_default_spec_maps", True)),
+                            create_own_car_thumbnails=bool(getattr(config, "create_own_car_thumbnails", True)),
+                            create_session_car_thumbnails=bool(getattr(config, "create_session_car_thumbnails", False)),
                         )
                         processing_cancelled = session_cancel_event.is_set()
                     finally:
@@ -23661,22 +29036,7 @@ class DownloaderService:
                 self._set_status(f"Watching • {session.session_id.folder_name()}")
                 self._stop_event.wait(max(config.poll_seconds, 0.2))
         finally:
-            final_config = self.get_config()
-            if last_saved and final_config.delete_downloaded_livery:
-                # After leaving a session the preserve targets are already reset, so the
-                # remembered member/team id is what keeps the user's own livery here.
-                last_saved = self._cleanup_saved(
-                    saved=last_saved,
-                    keep_my_livery_locally=final_config.keep_my_livery_locally,
-                    preserve_targets=last_session_preserve_targets,
-                    reason="Cleaning up session paints before exit",
-                    paints_root=paints_dir,
-                    fallback_member_id=last_known_member_id,
-                    fallback_team_id=last_known_team_id,
-                )
-            self._update_runtime_snapshot(None, last_saved if "last_saved" in locals() else [], last_known_member_id if "last_known_member_id" in locals() else None, session_rows=[])
-            close_sdk_reader(sdk_reader)
-            self._set_status("Stopped")
+            self._run_exit_cleanup_once()
 class WindowsTrayIcon:
     def __init__(
         self,
@@ -23989,13 +29349,19 @@ class DownloaderUI:
         self.simpledialog = simpledialog
         self.config_store = ConfigStore()
         self.config = self.config_store.load()
+        setup_logging(bool(self.config.verbose))
         self.log_queue = BoundedLogQueue()
         self._log_history: deque[str] = deque(maxlen=LOG_HISTORY_LIMIT)
         self.service = DownloaderService(self.config, self.log_queue)
         self.service.set_status_callback(self._on_service_status)
+        self.service.set_replay_name_clipboard_callback(self._on_replay_name_copy_requested)
+        self.cloud_sync = CloudSyncController()
         self._exiting = False
         self._launched_from_autostart = launched_from_autostart
         self._session_row_lookup: dict[str, SessionDriverSnapshot] = {}
+        self._people_cache: dict[str, object] | None = None
+        self._people_cache_signature: tuple[int, int] | None = None
+        self._people_cache_checked_at = 0.0
         self._session_tree_row_states: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {}
         self._last_session_snapshot_signature: tuple | None = None
         self._last_runtime_snapshot_version = -1
@@ -24028,6 +29394,7 @@ class DownloaderUI:
         self.root.geometry(f"{window_width}x{window_height}")
         self.root.minsize(min(WINDOW_MIN_SIZE[0], window_width), min(WINDOW_MIN_SIZE[1], window_height))
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.root.report_callback_exception = self._report_callback_exception
         self._apply_window_icon()
         self.tray_icon = WindowsTrayIcon(
             lambda: self.root.after(0, self.restore_from_background),
@@ -24036,10 +29403,41 @@ class DownloaderUI:
         self.tray_icon.start()
         self.instance_signal_server = SingleInstanceSignalServer(lambda: self.root.after(0, self.bring_to_front))
         self.status_var = tk.StringVar(value="Starting")
+        self.iracing_sdk_memory_var = tk.StringVar(value="iRacing SDK memory sharing: checking...")
+        self.iracing_sdk_memory_label = None
+        self._iracing_sdk_memory_warned = False
+        self._trading_paints_dialog = None
         self.ui_mode_var = tk.StringVar(value=normalize_ui_mode_preference(getattr(self.config, "ui_mode", "advanced")))
         self.auto_start_var = tk.BooleanVar(value=self.config.auto_start)
         self.start_minimized_var = tk.BooleanVar(value=self.config.start_minimized)
         self.minimize_to_tray_var = tk.BooleanVar(value=self.config.minimize_to_tray_on_close)
+        self.replay_name_template_var = tk.StringVar(
+            value=str(getattr(self.config, "replay_name_template", DEFAULT_REPLAY_NAME_TEMPLATE))
+        )
+        self.copy_replay_name_on_finish_var = tk.BooleanVar(
+            value=bool(getattr(self.config, "copy_replay_name_on_finish", False))
+        )
+        self.warning_decal_mode_var = tk.StringVar(
+            value=warning_decal_mode_label(getattr(self.config, "warning_decal_mode", "off"))
+        )
+        self.warning_decal_irating_var = tk.IntVar(
+            value=clamp_warning_decal_irating(getattr(self.config, "warning_decal_irating", 1500))
+        )
+        self.warning_decal_safety_var = tk.DoubleVar(
+            value=clamp_warning_decal_safety(getattr(self.config, "warning_decal_safety", 2.0))
+        )
+        self.use_default_spec_maps_var = tk.BooleanVar(
+            value=bool(getattr(self.config, "use_default_spec_maps", True))
+        )
+        self.create_own_car_thumbnails_var = tk.BooleanVar(
+            value=bool(getattr(self.config, "create_own_car_thumbnails", True))
+        )
+        self.create_session_car_thumbnails_var = tk.BooleanVar(
+            value=bool(getattr(self.config, "create_session_car_thumbnails", False))
+        )
+        self.replay_name_preview_var = tk.StringVar(value="")
+        self.replay_name_template_var.trace_add("write", lambda *_args: self.update_replay_name_preview())
+        self.manage_cloud_sync_var = tk.BooleanVar(value=bool(getattr(self.config, "manage_cloud_sync", False)))
         self.auto_refresh_var = tk.BooleanVar(value=self.config.auto_refresh_paints)
         self.cleanup_on_exit_var = tk.BooleanVar(value=self.config.delete_downloaded_livery)
         self.cleanup_before_fetch_var = tk.BooleanVar(value=self.config.cleanup_before_fetch)
@@ -24136,10 +29534,59 @@ class DownloaderUI:
         self.showroom_team_car_suggestions_var = tk.StringVar(value="")
         self.showroom_team_status_var = tk.StringVar(value="Enter a Team ID and car to download team paints into the iRacing paint folder.")
         self._showroom_download_custom_folder_path = ""
+        self.league_library_status_var = tk.StringVar(value="League decals and paints apply automatically in sessions of the same league.")
+        self._league_library_entries: list[LeagueLibraryEntry] = []
         self._showroom_pool_download_in_progress = False
+        self.tp_download_member_id_var = tk.StringVar(value="")
+        self.tp_download_team_id_var = tk.StringVar(value="")
+        self.tp_download_use_context_var = tk.BooleanVar(value=False)
+        self.tp_download_night_var = tk.StringVar(value="10:00 am")
+        self.tp_download_series_var = tk.StringVar(value="0")
+        self.tp_download_league_var = tk.StringVar(value="0")
+        self.tp_download_custom_numbers_var = tk.BooleanVar(value=False)
+        self.tp_download_folder_var = tk.StringVar(value=str(default_paints_dir(self.config)))
+        self.tp_download_status_var = tk.StringVar(value="Enter a Member ID and refresh to browse that member's car paints.")
+        self.tp_download_tab = None
+        self.tp_download_preview_panel = None
+        self.tp_download_tree = None
+        self.tp_download_friends_tree = None
+        self._tp_download_groups: dict[str, list[DownloadFile]] = {}
+        self._tp_download_tree_directories: dict[str, str] = {}
+        self._tp_download_buttons: list[object] = []
+        self._tp_download_busy = False
+        self._tp_download_auto_refresh_done = False
+        self._tp_download_own_member_id = 0
+        self._tp_download_preview_dir = default_temp_dir() / _TP_DOWNLOAD_TEMP_DIRNAME
+        self._tp_download_preview_temp = TpPreviewTempFiles()
         self.session_summary_var = tk.StringVar(value="No active iRacing session detected yet.")
         self.session_status_summary_var = tk.StringVar(value="Join a session and the driver list will appear here.")
         self.session_driver_action_summary_var = tk.StringVar(value="Select a driver to manage fixed paints.")
+        self.session_preview_panel = None
+        self._session_preview_after_id = None
+        self._session_preview_key_value = None
+        self.session_condition_vars = {
+            key: tk.StringVar(value=SESSION_CONDITION_UNKNOWN) for key, _label in SESSION_CONDITION_FIELDS
+        }
+        self._session_conditions_expanded = True
+        self.field_sof_var = tk.StringVar(value=f"SOF {SESSION_CONDITION_UNKNOWN}")
+        self.field_drivers_var = tk.StringVar(value="Drivers 0")
+        self.field_livery_var = tk.StringVar(value="0 without livery")
+        self.field_files_var = tk.StringVar(value="Files 0/0")
+        self.field_links_var = tk.StringVar(value="TP ready • SDK waiting")
+        self.field_progress_var = tk.DoubleVar(value=0.0)
+        self._purge_in_progress = False
+        self._manager_window = None
+        self._manager_loading = False
+        self._manager_tag_rows: list[ManagerTagRow] = []
+        self._manager_theme_rows: list[ManagerThemeRow] = []
+        self._manager_forbidden_rows: list[ManagerForbiddenRow] = []
+        self.league_preview_league_var = tk.StringVar(value="")
+        self.league_preview_car_var = tk.StringVar(value="")
+        self.league_preview_class_var = tk.StringVar(value="")
+        self.league_preview_driver_var = tk.StringVar(value="")
+        self.league_preview_paint_var = tk.StringVar(value="Paint TGA: library paint")
+        self._league_preview_paint_path: Path | None = None
+        self.league_preview_panel = None
         self.show_activity_var = tk.BooleanVar(value=self.config.show_activity_log)
         self.show_tp_monitor_var = tk.BooleanVar(value=getattr(self.config, "show_tp_monitor", False))
         self.check_updates_var = tk.BooleanVar(value=getattr(self.config, "check_updates_automatically", True))
@@ -24181,7 +29628,16 @@ class DownloaderUI:
         self._tp_mapping_startup_scan_deferred = False
         self._driver_override_assignment_in_progress: set[tuple[object, int, str, str]] = set()
         self._driver_restore_in_progress: set[tuple[object, int, str, str]] = set()
+        self._folder_metrics_started = False
+        self._folder_metrics_running = False
+        self.folder_metrics_size_vars: dict[str, Any] = {}
+        self.folder_metrics_iracing_total_var = tk.StringVar(value="…")
+        self.folder_metrics_nishizumi_total_var = tk.StringVar(value="…")
+        self.folder_metrics_free_space_var = tk.StringVar(value="…")
+        self.folder_metrics_button = None
+        self.folder_metrics_free_space_label = None
         self._build_ui()
+        self._refresh_iracing_sdk_memory_status()
         try:
             pool_after_bytes, pool_freed_bytes = enforce_random_pool_limit(
                 default_random_pool_dir(),
@@ -24224,9 +29680,12 @@ class DownloaderUI:
         self.root.after(150, self._drain_logs)
         self.root.after(600, self._poll_service)
         self.root.after(850, self.show_quick_start_if_needed)
+        self.root.after(900, self._start_trading_paints_check)
         self.root.after(TP_SHOWROOM_STARTUP_SCAN_DELAY_MS, self._start_tp_showroom_mapping_startup_scan)
         if self.config.start_minimized and self._launched_from_autostart:
             self.root.after(500, self.start_minimized)
+        if bool(getattr(self.config, "manage_cloud_sync", False)):
+            self._run_cloud_sync_action(self.cloud_sync.pause)
     def _apply_window_icon(self) -> None:
         try:
             ico_path = resource_path(APP_ICON_ICO_RESOURCE)
@@ -24474,6 +29933,16 @@ class DownloaderUI:
         outer.columnconfigure(0, weight=1)
         outer.rowconfigure(1, weight=1, minsize=260)
 
+        field_status = ttk.Frame(outer, padding=(0, 6, 0, 0))
+        field_status.grid(row=2, column=0, sticky="ew")
+        field_status.columnconfigure(7, weight=1)
+        ttk.Label(field_status, textvariable=self.field_sof_var, font=("Segoe UI", 9, "bold")).grid(row=0, column=0, sticky="w")
+        ttk.Label(field_status, textvariable=self.field_drivers_var).grid(row=0, column=1, sticky="w", padx=(18, 0))
+        ttk.Label(field_status, textvariable=self.field_livery_var, foreground="#9a2020").grid(row=0, column=2, sticky="w", padx=(18, 0))
+        ttk.Label(field_status, textvariable=self.field_files_var).grid(row=0, column=3, sticky="w", padx=(18, 0))
+        ttk.Progressbar(field_status, orient="horizontal", mode="determinate", length=120, maximum=100, variable=self.field_progress_var).grid(row=0, column=4, sticky="w", padx=(8, 0))
+        ttk.Label(field_status, textvariable=self.field_links_var, foreground="#555555").grid(row=0, column=5, sticky="w", padx=(18, 0))
+
         header = ttk.Frame(outer)
         header.grid(row=0, column=0, sticky="ew")
         header.columnconfigure(1, weight=1)
@@ -24493,6 +29962,7 @@ class DownloaderUI:
         ai_tab, ai_page = self._add_scrollable_tab(notebook, "AI")
         random_tab, random_page = self._add_scrollable_tab(notebook, "Random")
         showroom_tab, showroom_page = self._add_scrollable_tab(notebook, "Showroom")
+        tp_download_tab, tp_download_page = self._add_scrollable_tab(notebook, "TP Download")
         # Experimental tab is intentionally kept in the codebase but hidden from the notebook for now.
         experimental_page = ttk.Frame(notebook, padding=10)
         logs_tab, logs_page = self._add_scrollable_tab(notebook, "Logs")
@@ -24503,20 +29973,50 @@ class DownloaderUI:
         self.ai_tab = ai_tab
         self.random_tab = random_tab
         self.showroom_tab = showroom_tab
+        self.tp_download_tab = tp_download_tab
         self.logs_tab = logs_tab
-        self._advanced_tabs = (session_tab, general_tab, ai_tab, random_tab, showroom_tab, logs_tab)
+        self._advanced_tabs = (session_tab, general_tab, ai_tab, random_tab, showroom_tab, tp_download_tab, logs_tab)
+        notebook.bind("<<NotebookTabChanged>>", self._on_main_tab_changed, add="+")
 
         session_page.columnconfigure(0, weight=1)
-        session_page.rowconfigure(1, weight=1)
+        session_page.rowconfigure(2, weight=1)
         session_info = ttk.LabelFrame(session_page, text="Current session", padding=10)
         session_info.grid(row=0, column=0, sticky="ew")
         session_info.columnconfigure(0, weight=1)
         ttk.Label(session_info, textvariable=self.session_summary_var, justify="left").grid(row=0, column=0, sticky="w")
         ttk.Label(session_info, textvariable=self.session_status_summary_var, justify="left", foreground="#555555").grid(row=1, column=0, sticky="w", pady=(4, 0))
         ttk.Button(session_info, text="Force refresh current car/team", command=self.force_refresh_current_car_team).grid(row=0, column=1, rowspan=2, sticky="e", padx=(12, 0))
+        ttk.Button(session_info, text="Tags & forbidden…", command=self.open_tags_forbidden_manager).grid(row=0, column=2, rowspan=2, sticky="e", padx=(12, 0))
+
+        conditions_frame = ttk.LabelFrame(session_page, text="Session conditions", padding=8)
+        conditions_frame.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        conditions_frame.columnconfigure(0, weight=1)
+        conditions_header = ttk.Frame(conditions_frame)
+        conditions_header.grid(row=0, column=0, sticky="ew")
+        conditions_header.columnconfigure(0, weight=1)
+        ttk.Label(
+            conditions_header,
+            text="WeekendInfo values as iRacing reports them; missing values show a dash.",
+            foreground="#555555",
+        ).grid(row=0, column=0, sticky="w")
+        self.session_conditions_toggle = ttk.Button(conditions_header, text="Hide", command=self._toggle_session_conditions)
+        self.session_conditions_toggle.grid(row=0, column=1, sticky="e")
+        self.session_conditions_body = ttk.Frame(conditions_frame)
+        self.session_conditions_body.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        for column_index in range(4):
+            self.session_conditions_body.columnconfigure(column_index, weight=1 if column_index % 2 else 0)
+        for index, (field_key, field_label) in enumerate(SESSION_CONDITION_FIELDS):
+            row_index = index // 2
+            column = (index % 2) * 2
+            ttk.Label(self.session_conditions_body, text=f"{field_label}:").grid(
+                row=row_index, column=column, sticky="w", padx=(0, 6), pady=1
+            )
+            ttk.Label(self.session_conditions_body, textvariable=self.session_condition_vars[field_key]).grid(
+                row=row_index, column=column + 1, sticky="w", padx=(0, 24), pady=1
+            )
 
         driver_list_frame = ttk.LabelFrame(session_page, text="Drivers in session", padding=8)
-        driver_list_frame.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
+        driver_list_frame.grid(row=2, column=0, sticky="nsew", pady=(10, 0))
         driver_list_frame.columnconfigure(0, weight=1)
         driver_list_frame.rowconfigure(0, weight=1)
         # The list still grows to fill the tab; the smaller request is how far it may
@@ -24550,6 +30050,19 @@ class DownloaderUI:
         self.session_tree.bind("<Double-1>", self.on_session_driver_double_clicked)
         self.session_tree.bind("<Motion>", self.on_session_tree_motion)
         self.session_tree.bind("<Leave>", self.on_session_tree_leave)
+        self.session_tree.bind("<Button-3>", self.on_session_tree_context_menu)
+        self._session_context_menu = self.tk.Menu(self.root, tearoff=0)
+        self._session_context_menu.add_command(label="Add to friends", command=self.add_selected_session_drivers_to_friends)
+        self._session_context_menu.add_command(label="Remove from friends", command=self.remove_selected_session_drivers_from_friends)
+        self._session_context_menu.add_command(label="Set driver alias…", command=self.set_selected_session_driver_alias)
+        self._session_context_menu.add_command(label="Set team alias…", command=self.set_selected_session_team_alias)
+        self._session_context_menu.add_separator()
+        self._session_tag_menu = self.tk.Menu(self._session_context_menu, tearoff=0)
+        self._session_context_menu.add_cascade(label="Tag as", menu=self._session_tag_menu)
+        self._session_context_menu.add_command(label="Open themes folder", command=self.open_tag_themes_folder)
+        self._session_context_menu.add_separator()
+        self._session_context_menu.add_command(label="Copy tags to clipboard", command=self.copy_tags_to_clipboard)
+        self._session_context_menu.add_command(label="Import tags from clipboard", command=self.import_tags_from_clipboard)
         self.session_tree.grid(row=0, column=0, sticky="nsew")
         session_tree_scroll.grid(row=0, column=1, sticky="ns")
         for tag_name, color in {
@@ -24570,7 +30083,7 @@ class DownloaderUI:
             self.session_tree.tag_configure(tag_name, foreground=color)
 
         driver_actions = ttk.LabelFrame(session_page, text="Driver fixed paints", padding=8)
-        driver_actions.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        driver_actions.grid(row=3, column=0, sticky="ew", pady=(10, 0))
         driver_actions.columnconfigure(0, weight=1)
         ttk.Label(driver_actions, textvariable=self.session_driver_action_summary_var, foreground="#555555").grid(row=0, column=0, sticky="w")
         action_rows = ttk.Frame(driver_actions)
@@ -24581,7 +30094,7 @@ class DownloaderUI:
             block = ttk.Frame(action_rows)
             block.grid(row=0, column=column_index, sticky="w", padx=(0 if column_index == 0 else 12, 0))
             ttk.Label(block, text=label, font=("Segoe UI", 9, "bold")).grid(row=0, column=0, columnspan=3, sticky="w")
-            actions = (
+            actions = [
                 ("open", "Open TP", 1, 0, lambda k=kind: self.open_selected_driver_tp_paint(k)),
                 ("assign", "Assign link...", 1, 1, lambda k=kind: self.assign_selected_driver_paint_from_link(k)),
                 ("current", "Assign current", 1, 2, lambda k=kind: self.assign_current_driver_paint(k)),
@@ -24590,17 +30103,28 @@ class DownloaderUI:
                 ("block", "Block", 2, 2, lambda k=kind: self.block_selected_random_paint(k)),
                 ("restore", "Restore previous", 3, 0, lambda k=kind: self.restore_previous_driver_paint(k)),
                 ("forget", "Forget", 3, 1, lambda k=kind: self.forget_selected_driver_paint(k)),
-            )
+                ("forbid", "Forbid TP", 3, 2, lambda k=kind: self.toggle_forbid_selected_driver_tp_paint(k)),
+            ]
+            if kind == "car":
+                actions.append(("copy_ai", "Copy to AI", 4, 0, self.copy_selected_drivers_to_ai))
             for action_key, button_text, row_index, button_column, command in actions:
                 button = ttk.Button(block, text=button_text, command=command)
                 button.grid(row=row_index, column=button_column, sticky="ew", padx=(0 if button_column == 0 else 6, 0), pady=(4, 0))
                 self.session_driver_action_buttons.append(button)
                 self.session_driver_action_buttons_by_kind[(kind, action_key)] = button
 
+        session_preview_frame = ttk.LabelFrame(session_page, text="Preview", padding=8)
+        session_preview_frame.grid(row=4, column=0, sticky="nsew", pady=(10, 0))
+        session_preview_frame.columnconfigure(0, weight=1)
+        session_preview_frame.rowconfigure(0, weight=1)
+        self.session_preview_panel = PaintPreviewPanel(session_preview_frame, app=self)
+        self.session_preview_panel.grid(row=0, column=0, sticky="nsew")
+
         general_page.columnconfigure(0, weight=1)
         general_actions = ttk.LabelFrame(general_page, text="Actions", padding=10)
         general_actions.grid(row=0, column=0, sticky="w")
         ttk.Button(general_actions, text="Clear downloaded", command=self.clear_downloaded_now).pack(side="left")
+        ttk.Button(general_actions, text="Delete all downloaded paints…", command=self.purge_all_downloaded_paints).pack(side="left", padx=(8, 0))
         ttk.Button(general_actions, text="Refresh paints", command=self.redownload_now).pack(side="left", padx=(8, 0))
         ttk.Button(general_actions, text="Trigger global reload", command=self.trigger_global_reload_now).pack(side="left", padx=(8, 0))
         ttk.Button(general_actions, text="Paint folder", command=self.open_paint_folder).pack(side="left", padx=(8, 0))
@@ -24798,6 +30322,155 @@ class DownloaderUI:
             wraplength=700,
             justify="left",
         ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
+        cloud_sync = ttk.LabelFrame(general_page, text="Cloud sync", padding=10)
+        cloud_sync.grid(row=3, column=0, sticky="ew", pady=(10, 0))
+        ttk.Checkbutton(
+            cloud_sync,
+            text="Pause OneDrive and Dropbox while Nishizumi Paints is running",
+            variable=self.manage_cloud_sync_var,
+            command=self.on_setting_changed,
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            cloud_sync,
+            text="They are restarted when the app exits.",
+            foreground="#666666",
+        ).grid(row=1, column=0, sticky="w", pady=(4, 0))
+
+        replay_names = ttk.LabelFrame(general_page, text="Replay name", padding=10)
+        replay_names.grid(row=4, column=0, sticky="ew", pady=(10, 0))
+        replay_names.columnconfigure(0, weight=1)
+        ttk.Label(replay_names, text="Template", font=("Segoe UI", 9, "bold"), foreground="#0b63b6").grid(row=0, column=0, sticky="w")
+        replay_name_row = ttk.Frame(replay_names)
+        replay_name_row.grid(row=1, column=0, sticky="ew", pady=(4, 0))
+        replay_name_row.columnconfigure(0, weight=1)
+        self.replay_name_entry = ttk.Entry(replay_name_row, textvariable=self.replay_name_template_var)
+        self.replay_name_entry.grid(row=0, column=0, sticky="ew")
+        insert_tag_button = ttk.Menubutton(replay_name_row, text="Insert tag")
+        insert_tag_menu = self.tk.Menu(insert_tag_button, tearoff=False)
+        for tag_name in REPLAY_NAME_TOKENS:
+            insert_tag_menu.add_command(
+                label=tag_name,
+                command=lambda token=tag_name: self.insert_replay_name_tag(token),
+            )
+        insert_tag_button.configure(menu=insert_tag_menu)
+        insert_tag_button.grid(row=0, column=1, padx=(8, 0))
+        ttk.Button(replay_name_row, text="Copy now", command=self.copy_replay_name_now).grid(row=0, column=2, padx=(8, 0))
+        ttk.Label(replay_names, text="Preview", foreground="#666666").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(replay_names, textvariable=self.replay_name_preview_var, foreground="#0b63b6").grid(row=3, column=0, sticky="w")
+        ttk.Checkbutton(
+            replay_names,
+            text="Copy the replay name to the clipboard when the race finishes",
+            variable=self.copy_replay_name_on_finish_var,
+            command=self.on_setting_changed,
+        ).grid(row=4, column=0, sticky="w", pady=(8, 0))
+        self.update_replay_name_preview()
+
+        warning_decals = ttk.LabelFrame(general_page, text="Warning decals", padding=10)
+        warning_decals.grid(row=5, column=0, sticky="ew", pady=(10, 0))
+        warning_decals.columnconfigure(1, weight=1)
+        ttk.Label(warning_decals, text="Mode").grid(row=0, column=0, sticky="w")
+        self.warning_decal_mode_combo = ttk.Combobox(
+            warning_decals,
+            state="readonly",
+            values=["Off", "AND", "OR"],
+            width=8,
+            textvariable=self.warning_decal_mode_var,
+        )
+        self.warning_decal_mode_combo.grid(row=0, column=1, sticky="w", padx=(8, 0))
+        self.warning_decal_mode_combo.bind("<<ComboboxSelected>>", lambda _e: self.on_setting_changed())
+        ttk.Label(warning_decals, text="iRating at or below").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        self.warning_decal_irating_spin = ttk.Spinbox(
+            warning_decals,
+            from_=1000,
+            to=10000,
+            increment=100,
+            width=8,
+            textvariable=self.warning_decal_irating_var,
+            command=self.on_setting_changed,
+        )
+        self.warning_decal_irating_spin.grid(row=1, column=1, sticky="w", padx=(8, 0), pady=(6, 0))
+        self.warning_decal_irating_spin.bind("<FocusOut>", lambda _e: self.on_setting_changed())
+        self.warning_decal_irating_spin.bind("<Return>", lambda _e: self.on_setting_changed())
+        ttk.Label(warning_decals, text="Safety rating at or below").grid(row=2, column=0, sticky="w", pady=(6, 0))
+        self.warning_decal_safety_spin = ttk.Spinbox(
+            warning_decals,
+            from_=0.1,
+            to=5.0,
+            increment=0.05,
+            width=8,
+            textvariable=self.warning_decal_safety_var,
+            command=self.on_setting_changed,
+        )
+        self.warning_decal_safety_spin.grid(row=2, column=1, sticky="w", padx=(8, 0), pady=(6, 0))
+        self.warning_decal_safety_spin.bind("<FocusOut>", lambda _e: self.on_setting_changed())
+        self.warning_decal_safety_spin.bind("<Return>", lambda _e: self.on_setting_changed())
+        ttk.Label(
+            warning_decals,
+            text="Put warning decals in the themes folder named Warning.<carfolder>.decal.tga (or Warning.decal.tga for all cars).",
+            foreground="#666666",
+            wraplength=700,
+            justify="left",
+        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        spec_maps = ttk.LabelFrame(general_page, text="Default spec maps", padding=10)
+        spec_maps.grid(row=6, column=0, sticky="ew", pady=(10, 0))
+        spec_maps.columnconfigure(0, weight=1)
+        ttk.Checkbutton(
+            spec_maps,
+            text="Use my default spec maps for drivers whose paint has no spec map",
+            variable=self.use_default_spec_maps_var,
+            command=self.on_setting_changed,
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            spec_maps,
+            text="Put <car folder>.mip files here; drivers whose paint has no spec map get yours.",
+            foreground="#666666",
+            wraplength=700,
+            justify="left",
+        ).grid(row=1, column=0, sticky="w", pady=(4, 0))
+        ttk.Button(spec_maps, text="Open folder", command=self.open_default_spec_maps_folder).grid(
+            row=2, column=0, sticky="w", pady=(8, 0)
+        )
+
+        car_thumbnails = ttk.LabelFrame(general_page, text="Car thumbnails", padding=10)
+        car_thumbnails.grid(row=7, column=0, sticky="ew", pady=(10, 0))
+        car_thumbnails.columnconfigure(0, weight=1)
+        ttk.Checkbutton(
+            car_thumbnails,
+            text="Create a thumbnail of my car",
+            variable=self.create_own_car_thumbnails_var,
+            command=self.on_setting_changed,
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Checkbutton(
+            car_thumbnails,
+            text="Create thumbnails for the other drivers in the session",
+            variable=self.create_session_car_thumbnails_var,
+            command=self.on_setting_changed,
+        ).grid(row=1, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(
+            car_thumbnails,
+            text="Rendered from the iRacing car viewer when it is running; saved as PNG files in the thumbnails folder.",
+            foreground="#666666",
+            wraplength=700,
+            justify="left",
+        ).grid(row=2, column=0, sticky="w", pady=(4, 0))
+        ttk.Button(car_thumbnails, text="Open thumbnails folder", command=self.open_car_thumbnails_folder).grid(
+            row=3, column=0, sticky="w", pady=(8, 0)
+        )
+
+        sdk_memory = ttk.LabelFrame(general_page, text="iRacing SDK", padding=10)
+        sdk_memory.grid(row=8, column=0, sticky="ew", pady=(10, 0))
+        sdk_memory.columnconfigure(0, weight=1)
+        self.iracing_sdk_memory_label = ttk.Label(
+            sdk_memory,
+            textvariable=self.iracing_sdk_memory_var,
+            justify="left",
+            wraplength=700,
+        )
+        self.iracing_sdk_memory_label.grid(row=0, column=0, sticky="w")
+        ttk.Button(sdk_memory, text="Fix it", command=self.fix_iracing_sdk_memory_now).grid(
+            row=0, column=1, sticky="e", padx=(12, 0)
+        )
 
         ai_page.columnconfigure(0, weight=0)
         ai_page.columnconfigure(1, weight=1)
@@ -25144,6 +30817,87 @@ class DownloaderUI:
         ttk.Button(showroom_actions, text="Open showroom", command=self.open_tp_showroom).pack(side="left", padx=(8, 0))
         ttk.Label(showroom_download_box, textvariable=self.showroom_download_status_var, justify="left", foreground="#555555", wraplength=920).grid(row=5, column=0, sticky="w", pady=(10, 0))
 
+        league_library_box = ttk.LabelFrame(showroom_page, text="League library", padding=10)
+        league_library_box.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
+        league_library_box.columnconfigure(0, weight=1)
+        league_library_box.rowconfigure(0, weight=1)
+        league_tree_frame = ttk.Frame(league_library_box)
+        league_tree_frame.grid(row=0, column=0, sticky="nsew")
+        league_tree_frame.columnconfigure(0, weight=1)
+        league_tree_frame.rowconfigure(0, weight=1)
+        self.league_library_tree = ttk.Treeview(
+            league_tree_frame,
+            columns=("league", "class", "driver", "car", "type"),
+            show="headings",
+            height=7,
+            selectmode="extended",
+        )
+        self.league_library_tree.heading("league", text="League")
+        self.league_library_tree.heading("class", text="Class")
+        self.league_library_tree.heading("driver", text="Driver")
+        self.league_library_tree.heading("car", text="Car")
+        self.league_library_tree.heading("type", text="Type")
+        self.league_library_tree.column("league", width=90, minwidth=70, anchor="e", stretch=False)
+        self.league_library_tree.column("class", width=110, minwidth=80, stretch=False)
+        self.league_library_tree.column("driver", width=120, minwidth=90, stretch=False)
+        self.league_library_tree.column("car", width=320, minwidth=180)
+        self.league_library_tree.column("type", width=150, minwidth=110, stretch=False)
+        self.league_library_tree.grid(row=0, column=0, sticky="nsew")
+        league_tree_scroll = ttk.Scrollbar(league_tree_frame, orient="vertical", command=self.league_library_tree.yview)
+        league_tree_scroll.grid(row=0, column=1, sticky="ns")
+        self.league_library_tree.configure(yscrollcommand=league_tree_scroll.set)
+        league_actions = ttk.Frame(league_library_box)
+        league_actions.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        ttk.Button(league_actions, text="Import files...", command=self.import_league_library_files).pack(side="left")
+        ttk.Button(league_actions, text="Import folder...", command=self.import_league_library_folder).pack(side="left", padx=(8, 0))
+        ttk.Button(league_actions, text="Open folder", command=self.open_league_library_folder).pack(side="left", padx=(8, 0))
+        ttk.Button(league_actions, text="Delete selected", command=self.delete_selected_league_library_entries).pack(side="left", padx=(8, 0))
+        league_preview_box = ttk.LabelFrame(league_library_box, text="League decal preview", padding=8)
+        league_preview_box.grid(row=2, column=0, sticky="nsew", pady=(10, 0))
+        league_preview_box.columnconfigure(1, weight=1)
+        league_preview_controls = ttk.Frame(league_preview_box)
+        league_preview_controls.grid(row=0, column=0, columnspan=2, sticky="ew")
+        ttk.Label(league_preview_controls, text="League").pack(side="left")
+        self.league_preview_league_combo = ttk.Combobox(
+            league_preview_controls, textvariable=self.league_preview_league_var, width=8
+        )
+        self.league_preview_league_combo.pack(side="left", padx=(6, 12))
+        self.league_preview_league_combo.bind("<<ComboboxSelected>>", lambda _event: self._update_league_preview_cars())
+        ttk.Label(league_preview_controls, text="Car").pack(side="left")
+        self.league_preview_car_combo = ttk.Combobox(
+            league_preview_controls, textvariable=self.league_preview_car_var, width=30
+        )
+        self.league_preview_car_combo.pack(side="left", padx=(6, 12))
+        ttk.Label(league_preview_controls, text="Class").pack(side="left")
+        ttk.Entry(league_preview_controls, textvariable=self.league_preview_class_var, width=16).pack(side="left", padx=(6, 12))
+        ttk.Label(league_preview_controls, text="Driver ID").pack(side="left")
+        ttk.Entry(league_preview_controls, textvariable=self.league_preview_driver_var, width=10).pack(side="left", padx=(6, 0))
+        league_preview_actions = ttk.Frame(league_preview_box)
+        league_preview_actions.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        ttk.Button(league_preview_actions, text="Preview decal", command=self.preview_league_decal).pack(side="left")
+        ttk.Button(league_preview_actions, text="Choose paint TGA…", command=self.choose_league_preview_paint).pack(side="left", padx=(8, 0))
+        ttk.Button(league_preview_actions, text="Export PNGs…", command=self.export_league_library_pngs).pack(side="left", padx=(8, 0))
+        ttk.Label(league_preview_actions, textvariable=self.league_preview_paint_var, foreground="#555555").pack(side="left", padx=(12, 0))
+        self.league_preview_panel = PaintPreviewPanel(league_preview_box, app=self)
+        self.league_preview_panel.grid(row=2, column=0, columnspan=2, sticky="nsew", pady=(8, 0))
+        ttk.Label(
+            league_library_box,
+            text="Applied automatically in sessions of the same league.",
+            foreground="#555555",
+            justify="left",
+            wraplength=920,
+        ).grid(row=3, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(
+            league_library_box,
+            textvariable=self.league_library_status_var,
+            foreground="#555555",
+            justify="left",
+            wraplength=920,
+        ).grid(row=4, column=0, sticky="w", pady=(4, 0))
+        self._refresh_league_library_tree()
+
+        self._build_tp_download_page(tp_download_page)
+
         experimental_page.columnconfigure(0, weight=1)
         experimental_top = ttk.LabelFrame(experimental_page, text="Experimental extras", padding=10)
         experimental_top.grid(row=0, column=0, sticky="ew")
@@ -25200,13 +30954,14 @@ class DownloaderUI:
         ).pack(anchor="w", pady=(4, 0))
 
         logs_page.columnconfigure(0, weight=1)
-        logs_page.rowconfigure(4, weight=1)
+        logs_page.rowconfigure(5, weight=1)
         logs_toolbar = ttk.LabelFrame(logs_page, text="Log options", padding=10)
         logs_toolbar.grid(row=0, column=0, sticky="ew")
         ttk.Checkbutton(logs_toolbar, text="Show activity", variable=self.show_activity_var, command=self.on_setting_changed).pack(side="left")
         ttk.Checkbutton(logs_toolbar, text="Verbose logs", variable=self.verbose_var, command=self.on_setting_changed).pack(side="left", padx=(12, 0))
         ttk.Checkbutton(logs_toolbar, text="Show TP monitor", variable=self.show_tp_monitor_var, command=self.on_setting_changed).pack(side="left", padx=(12, 0))
         ttk.Button(logs_toolbar, text="Export log", command=self.export_log).pack(side="right")
+        ttk.Button(logs_toolbar, text="View log", command=self.view_log).pack(side="right", padx=(0, 8))
         ttk.Button(logs_toolbar, text="Reset app settings", command=self.reset_program_config).pack(side="right", padx=(0, 8))
         mapping_tools = ttk.LabelFrame(logs_page, text="Automatic car identification", padding=10)
         mapping_tools.grid(row=1, column=0, sticky="ew", pady=(10, 0))
@@ -25226,8 +30981,36 @@ class DownloaderUI:
         ttk.Label(self.monitor_frame, textvariable=self.tp_monitor_detail_var, justify="left").grid(row=1, column=0, sticky="w", pady=(4, 0))
         ttk.Label(self.monitor_frame, textvariable=self.tp_monitor_save_var, justify="left").grid(row=2, column=0, sticky="w", pady=(4, 0))
         ttk.Button(self.monitor_frame, text="Reset TP monitor", command=self.reset_tp_monitor).grid(row=0, column=1, rowspan=3, sticky="ns", padx=(12, 0))
+        self.folder_metrics_frame = ttk.LabelFrame(logs_page, text="iRacing folder sizes", padding=8)
+        self.folder_metrics_frame.grid(row=4, column=0, sticky="ew", pady=(10, 0))
+        self.folder_metrics_frame.columnconfigure(1, weight=1)
+        metric_row = 0
+        for name in IRACING_FOLDER_METRIC_NAMES:
+            ttk.Label(self.folder_metrics_frame, text=name).grid(row=metric_row, column=0, sticky="w")
+            size_var = self.tk.StringVar(value="…")
+            self.folder_metrics_size_vars[name] = size_var
+            ttk.Label(self.folder_metrics_frame, textvariable=size_var).grid(row=metric_row, column=1, sticky="e", padx=(12, 0))
+            metric_row += 1
+        ttk.Label(self.folder_metrics_frame, text="iRacing total", font=("Segoe UI", 9, "bold")).grid(row=metric_row, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(self.folder_metrics_frame, textvariable=self.folder_metrics_iracing_total_var, font=("Segoe UI", 9, "bold")).grid(row=metric_row, column=1, sticky="e", padx=(12, 0), pady=(4, 0))
+        metric_row += 1
+        for label in self._folder_metrics_extra_dirs():
+            ttk.Label(self.folder_metrics_frame, text=label).grid(row=metric_row, column=0, sticky="w")
+            size_var = self.tk.StringVar(value="…")
+            self.folder_metrics_size_vars[label] = size_var
+            ttk.Label(self.folder_metrics_frame, textvariable=size_var).grid(row=metric_row, column=1, sticky="e", padx=(12, 0))
+            metric_row += 1
+        ttk.Label(self.folder_metrics_frame, text="Nishizumi total", font=("Segoe UI", 9, "bold")).grid(row=metric_row, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(self.folder_metrics_frame, textvariable=self.folder_metrics_nishizumi_total_var, font=("Segoe UI", 9, "bold")).grid(row=metric_row, column=1, sticky="e", padx=(12, 0), pady=(4, 0))
+        metric_row += 1
+        ttk.Label(self.folder_metrics_frame, text="Free space").grid(row=metric_row, column=0, sticky="w", pady=(4, 0))
+        self.folder_metrics_free_space_label = ttk.Label(self.folder_metrics_frame, textvariable=self.folder_metrics_free_space_var, font=("Segoe UI", 9))
+        self.folder_metrics_free_space_label.grid(row=metric_row, column=1, sticky="e", padx=(12, 0), pady=(4, 0))
+        metric_row += 1
+        self.folder_metrics_button = ttk.Button(self.folder_metrics_frame, text="Recalculate", command=self._start_folder_metrics_refresh)
+        self.folder_metrics_button.grid(row=metric_row, column=1, sticky="e", pady=(8, 0))
         self.log_frame = ttk.LabelFrame(logs_page, text="Activity", padding=8)
-        self.log_frame.grid(row=4, column=0, sticky="nsew", pady=(10, 0))
+        self.log_frame.grid(row=5, column=0, sticky="nsew", pady=(10, 0))
         self.log_frame.columnconfigure(0, weight=1)
         self.log_frame.rowconfigure(0, weight=1)
         self.log_text = self.scrolledtext.ScrolledText(self.log_frame, height=10, wrap="word", font=("Consolas", 9))
@@ -25421,6 +31204,596 @@ class DownloaderUI:
         self._guard_value_widgets_from_wheel()
         self._update_session_action_state()
 
+    def _build_tp_download_page(self, page) -> None:
+        ttk = self.ttk
+        page.columnconfigure(0, weight=1)
+        page.rowconfigure(2, weight=1)
+
+        header = ttk.LabelFrame(page, text="Trading Paints member paints", padding=10)
+        header.grid(row=0, column=0, sticky="ew")
+        digits_command = (self.root.register(self._tp_download_digits_only), "%P")
+        ttk.Label(header, text="Member ID").grid(row=0, column=0, sticky="w")
+        ttk.Entry(
+            header,
+            textvariable=self.tp_download_member_id_var,
+            width=16,
+            validate="key",
+            validatecommand=digits_command,
+        ).grid(row=0, column=1, sticky="w", padx=(6, 18))
+        ttk.Label(header, text="Team ID").grid(row=0, column=2, sticky="w")
+        ttk.Entry(
+            header,
+            textvariable=self.tp_download_team_id_var,
+            width=16,
+            validate="key",
+            validatecommand=digits_command,
+        ).grid(row=0, column=3, sticky="w", padx=(6, 18))
+        refresh_button = ttk.Button(header, text="Refresh", command=self._tp_download_refresh)
+        refresh_button.grid(row=0, column=4, sticky="w")
+        ttk.Checkbutton(
+            header,
+            text="Use context",
+            variable=self.tp_download_use_context_var,
+            command=self._tp_download_toggle_context,
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        ttk.Label(
+            header,
+            text="Team ID is used by the context fetch, so a team paint is previewed for that car folder.",
+            foreground="#555555",
+        ).grid(row=1, column=2, columnspan=3, sticky="w", pady=(8, 0))
+
+        context_frame = ttk.LabelFrame(page, text="Trading Paints context", padding=8)
+        context_frame.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        ttk.Label(context_frame, text="Day/Night").grid(row=0, column=0, sticky="w")
+        ttk.Combobox(
+            context_frame,
+            textvariable=self.tp_download_night_var,
+            values=["10:00 am", "1:00 pm", "5:00 pm", "8:00 pm", "11:00 pm"],
+            width=12,
+        ).grid(row=0, column=1, sticky="w", padx=(6, 18))
+        ttk.Label(context_frame, text="Series ID").grid(row=0, column=2, sticky="w")
+        ttk.Entry(
+            context_frame,
+            textvariable=self.tp_download_series_var,
+            width=10,
+            validate="key",
+            validatecommand=digits_command,
+        ).grid(row=0, column=3, sticky="w", padx=(6, 18))
+        ttk.Label(context_frame, text="League ID").grid(row=0, column=4, sticky="w")
+        ttk.Entry(
+            context_frame,
+            textvariable=self.tp_download_league_var,
+            width=10,
+            validate="key",
+            validatecommand=digits_command,
+        ).grid(row=0, column=5, sticky="w", padx=(6, 18))
+        ttk.Checkbutton(
+            context_frame,
+            text="Custom numbers",
+            variable=self.tp_download_custom_numbers_var,
+        ).grid(row=0, column=6, sticky="w", padx=(0, 18))
+        apply_button = ttk.Button(context_frame, text="Apply context", command=self._tp_download_apply_context)
+        apply_button.grid(row=0, column=7, sticky="w")
+        context_frame.grid_remove()
+        self._tp_download_context_frame = context_frame
+
+        content = ttk.Frame(page)
+        content.grid(row=2, column=0, sticky="nsew", pady=(10, 0))
+        content.columnconfigure(0, weight=1)
+        content.columnconfigure(1, weight=1)
+        content.rowconfigure(0, weight=1)
+        cars_box = ttk.LabelFrame(content, text="Cars", padding=8)
+        cars_box.grid(row=0, column=0, sticky="nsew")
+        cars_box.columnconfigure(0, weight=1)
+        cars_box.rowconfigure(0, weight=1)
+        self.tp_download_tree = ttk.Treeview(
+            cars_box,
+            columns=("directory", "files"),
+            show="headings",
+            selectmode="extended",
+            height=14,
+        )
+        self.tp_download_tree.heading("directory", text="Car folder")
+        self.tp_download_tree.heading("files", text="Files")
+        self.tp_download_tree.column("directory", width=260, minwidth=180, anchor="w")
+        self.tp_download_tree.column("files", width=60, minwidth=48, anchor="e", stretch=False)
+        cars_scroll = ttk.Scrollbar(cars_box, orient="vertical", command=self.tp_download_tree.yview)
+        self.tp_download_tree.configure(yscrollcommand=cars_scroll.set)
+        self.tp_download_tree.grid(row=0, column=0, sticky="nsew")
+        cars_scroll.grid(row=0, column=1, sticky="ns")
+        self.tp_download_tree.bind("<<TreeviewSelect>>", self._on_tp_download_car_selected)
+
+        preview_box = ttk.LabelFrame(content, text="Preview", padding=8)
+        preview_box.grid(row=0, column=1, sticky="nsew", padx=(10, 0))
+        preview_box.columnconfigure(0, weight=1)
+        preview_box.rowconfigure(0, weight=1)
+        self.tp_download_preview_panel = PaintPreviewPanel(preview_box, app=self)
+        self.tp_download_preview_panel.grid(row=0, column=0, sticky="nsew")
+
+        bottom = ttk.LabelFrame(page, text="Download", padding=10)
+        bottom.grid(row=3, column=0, sticky="ew", pady=(10, 0))
+        bottom.columnconfigure(1, weight=1)
+        ttk.Label(bottom, text="Download folder:").grid(row=0, column=0, sticky="w")
+        ttk.Label(bottom, textvariable=self.tp_download_folder_var, foreground="#555555", wraplength=760).grid(
+            row=0, column=1, sticky="w", padx=(6, 12)
+        )
+        ttk.Button(bottom, text="Change…", command=self._tp_download_choose_folder).grid(row=0, column=2, sticky="e")
+        actions = ttk.Frame(bottom)
+        actions.grid(row=1, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        selected_button = ttk.Button(actions, text="Download selected", command=self._tp_download_selected)
+        selected_button.pack(side="left")
+        all_button = ttk.Button(actions, text="Download all", command=self._tp_download_all)
+        all_button.pack(side="left", padx=(8, 0))
+        ttk.Label(bottom, textvariable=self.tp_download_status_var, foreground="#555555", wraplength=900, justify="left").grid(
+            row=2, column=0, columnspan=3, sticky="w", pady=(8, 0)
+        )
+        self._tp_download_buttons = [refresh_button, apply_button, selected_button, all_button]
+
+        friends_box = ttk.LabelFrame(page, text="Friends", padding=8)
+        friends_box.grid(row=4, column=0, sticky="ew", pady=(10, 0))
+        friends_box.columnconfigure(0, weight=1)
+        friends_box.rowconfigure(0, weight=1)
+        self.tp_download_friends_tree = ttk.Treeview(
+            friends_box,
+            columns=("id", "name"),
+            show="headings",
+            selectmode="browse",
+            height=6,
+        )
+        self.tp_download_friends_tree.heading("id", text="ID")
+        self.tp_download_friends_tree.heading("name", text="Name")
+        self.tp_download_friends_tree.column("id", width=110, minwidth=90, anchor="e", stretch=False)
+        self.tp_download_friends_tree.column("name", width=320, minwidth=200, anchor="w")
+        friends_scroll = ttk.Scrollbar(friends_box, orient="vertical", command=self.tp_download_friends_tree.yview)
+        self.tp_download_friends_tree.configure(yscrollcommand=friends_scroll.set)
+        self.tp_download_friends_tree.grid(row=0, column=0, sticky="nsew")
+        friends_scroll.grid(row=0, column=1, sticky="ns")
+        friends_actions = ttk.Frame(friends_box)
+        friends_actions.grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        remove_friend_button = ttk.Button(friends_actions, text="Remove", command=self._tp_download_remove_friend)
+        remove_friend_button.pack(side="left")
+        load_friend_button = ttk.Button(friends_actions, text="Load in TP Download", command=self._tp_download_load_friend)
+        load_friend_button.pack(side="left", padx=(8, 0))
+        download_friends_button = ttk.Button(
+            friends_actions,
+            text="Download all friends' paints",
+            command=self._tp_download_friends_all,
+        )
+        download_friends_button.pack(side="left", padx=(8, 0))
+        self._tp_download_buttons = [
+            refresh_button,
+            apply_button,
+            selected_button,
+            all_button,
+            remove_friend_button,
+            load_friend_button,
+            download_friends_button,
+        ]
+        self._refresh_tp_download_friends()
+
+    def _tp_download_digits_only(self, proposed: str) -> bool:
+        return proposed == "" or str(proposed).isdigit()
+
+    def _refresh_tp_download_friends(self) -> None:
+        tree = getattr(self, "tp_download_friends_tree", None)
+        if tree is None:
+            return
+        people = load_people()
+        self._people_cache = people
+        self._people_cache_signature = _file_signature(default_people_path())
+        self._people_cache_checked_at = time.monotonic()
+        try:
+            tree.delete(*tree.get_children())
+        except Exception:
+            pass
+        friends = people.get("friends") or {}
+        for raw_id, name in sorted(friends.items(), key=lambda item: str(item[1] or "").lower()):
+            try:
+                tree.insert("", "end", iid=str(raw_id), values=(str(raw_id), str(name or "")))
+            except Exception:
+                logging.debug("Could not add friend %s to the TP Download tab", raw_id, exc_info=True)
+
+    def _tp_download_selected_friend_id(self) -> int | None:
+        tree = getattr(self, "tp_download_friends_tree", None)
+        selection = tree.selection() if tree is not None else ()
+        if not selection:
+            self.tp_download_status_var.set("Select a friend first.")
+            return None
+        try:
+            return int(selection[0])
+        except (TypeError, ValueError):
+            return None
+
+    def _tp_download_remove_friend(self) -> None:
+        if self._tp_download_busy:
+            return
+        member_id = self._tp_download_selected_friend_id()
+        if member_id is None:
+            return
+        set_friend(member_id, "", False)
+        self._after_people_edit()
+        self.tp_download_status_var.set(f"Removed member {member_id} from friends.")
+
+    def _tp_download_load_friend(self) -> None:
+        if self._tp_download_busy:
+            return
+        member_id = self._tp_download_selected_friend_id()
+        if member_id is None:
+            return
+        self.tp_download_member_id_var.set(str(member_id))
+        self._tp_download_refresh()
+
+    def _tp_download_friends_all(self) -> None:
+        if self._tp_download_busy:
+            return
+        friends = load_people().get("friends") or {}
+        friend_ids = [int(raw_id) for raw_id in friends if str(raw_id).isdigit()]
+        if not friend_ids:
+            self.tp_download_status_var.set("Add friends in the Session tab first.")
+            return
+        folder = default_paints_dir(self.config)
+        self._tp_download_set_busy(True)
+        self.tp_download_status_var.set(f"Friends: 0 of {len(friend_ids)} — 0 files")
+
+        def progress(done: int, total: int, files: int) -> None:
+            self._tp_download_after(
+                0,
+                lambda: self.tp_download_status_var.set(f"Friends: {done} of {total} — {files} files"),
+            )
+
+        def worker() -> None:
+            result = download_friends_paints(
+                friend_ids,
+                _fetch_user_files_fast_uncached,
+                download_tp_paint_to,
+                folder,
+                progress=progress,
+            )
+            self._tp_download_after(0, lambda: self._tp_download_finish_friends_all(result, folder))
+
+        threading.Thread(target=worker, name="NishizumiTpFriendsDownload", daemon=True).start()
+
+    def _tp_download_finish_friends_all(self, result: dict[str, object], folder: Path) -> None:
+        self._tp_download_set_busy(False)
+        done = int(result.get("friends_done") or 0)
+        total = int(result.get("friends_total") or 0)
+        files = int(result.get("files") or 0)
+        failed = list(result.get("failed") or [])
+        self.tp_download_status_var.set(f"Friends: {done} of {total} — {files} files")
+        failed_text = f", {len(failed)} failed" if failed else ""
+        self._append_log(
+            f"Friends download: {files} files from {done} of {total} friends{failed_text} into {folder}."
+        )
+
+    def _tp_download_toggle_context(self) -> None:
+        frame = getattr(self, "_tp_download_context_frame", None)
+        if frame is None:
+            return
+        if self.tp_download_use_context_var.get():
+            frame.grid()
+        else:
+            frame.grid_remove()
+        self._refresh_page_scroll_regions()
+
+    def _tp_download_after(self, delay: int, callback) -> None:
+        try:
+            self.root.after(delay, callback)
+        except Exception:
+            logging.debug("Could not schedule a TP download UI update", exc_info=True)
+
+    def _tp_download_set_busy(self, busy: bool) -> None:
+        self._tp_download_busy = bool(busy)
+        state = ["disabled"] if busy else ["!disabled"]
+        for button in self._tp_download_buttons:
+            try:
+                button.state(state)
+            except Exception:
+                pass
+
+    def _tp_download_live_member_id(self) -> int:
+        try:
+            snapshot = self.service.get_runtime_snapshot()
+        except Exception:
+            logging.debug("Could not read the live iRacing session member ID", exc_info=True)
+            return 0
+        session = snapshot.current_session
+        if session is None:
+            return 0
+        return normalize_tp_member_id(session.local_user_id)
+
+    def _tp_download_refresh_own_member_id(self) -> int:
+        try:
+            self._tp_download_own_member_id, _source = resolve_iracing_ui_preview_member_id(
+                self.config, self._tp_download_live_member_id()
+            )
+        except Exception:
+            logging.debug("Could not resolve the user's own iRacing ID", exc_info=True)
+            self._tp_download_own_member_id = 0
+        return self._tp_download_own_member_id
+
+    def _tp_download_ids(self) -> tuple[int, int] | None:
+        try:
+            member_id = int(self.tp_download_member_id_var.get().strip() or "0")
+        except ValueError:
+            member_id = 0
+        try:
+            team_id = int(self.tp_download_team_id_var.get().strip() or "0")
+        except ValueError:
+            team_id = 0
+        if member_id <= 0:
+            self.tp_download_status_var.set("Enter a valid Member ID.")
+            return None
+        return member_id, max(0, team_id)
+
+    def _tp_download_context_payload_for(self, member_id: int, team_id: int, directory: str) -> dict[str, str] | None:
+        try:
+            series_id = int(self.tp_download_series_var.get().strip() or "0")
+            league_id = int(self.tp_download_league_var.get().strip() or "0")
+        except ValueError:
+            self.tp_download_status_var.set("Series ID and League ID must be numbers.")
+            return None
+        own_member_id = self._tp_download_refresh_own_member_id()
+        number = str(own_member_id)[-2:] if own_member_id > 0 else "64"
+        return tp_download_context_payload(
+            member_id,
+            team_id,
+            directory,
+            night=self.tp_download_night_var.get().strip(),
+            series_id=series_id,
+            league_id=league_id,
+            custom_numbers=bool(self.tp_download_custom_numbers_var.get()),
+            number=number,
+        )
+
+    def _tp_download_on_tab_opened(self) -> None:
+        self._tp_download_refresh_own_member_id()
+        if self._tp_download_auto_refresh_done:
+            return
+        self._tp_download_auto_refresh_done = True
+        if not self.tp_download_member_id_var.get().strip() and self._tp_download_own_member_id > 0:
+            self.tp_download_member_id_var.set(str(self._tp_download_own_member_id))
+        if self.tp_download_member_id_var.get().strip():
+            self._tp_download_refresh()
+
+    def _tp_download_cleanup_preview(self) -> None:
+        try:
+            self._tp_download_preview_temp.cleanup()
+        except Exception:
+            logging.debug("Could not clean up TP preview files", exc_info=True)
+        panel = getattr(self, "tp_download_preview_panel", None)
+        if panel is not None:
+            try:
+                panel.clear()
+            except Exception:
+                logging.debug("Could not clear the TP preview panel", exc_info=True)
+
+    def _tp_download_refresh(self) -> None:
+        if self._tp_download_busy:
+            return
+        self._tp_download_refresh_own_member_id()
+        ids = self._tp_download_ids()
+        if ids is None:
+            return
+        member_id, _team_id = ids
+        self._tp_download_cleanup_preview()
+        self._tp_download_set_busy(True)
+        self.tp_download_status_var.set("Loading cars…")
+
+        def worker() -> None:
+            error = ""
+            try:
+                files = _fetch_user_files_fast_uncached(member_id)
+            except Exception as exc:
+                logging.debug("Could not fetch TP paints for member %s: %s", member_id, exc)
+                files = []
+                error = str(exc)
+            self._tp_download_after(0, lambda: self._tp_download_finish_refresh(member_id, files, error))
+
+        threading.Thread(target=worker, name="NishizumiTpDownloadRefresh", daemon=True).start()
+
+    def _tp_download_finish_refresh(self, member_id: int, files: list[DownloadFile], error: str) -> None:
+        self._tp_download_groups = tp_download_car_groups(files)
+        tree = getattr(self, "tp_download_tree", None)
+        if tree is not None:
+            try:
+                tree.delete(*tree.get_children())
+            except Exception:
+                pass
+        self._tp_download_tree_directories = {}
+        if tree is not None:
+            for index, (directory, group) in enumerate(self._tp_download_groups.items()):
+                iid = f"car-{index}"
+                try:
+                    tree.insert("", "end", iid=iid, values=(directory, len(group)))
+                    self._tp_download_tree_directories[iid] = directory
+                except Exception:
+                    logging.debug("Could not add TP car row %s", directory, exc_info=True)
+        self._tp_download_set_busy(False)
+        if error:
+            self.tp_download_status_var.set(f"Could not load paints for member {member_id}: {error}")
+        elif self._tp_download_groups:
+            self.tp_download_status_var.set(f"Found {len(self._tp_download_groups)} car folder(s) for member {member_id}.")
+        else:
+            self.tp_download_status_var.set(f"No car paints found for member {member_id}.")
+
+    def _on_tp_download_car_selected(self, _event=None) -> None:
+        if self._tp_download_busy:
+            return
+        tree = getattr(self, "tp_download_tree", None)
+        if tree is None:
+            return
+        selection = tree.selection()
+        if len(selection) != 1:
+            return
+        directory = self._tp_download_tree_directories.get(selection[0], "")
+        if directory:
+            self._tp_download_preview_directory(directory)
+
+    def _tp_download_apply_context(self) -> None:
+        if self._tp_download_busy:
+            return
+        if not self.tp_download_use_context_var.get():
+            self.tp_download_status_var.set("Tick Use context to fetch with the Trading Paints context.")
+            return
+        tree = getattr(self, "tp_download_tree", None)
+        if tree is not None:
+            selection = tree.selection()
+            if len(selection) == 1:
+                directory = self._tp_download_tree_directories.get(selection[0], "")
+                if directory:
+                    self._tp_download_preview_directory(directory)
+                    return
+        self.tp_download_status_var.set("Select one car folder to fetch with the context.")
+
+    def _tp_download_preview_directory(self, directory: str) -> None:
+        ids = self._tp_download_ids()
+        if ids is None:
+            return
+        member_id, team_id = ids
+        payload = None
+        if self.tp_download_use_context_var.get():
+            payload = self._tp_download_context_payload_for(member_id, team_id, directory)
+            if payload is None:
+                return
+        own_member_id = self._tp_download_refresh_own_member_id()
+        number = str(own_member_id)[-2:] if own_member_id > 0 else None
+        self._tp_download_cleanup_preview()
+        self._tp_download_set_busy(True)
+        self.tp_download_status_var.set(f"Loading preview for {directory}…")
+        preview_dir = self._tp_download_preview_dir
+
+        def worker() -> None:
+            car_tga: Path | None = None
+            decal_tga: Path | None = None
+            car_kind = "car"
+            try:
+                if payload is not None:
+                    files = fetch_tp_download_context(payload, member_id, team_id)
+                else:
+                    files = list(self._tp_download_groups.get(directory, []))
+                car_item, decal_item = pick_tp_preview_items(files, prefer_team=team_id > 0)
+                if car_item is not None and car_item.download_id.paint_type is PaintType.CAR_NUMBER:
+                    car_kind = "car_num"
+                for item in files:
+                    saved = download_tp_paint_to(item, preview_dir)
+                    if saved is None:
+                        continue
+                    self._tp_download_preview_temp.track(saved, False, False)
+                    if item is car_item:
+                        car_tga = saved
+                    elif item is decal_item:
+                        decal_tga = saved
+            except Exception:
+                logging.debug("Could not build the TP download preview for %s", directory, exc_info=True)
+            finally:
+                self._tp_download_after(
+                    0,
+                    lambda: self._tp_download_finish_preview(
+                        directory, car_tga, decal_tga, number, member_id, car_kind
+                    ),
+                )
+
+        threading.Thread(target=worker, name="NishizumiTpDownloadPreview", daemon=True).start()
+
+    def _tp_download_finish_preview(
+        self,
+        directory: str,
+        car_tga: Path | None,
+        decal_tga: Path | None,
+        number: str | None,
+        member_id: int = 0,
+        car_kind: str = "car",
+    ) -> None:
+        panel = getattr(self, "tp_download_preview_panel", None)
+        if panel is not None:
+            try:
+                if car_tga is None:
+                    panel.clear()
+                else:
+                    panel.show(
+                        car_tga,
+                        decal_tga=decal_tga,
+                        car_path=directory,
+                        number=number,
+                        member_id=member_id,
+                        render_kind=car_kind,
+                    )
+            except Exception:
+                logging.debug("Could not show the TP paint preview", exc_info=True)
+        if car_tga is None:
+            self.tp_download_status_var.set(f"No downloadable car paint found for {directory}.")
+        else:
+            self.tp_download_status_var.set(f"Previewing {directory}.")
+        self._tp_download_set_busy(False)
+
+    def _tp_download_selected(self) -> None:
+        self._tp_download_download(all_groups=False)
+
+    def _tp_download_all(self) -> None:
+        self._tp_download_download(all_groups=True)
+
+    def _tp_download_download(self, *, all_groups: bool) -> None:
+        if self._tp_download_busy:
+            return
+        tree = getattr(self, "tp_download_tree", None)
+        if all_groups:
+            directories = list(self._tp_download_groups)
+        elif tree is not None:
+            directories = [
+                self._tp_download_tree_directories[iid]
+                for iid in tree.selection()
+                if iid in self._tp_download_tree_directories
+            ]
+        else:
+            directories = []
+        files: list[DownloadFile] = []
+        for directory in directories:
+            files.extend(self._tp_download_groups.get(directory, []))
+        # The TP Download tab is for normal paints. Writing _ss variants into the
+        # live paint folder for every car (including car_spec_#_ss.mip) polluted
+        # folders and could make iRacing pick the wrong variant.
+        files = [item for item in files if not item.download_id.is_superspeedway_variant]
+        if not files:
+            self.tp_download_status_var.set("Select at least one car folder with standard paints to download.")
+            return
+        folder_text = self.tp_download_folder_var.get().strip() or str(default_paints_dir(self.config))
+        folder = Path(folder_text)
+        self._tp_download_set_busy(True)
+        total = len(files)
+        self.tp_download_status_var.set(f"Downloaded 0 of {total} …")
+
+        def worker() -> None:
+            downloaded = 0
+            try:
+                _remove_stale_spec_maps_for_download_items(files, folder)
+                for item in files:
+                    if download_tp_paint_to(item, folder) is not None:
+                        downloaded += 1
+                    self._tp_download_after(
+                        0,
+                        lambda done=downloaded: self.tp_download_status_var.set(f"Downloaded {done} of {total} …"),
+                    )
+            except Exception:
+                logging.debug("Could not download TP paints to %s", folder, exc_info=True)
+            finally:
+                self._tp_download_after(0, lambda: self._tp_download_finish_download(downloaded, folder))
+
+        threading.Thread(target=worker, name="NishizumiTpDownloadSave", daemon=True).start()
+
+    def _tp_download_finish_download(self, downloaded: int, folder: Path) -> None:
+        self._tp_download_set_busy(False)
+        self.tp_download_status_var.set(f"Downloaded {downloaded} files to {folder}")
+
+    def _tp_download_choose_folder(self) -> None:
+        initial = self.tp_download_folder_var.get().strip() or str(default_paints_dir(self.config))
+        try:
+            chosen = self.filedialog.askdirectory(initialdir=initial, title="Choose a download folder")
+        except Exception:
+            logging.debug("Could not open the TP download folder dialog", exc_info=True)
+            return
+        if chosen:
+            self.tp_download_folder_var.set(str(Path(chosen)))
+
     def _session_row_iid(self, row: SessionDriverSnapshot) -> str:
         return f"{row.target_kind}:{row.target_id}:{row.directory.lower()}:{row.iracing_id}"
     def _session_row_values(self, row: SessionDriverSnapshot) -> tuple[str, ...]:
@@ -25433,7 +31806,7 @@ class DownloaderUI:
             self._format_irating_text(row.irating),
             str(row.license_label),
             str(row.safety_rating),
-            str(row.current_driver_text or self._format_session_driver_name(row)),
+            str(self._session_row_name_text(row)),
             str(row.last_driver_swap_text or "-"),
             str(row.last_refresh_text or "-"),
         )
@@ -25492,7 +31865,7 @@ class DownloaderUI:
         if column_name == "helmet":
             return row.helmet_reason_text
         if column_name == "name":
-            return str(row.current_driver_text or self._format_session_driver_name(row))
+            return self._session_row_name_text(row)
         if column_name == "swap":
             return "" if str(row.last_driver_swap_text or "-") == "-" else str(row.last_driver_swap_text)
         if column_name == "refresh":
@@ -25554,6 +31927,243 @@ class DownloaderUI:
 
     def on_session_tree_leave(self, _event=None) -> None:
         self._destroy_session_tree_tooltip()
+
+    def _people_data(self) -> dict[str, object]:
+        now = time.monotonic()
+        if self._people_cache is None or now - self._people_cache_checked_at >= 1.0:
+            signature = _file_signature(default_people_path())
+            if self._people_cache is None or signature != self._people_cache_signature:
+                self._people_cache = load_people()
+                self._people_cache_signature = signature
+            self._people_cache_checked_at = now
+        return self._people_cache
+
+    def _invalidate_people_cache(self) -> None:
+        self._people_cache = None
+        self._people_cache_signature = None
+        self._people_cache_checked_at = 0.0
+
+    def _session_row_people_name(self, row: SessionDriverSnapshot) -> str:
+        team_id = row.target_id if str(getattr(row, "target_kind", "")).lower() == "team" else None
+        return display_name_with_alias(row.display_name, row.iracing_id, team_id, self._people_data())
+
+    def _session_row_name_text(self, row: SessionDriverSnapshot) -> str:
+        text = str(row.current_driver_text or self._format_session_driver_name(row))
+        aliased = self._session_row_people_name(row)
+        if row.display_name and aliased != row.display_name:
+            text = text.replace(row.display_name, aliased, 1)
+        return text
+
+    def on_session_tree_context_menu(self, event) -> None:
+        iid = self.session_tree.identify_row(event.y)
+        if iid:
+            if iid not in self.session_tree.selection():
+                self.session_tree.selection_set(iid)
+            self.session_tree.focus(iid)
+            self.on_session_driver_selected()
+        team_rows = any(
+            str(getattr(row, "target_kind", "")).lower() == "team"
+            for row, _user in self._selected_session_contexts()[1]
+        )
+        try:
+            self._rebuild_session_tag_menu()
+            self._session_context_menu.entryconfigure(3, state="normal" if team_rows else "disabled")
+            self._session_context_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self._session_context_menu.grab_release()
+
+    def _rebuild_session_tag_menu(self) -> None:
+        menu = getattr(self, "_session_tag_menu", None)
+        if menu is None:
+            return
+        menu.delete(0, "end")
+        themes = load_tag_themes(default_tag_themes_dir())
+        for theme_name in sorted(themes, key=str.casefold):
+            menu.add_command(
+                label=theme_name,
+                command=lambda name=theme_name: self.set_selected_session_drivers_theme(name),
+            )
+        if not themes:
+            menu.add_command(label="(no themes found)", state="disabled")
+        menu.add_separator()
+        menu.add_command(label="Remove tag", command=lambda: self.set_selected_session_drivers_theme(""))
+
+    def _refresh_theme_target_keys(self, users: Iterable[SessionUser]) -> None:
+        for target_key in dict.fromkeys(user.effective_target_key() for user in users):
+            self.service.request_refresh_target_now(target_key)
+        self._last_session_action_state_key = None
+        self._update_session_action_state()
+
+    def set_selected_session_drivers_theme(self, theme_name: str) -> None:
+        selected = self._require_selected_session_drivers()
+        if selected is None:
+            return
+        snapshot, contexts = selected
+        session = snapshot.current_session
+        if session is None:
+            return
+        updated: list[SessionUser] = []
+        for row, user in contexts:
+            if user.is_ai:
+                self._append_log(f"{row.display_name} is an AI driver; themes only apply to human drivers.")
+                continue
+            if session_user_is_local_target(session, user):
+                self._append_log(f"{row.display_name}'s own paints are never replaced by a theme.")
+                continue
+            set_tag(user.user_id, theme_name)
+            updated.append(user)
+            if theme_name:
+                self._append_log(f"Tagged {row.display_name} as {theme_name}.")
+            else:
+                self._append_log(f"Removed the theme tag from {row.display_name}.")
+        if not updated:
+            return
+        self._after_people_edit()
+        self._refresh_theme_target_keys(updated)
+
+    def copy_tags_to_clipboard(self) -> None:
+        tags = tags_from_people(self._people_data())
+        snapshot = self.service.get_runtime_snapshot()
+        names: dict[str, str] = {}
+        if snapshot.current_session is not None:
+            for user in snapshot.current_session.users:
+                names[str(user.user_id)] = user.display_name or str(user.user_id)
+        text = format_tags_clipboard(tags, names)
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+        except Exception as exc:
+            self._append_log(f"Could not copy tags: {exc}")
+            return
+        self._append_log(f"Copied {len(tags)} theme tag(s) to the clipboard.")
+
+    def import_tags_from_clipboard(self) -> None:
+        try:
+            text = self.root.clipboard_get()
+        except Exception as exc:
+            self._append_log(f"Could not read the clipboard: {exc}")
+            return
+        imported = parse_tags_clipboard(text)
+        if not imported:
+            self._append_log("The clipboard does not contain Nishizumi Paints theme tags.")
+            return
+        existing = tags_from_people(self._people_data())
+        themes = load_tag_themes(default_tag_themes_dir())
+        known = {name.casefold() for name in themes}
+        added = 0
+        skipped = 0
+        for member_id, theme_name in imported.items():
+            if member_id in existing:
+                skipped += 1
+                continue
+            if theme_name.casefold() not in known:
+                logging.info("Theme %s from the clipboard is not in the themes folder; skipped", theme_name)
+                skipped += 1
+                continue
+            set_tag(member_id, theme_name)
+            added += 1
+        self._after_people_edit()
+        self._append_log(f"Imported {added} theme tag(s); skipped {skipped}.")
+        snapshot = self.service.get_runtime_snapshot()
+        if snapshot.current_session is not None and added:
+            targets = [
+                user
+                for user in snapshot.current_session.users
+                if str(user.user_id) in imported and not user.is_ai
+            ]
+            self._refresh_theme_target_keys(targets)
+
+    def open_tag_themes_folder(self) -> None:
+        path = default_tag_themes_dir()
+        path.mkdir(parents=True, exist_ok=True)
+        try:
+            if sys.platform == "win32":
+                os.startfile(path)  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                os.system(f'open "{path}"')
+            else:
+                os.system(f'xdg-open "{path}"')
+        except Exception as exc:
+            self._append_log(f"Could not open themes folder: {exc}")
+
+    def _session_actionable_contexts(self) -> list[tuple[SessionDriverSnapshot, SessionUser]]:
+        snapshot, contexts = self._selected_session_contexts()
+        if snapshot.current_session is None or not contexts:
+            self._append_log("Select one or more drivers in the Session tab first.")
+            return []
+        actionable = [(row, user) for row, user in contexts if not row.is_ai]
+        if not actionable:
+            self._append_log("AI drivers cannot be added to friends or aliased.")
+        return actionable
+
+    def _after_people_edit(self) -> None:
+        self._invalidate_people_cache()
+        self._refresh_session_tree()
+        self._refresh_tp_download_friends()
+
+    def add_selected_session_drivers_to_friends(self) -> None:
+        contexts = self._session_actionable_contexts()
+        if not contexts:
+            return
+        for row, _user in contexts:
+            set_friend(row.iracing_id, row.display_name or str(row.iracing_id), True)
+        self._after_people_edit()
+        self._append_log(f"Added {len(contexts)} driver(s) to friends.")
+
+    def remove_selected_session_drivers_from_friends(self) -> None:
+        contexts = self._session_actionable_contexts()
+        if not contexts:
+            return
+        for row, _user in contexts:
+            set_friend(row.iracing_id, "", False)
+        self._after_people_edit()
+        self._append_log(f"Removed {len(contexts)} driver(s) from friends.")
+
+    def set_selected_session_driver_alias(self) -> None:
+        contexts = self._session_actionable_contexts()
+        if not contexts:
+            return
+        row = contexts[0][0]
+        current = str((self._people_data().get("driver_aliases") or {}).get(str(row.iracing_id)) or "")
+        value = self.simpledialog.askstring(
+            APP_NAME,
+            f"Alias for {row.display_name}:",
+            parent=self.root,
+            initialvalue=current,
+        )
+        if value is None:
+            return
+        for selected_row, _user in contexts:
+            set_alias("driver", selected_row.iracing_id, value)
+        self._after_people_edit()
+        self._append_log(f"Updated the driver alias for {len(contexts)} driver(s).")
+
+    def set_selected_session_team_alias(self) -> None:
+        contexts = self._session_actionable_contexts()
+        if not contexts:
+            return
+        team_rows = [
+            (row, user)
+            for row, user in contexts
+            if str(getattr(row, "target_kind", "")).lower() == "team"
+        ]
+        if not team_rows:
+            self._append_log("Select a team row in the Session tab to set a team alias.")
+            return
+        row = team_rows[0][0]
+        current = str((self._people_data().get("team_aliases") or {}).get(str(row.target_id)) or "")
+        value = self.simpledialog.askstring(
+            APP_NAME,
+            f"Alias for team {row.target_id}:",
+            parent=self.root,
+            initialvalue=current,
+        )
+        if value is None:
+            return
+        for selected_row, _user in team_rows:
+            set_alias("team", selected_row.target_id, value)
+        self._after_people_edit()
+        self._append_log(f"Updated the team alias for {len(team_rows)} team(s).")
 
     def on_session_driver_double_clicked(self, event) -> None:
         iid = self.session_tree.identify_row(event.y)
@@ -25624,7 +32234,13 @@ class DownloaderUI:
             for row in snapshot.session_rows
         )
         team_mode = session_has_team_targets(snapshot.current_session)
-        return (session_label, bool(team_mode), bool(getattr(snapshot, "replay_mode_active", False)), rows_sig)
+        return (
+            session_label,
+            bool(team_mode),
+            bool(getattr(snapshot, "replay_mode_active", False)),
+            _file_signature(default_people_path()),
+            rows_sig,
+        )
     def _format_session_driver_name(self, row: SessionDriverSnapshot) -> str:
         return f"{row.display_name} [AI]" if row.is_ai else row.display_name
     def _status_sort_key(self, status_code: str, status_text: str) -> tuple[int, str]:
@@ -25776,7 +32392,97 @@ class DownloaderUI:
             tuple(sorted(str(item.file_path) for item in snapshot.last_saved)),
             _file_signature(default_driver_paint_overrides_path()),
             _file_signature(default_paint_history_index_path()),
+            _file_signature(default_forbidden_tp_paints_path()),
         )
+
+    def _session_preview_key(
+        self,
+        snapshot: RuntimeSnapshot,
+        contexts: list[tuple[SessionDriverSnapshot, SessionUser]],
+    ) -> tuple | None:
+        if len(contexts) != 1:
+            return None
+        _row, user = contexts[0]
+        session = snapshot.current_session
+        return (
+            session.session_id.folder_name() if session is not None else "",
+            int(user.user_id),
+            str(user.directory or "").lower(),
+            str(user.car_design or ""),
+            str(user.helmet_design or ""),
+            str(user.suit_design or ""),
+            str(user.number or ""),
+            len(getattr(snapshot, "last_saved", ()) or ()),
+        )
+
+    def _cancel_session_preview(self) -> None:
+        after_id = self._session_preview_after_id
+        self._session_preview_after_id = None
+        if after_id is None:
+            return
+        try:
+            self.root.after_cancel(after_id)
+        except Exception:
+            logging.debug("Could not cancel the Session preview update", exc_info=True)
+
+    def _schedule_session_preview(
+        self,
+        snapshot: RuntimeSnapshot,
+        contexts: list[tuple[SessionDriverSnapshot, SessionUser]],
+    ) -> None:
+        panel = getattr(self, "session_preview_panel", None)
+        if panel is None:
+            return
+        key = self._session_preview_key(snapshot, contexts)
+        if key is None:
+            if self._session_preview_key_value is None:
+                self._cancel_session_preview()
+                return
+            self._session_preview_key_value = None
+            self._cancel_session_preview()
+            try:
+                panel.clear()
+            except Exception:
+                logging.debug("Could not clear the Session preview", exc_info=True)
+            return
+        if key == self._session_preview_key_value and self._session_preview_after_id is None:
+            return
+        self._session_preview_key_value = key
+        self._cancel_session_preview()
+        try:
+            self._session_preview_after_id = self.root.after(300, self._refresh_session_preview)
+        except Exception:
+            logging.debug("Could not schedule the Session preview update", exc_info=True)
+            self._refresh_session_preview()
+
+    def _refresh_session_preview(self) -> None:
+        self._session_preview_after_id = None
+        panel = getattr(self, "session_preview_panel", None)
+        if panel is None:
+            return
+        _snapshot, contexts = self._selected_session_contexts()
+        if len(contexts) != 1:
+            self._session_preview_key_value = None
+            try:
+                panel.clear()
+            except Exception:
+                logging.debug("Could not clear the Session preview", exc_info=True)
+            return
+        _row, user = contexts[0]
+        try:
+            inputs = session_preview_inputs(user, default_paints_dir(self.config))
+            panel.show(
+                inputs["car_tga"],
+                decal_tga=inputs["decal_tga"],
+                car_path=str(inputs["car_path"] or ""),
+                design=str(inputs["design"] or ""),
+                number=inputs["number"],
+                member_id=int(user.user_id),
+                render_kind=str(inputs.get("car_kind") or "car"),
+            )
+            panel.show_driver(inputs["helmet_tga"], inputs["suit_tga"])
+        except Exception:
+            logging.debug("Could not show the Session preview", exc_info=True)
 
     def _update_session_action_state(self) -> None:
         snapshot, contexts = self._selected_session_contexts()
@@ -25790,6 +32496,7 @@ class DownloaderUI:
         if state_key is not None and state_key == self.__dict__.get("_last_session_action_state_key"):
             return
         self._last_session_action_state_key = state_key
+        self._schedule_session_preview(snapshot, contexts)
         enabled = bool(snapshot.current_session is not None and contexts)
         for button in getattr(self, "session_driver_action_buttons", []):
             try:
@@ -25803,6 +32510,7 @@ class DownloaderUI:
         session = snapshot.current_session
         overrides = load_driver_paint_overrides()
         history_index = _load_paint_history_index()
+        forbidden_paints = _cached_forbidden_tp_paints()
         last_saved = list(snapshot.last_saved)
         current_entry_cache: dict[tuple[int, str], dict[str, object] | None] = {}
 
@@ -25869,6 +32577,20 @@ class DownloaderUI:
                 for index in available_indices
             )
             can_start_override = bool(available_indices)
+            can_forbid = any(
+                not contexts[index][1].is_ai and not session_user_is_local_target(session, contexts[index][1])
+                for index in available_indices
+            )
+            all_forbidden = bool(contexts) and all(
+                is_tp_paint_forbidden(
+                    "team" if session_user_uses_team_target(context_user) else "user",
+                    context_user.team_id if session_user_uses_team_target(context_user) else context_user.user_id,
+                    kind,
+                    context_user.directory if kind == "car" else "",
+                    forbidden=forbidden_paints,
+                )
+                for _context_row, context_user in contexts
+            )
             for action_key, action_enabled in (
                 ("assign", can_start_override),
                 ("current", can_assign_current),
@@ -25878,6 +32600,8 @@ class DownloaderUI:
                 ("block", can_mark_random),
                 ("restore", can_restore_previous),
                 ("forget", can_forget),
+                ("forbid", can_forbid),
+                ("copy_ai", True),
             ):
                 button = getattr(self, "session_driver_action_buttons_by_kind", {}).get((kind, action_key))
                 if button is not None:
@@ -25885,6 +32609,12 @@ class DownloaderUI:
                         button.state(["!disabled"] if action_enabled else ["disabled"])
                     except Exception:
                         pass
+            forbid_button = getattr(self, "session_driver_action_buttons_by_kind", {}).get((kind, "forbid"))
+            if forbid_button is not None:
+                try:
+                    forbid_button.configure(text="Allow TP" if all_forbidden else "Forbid TP")
+                except Exception:
+                    pass
             if len(contexts) == 1 and entries[0] is not None:
                 entry = entries[0]
                 scheme = str(entry.get("scheme_id") or "").strip()
@@ -25899,6 +32629,60 @@ class DownloaderUI:
             self.session_driver_action_summary_var.set(
                 f"{len(contexts)} drivers selected | actions apply to compatible selected rows."
             )
+    def _toggle_session_conditions(self) -> None:
+        self._session_conditions_expanded = not self._session_conditions_expanded
+        try:
+            if self._session_conditions_expanded:
+                self.session_conditions_body.grid()
+                self.session_conditions_toggle.configure(text="Hide")
+            else:
+                self.session_conditions_body.grid_remove()
+                self.session_conditions_toggle.configure(text="Show")
+        except Exception:
+            logging.debug("Could not toggle the session conditions frame", exc_info=True)
+        self._refresh_page_scroll_regions()
+
+    def _refresh_session_conditions(self, snapshot: RuntimeSnapshot | None = None) -> None:
+        if snapshot is None:
+            snapshot = self._cached_runtime_snapshot
+        if snapshot is None:
+            try:
+                snapshot = self.service.get_runtime_snapshot()
+            except Exception:
+                snapshot = None
+        values = session_condition_values(snapshot.current_session if snapshot is not None else None)
+        for field_key, variable in self.session_condition_vars.items():
+            try:
+                variable.set(values.get(field_key, SESSION_CONDITION_UNKNOWN))
+            except Exception:
+                logging.debug("Could not update the session condition %s", field_key, exc_info=True)
+
+    def _refresh_field_status(self, snapshot: RuntimeSnapshot | None = None) -> None:
+        if snapshot is None:
+            snapshot = self._cached_runtime_snapshot
+        if snapshot is None:
+            try:
+                snapshot = self.service.get_runtime_snapshot()
+            except Exception:
+                snapshot = None
+        session = snapshot.current_session if snapshot is not None else None
+        rows = list(snapshot.session_rows) if snapshot is not None else []
+        sof = session_strength_of_field(session)
+        drivers = session_driver_count(session)
+        without_livery = session_without_livery_count(rows)
+        done, total = session_paint_progress(rows)
+        sdk_state = "connected" if session is not None else "waiting"
+        tp_state = "ready" if tp_fetch_hosts_available() else "offline"
+        try:
+            self.field_sof_var.set(f"SOF {sof}" if sof > 0 else f"SOF {SESSION_CONDITION_UNKNOWN}")
+            self.field_drivers_var.set(f"Drivers {drivers}")
+            self.field_livery_var.set(f"{without_livery} without livery")
+            self.field_files_var.set(f"Files {done}/{total}")
+            self.field_links_var.set(f"TP {tp_state} • SDK {sdk_state}")
+            self.field_progress_var.set((done / total * 100.0) if total > 0 else 0.0)
+        except Exception:
+            logging.debug("Could not update the field status bar", exc_info=True)
+
     def _refresh_session_tree(self, snapshot: RuntimeSnapshot | None = None) -> None:
         if snapshot is None:
             snapshot = self.service.get_runtime_snapshot()
@@ -26237,6 +33021,24 @@ class DownloaderUI:
             return bool(reader is not None and _try_incremental_texture_reload(reader, session, saved_items))
         except Exception:
             logging.debug("Incremental texture reload for restored paint failed", exc_info=True)
+            return False
+        finally:
+            close_sdk_reader(reader)
+    def _reload_showroom_texture_for_member(self, member_id: int, car_directory: str) -> bool:
+        try:
+            session = self.service.get_runtime_snapshot().current_session
+        except Exception:
+            logging.debug("Could not read the live session for the showroom paint", exc_info=True)
+            return False
+        car_idx = _session_car_index_for_member(session, member_id, car_directory)
+        if car_idx is None:
+            return False
+        reader = None
+        try:
+            reader = create_sdk_reader()
+            return bool(reader is not None and trigger_texture_reload(reader, car_idx=car_idx))
+        except Exception:
+            logging.debug("Could not reload the showroom paint texture", exc_info=True)
             return False
         finally:
             close_sdk_reader(reader)
@@ -26659,6 +33461,133 @@ class DownloaderUI:
             self._last_session_snapshot_signature = None
             self._refresh_session_tree()
         self._update_session_action_state()
+
+    def _forbidden_tp_paint_paths(
+        self,
+        target_kind: str,
+        target_id: int,
+        kind: str,
+        directory: str,
+        paints_dir: Path,
+    ) -> list[Path]:
+        is_team_paint = target_kind == "team"
+        download_ids: list[DownloadId] = []
+        if kind == "car":
+            for paint_type in (PaintType.CAR, PaintType.CAR_DECAL, PaintType.CAR_NUMBER):
+                for superspeedway in (False, True):
+                    download_ids.append(
+                        DownloadId(
+                            user_id=int(target_id),
+                            directory=directory,
+                            paint_type=paint_type,
+                            is_team_paint=is_team_paint,
+                            is_superspeedway_variant=superspeedway,
+                        )
+                    )
+            for superspeedway in (False, True):
+                download_ids.append(
+                    DownloadId(
+                        user_id=int(target_id),
+                        directory=directory,
+                        paint_type=PaintType.CAR_SPEC,
+                        is_team_paint=is_team_paint,
+                        is_superspeedway_variant=superspeedway,
+                    )
+                )
+                download_ids.append(
+                    DownloadId(
+                        user_id=int(target_id),
+                        directory=directory,
+                        paint_type=PaintType.CAR_SPEC,
+                        is_team_paint=is_team_paint,
+                        is_numbered_car_spec=True,
+                        is_superspeedway_variant=superspeedway,
+                    )
+                )
+        else:
+            paint_type = PaintType.HELMET if kind == "helmet" else PaintType.SUIT
+            download_ids.append(
+                DownloadId(
+                    user_id=int(target_id),
+                    directory=directory,
+                    paint_type=paint_type,
+                    is_team_paint=is_team_paint,
+                )
+            )
+        return [save_path_for(download_id, paints_dir) for download_id in download_ids]
+
+    def _delete_forbidden_tp_paint_files(
+        self,
+        target_kind: str,
+        target_id: int,
+        kind: str,
+        directory: str,
+        paints_dir: Path,
+    ) -> int:
+        removed = 0
+        for path in self._forbidden_tp_paint_paths(target_kind, target_id, kind, directory, paints_dir):
+            if not path.exists():
+                continue
+            # iRacing can briefly hold a TGA open; retry instead of silently leaving
+            # a forbidden paint on disk.
+            if _hard_delete_file(path, paints_root=paints_dir):
+                removed += 1
+        return removed
+
+    def toggle_forbid_selected_driver_tp_paint(self, kind: str) -> None:
+        selected = self._require_selected_session_drivers()
+        if selected is None:
+            return
+        snapshot, contexts = selected
+        session = snapshot.current_session
+        if session is None:
+            return
+        normalized_kind = _driver_paint_override_kind(kind)
+        if not normalized_kind:
+            self._append_log(f"Cannot forbid unsupported paint kind: {kind}")
+            return
+        paints_dir = default_paints_dir(self.config)
+        refresh_keys: list[tuple[str, int, str]] = []
+        for row, user in contexts:
+            if user.is_ai:
+                self._append_log(f"{row.display_name} is an AI driver; Trading Paints paints cannot be forbidden for AI drivers.")
+                continue
+            if session_user_is_local_target(session, user):
+                self._append_log(f"{row.display_name}'s own Trading Paints {normalized_kind} is never forbidden.")
+                continue
+            target_kind = "team" if session_user_uses_team_target(user) else "user"
+            target_id = int(user.team_id or 0) if target_kind == "team" else int(user.user_id)
+            directory = str(user.directory or "") if normalized_kind == "car" else ""
+            forbidden = is_tp_paint_forbidden(target_kind, target_id, normalized_kind, directory)
+            new_state = set_tp_paint_forbidden(
+                target_kind,
+                target_id,
+                normalized_kind,
+                directory,
+                row.display_name,
+                not forbidden,
+            )
+            if new_state:
+                removed = self._delete_forbidden_tp_paint_files(
+                    target_kind,
+                    target_id,
+                    normalized_kind,
+                    directory,
+                    paints_dir,
+                )
+                self._append_log(
+                    f"Forbade {row.display_name}'s Trading Paints {normalized_kind}; the fallback will be used."
+                )
+                if removed:
+                    self._append_log(f"Removed {removed} saved Trading Paints {normalized_kind} file(s) for {row.display_name}.")
+            else:
+                self._append_log(f"Allowed {row.display_name}'s Trading Paints {normalized_kind} again.")
+            refresh_keys.append(user.effective_target_key())
+        for target_key in dict.fromkeys(refresh_keys):
+            self.service.request_refresh_target_now(target_key)
+        self._last_session_action_state_key = None
+        self._update_session_action_state()
+
     def _append_log_to_single_widget(self, widget, line: str, counter_attr: str) -> None:
         if widget is None:
             return
@@ -27337,6 +34266,107 @@ class DownloaderUI:
             except Exception:
                 self._pool_stats_refresh_in_progress = False
         threading.Thread(target=_worker, name="NishizumiRandomPoolStats", daemon=True).start()
+    def _folder_metrics_extra_dirs(self) -> dict[str, Path]:
+        return {
+            "AI liveries": default_ai_livery_dir(),
+            "Random pool": default_random_pool_dir(),
+            "Collection pool": default_tp_collection_pool_dir(),
+            "Replay packs": default_replay_packs_dir(),
+        }
+    def _on_main_tab_changed(self, _event=None) -> None:
+        if self._exiting:
+            return
+        try:
+            selected = self.main_notebook.select()
+        except Exception:
+            return
+        tp_download_tab = getattr(self, "tp_download_tab", None)
+        if tp_download_tab is not None and selected == str(tp_download_tab):
+            self._tp_download_on_tab_opened()
+        if self._folder_metrics_started:
+            return
+        if self.logs_tab is not None and selected == str(self.logs_tab):
+            self._start_folder_metrics_refresh()
+    def _start_folder_metrics_refresh(self) -> None:
+        if self._folder_metrics_running or self._exiting:
+            return
+        self._folder_metrics_started = True
+        self._folder_metrics_running = True
+        if self.folder_metrics_button is not None:
+            self.folder_metrics_button.configure(state="disabled")
+        for size_var in self.folder_metrics_size_vars.values():
+            size_var.set("…")
+        self.folder_metrics_iracing_total_var.set("…")
+        self.folder_metrics_nishizumi_total_var.set("…")
+        self.folder_metrics_free_space_var.set("…")
+        self._set_folder_metrics_free_space_style(False)
+        extra = self._folder_metrics_extra_dirs()
+        def _worker() -> None:
+            started_at = time.monotonic()
+            metrics: list[tuple[str, Path, int]] = []
+            free_info: tuple[int, int, bool] | None = None
+            try:
+                documents_dir = resolve_iracing_documents_dir(self.config)
+                metrics = iracing_folder_metrics(documents_dir, extra)
+                free_info = free_space_info(documents_dir)
+            except Exception:
+                logging.exception("Could not measure iRacing folder sizes")
+            elapsed = time.monotonic() - started_at
+            summary = ", ".join(
+                f"{label}={format_folder_size(size)}" for label, _path, size in metrics
+            ) or "no folders"
+            logging.info("iRacing folder sizes measured in %.2fs: %s", elapsed, summary)
+            try:
+                self.root.after(
+                    0,
+                    lambda: self._finish_folder_metrics_refresh(metrics, free_info),
+                )
+            except Exception:
+                self._folder_metrics_running = False
+        threading.Thread(target=_worker, name="NishizumiFolderMetrics", daemon=True).start()
+    def _finish_folder_metrics_refresh(
+        self,
+        metrics: list[tuple[str, Path, int]],
+        free_info: tuple[int, int, bool] | None,
+    ) -> None:
+        self._folder_metrics_running = False
+        if self._exiting:
+            return
+        if self.folder_metrics_button is not None:
+            self.folder_metrics_button.configure(state="normal")
+        if not metrics:
+            for size_var in self.folder_metrics_size_vars.values():
+                size_var.set("Error")
+            self.folder_metrics_iracing_total_var.set("Error")
+            self.folder_metrics_nishizumi_total_var.set("Error")
+        else:
+            for label, _path, size in metrics:
+                size_var = self.folder_metrics_size_vars.get(label)
+                if size_var is not None:
+                    size_var.set(format_folder_size(size))
+            iracing_sizes = [size for _label, _path, size in metrics[: len(IRACING_FOLDER_METRIC_NAMES)] if size >= 0]
+            nishizumi_sizes = [size for _label, _path, size in metrics[len(IRACING_FOLDER_METRIC_NAMES):] if size >= 0]
+            self.folder_metrics_iracing_total_var.set(format_folder_size(sum(iracing_sizes)))
+            self.folder_metrics_nishizumi_total_var.set(format_folder_size(sum(nishizumi_sizes)))
+        if free_info is None:
+            self.folder_metrics_free_space_var.set("Error")
+            self._set_folder_metrics_free_space_style(False)
+            return
+        free_bytes, total_bytes, low = free_info
+        self.folder_metrics_free_space_var.set(
+            f"{format_folder_size(free_bytes)} free of {format_folder_size(total_bytes)}"
+        )
+        self._set_folder_metrics_free_space_style(low)
+    def _set_folder_metrics_free_space_style(self, low: bool) -> None:
+        if self.folder_metrics_free_space_label is None:
+            return
+        try:
+            if low:
+                self.folder_metrics_free_space_label.configure(foreground="#b00020", font=("Segoe UI", 9, "bold"))
+            else:
+                self.folder_metrics_free_space_label.configure(foreground="#1a1a1a", font=("Segoe UI", 9))
+        except Exception:
+            logging.debug("Could not style the free space label", exc_info=True)
     def _poll_service(self) -> None:
         # One failing refresh used to end the polling for good: the status, the session
         # list and the service restart below all stopped until the window was reopened.
@@ -27409,6 +34439,7 @@ class DownloaderUI:
                 self._last_runtime_snapshot_version = runtime_snapshot_version
                 self._maybe_autofill_ai_roster_member_id_from_session(runtime_snapshot)
                 self._refresh_session_tree(runtime_snapshot)
+                self.update_replay_name_preview()
         if not self._exiting and not self._headless_controller_mode and not self.service.is_running():
             if self._claim_single_instance():
                 self._append_log("Service stopped unexpectedly. Restarting...")
@@ -27422,6 +34453,8 @@ class DownloaderUI:
                 self._append_log(
                     "Another copy of Nishizumi Paints is running the downloader, so this window does not start a second one."
                 )
+        self._refresh_field_status()
+        self._refresh_session_conditions()
         return True
 
     def _claim_single_instance(self) -> bool:
@@ -27453,6 +34486,47 @@ class DownloaderUI:
         if self._exiting:
             return
         self.root.after(0, lambda: self.status_var.set(value))
+
+    def _replay_name_preview_values(self) -> dict[str, str]:
+        try:
+            session = self.service.get_runtime_snapshot().current_session
+        except Exception:
+            session = None
+        if session is None:
+            return dict(REPLAY_NAME_EXAMPLE_VALUES)
+        return replay_name_values(session)
+
+    def update_replay_name_preview(self) -> None:
+        preview = render_replay_name(self.replay_name_template_var.get(), self._replay_name_preview_values())
+        self.replay_name_preview_var.set(preview or "(empty)")
+
+    def insert_replay_name_tag(self, token: str) -> None:
+        try:
+            self.replay_name_entry.insert("insert", f"{{{token}}}")
+            self.replay_name_entry.focus_set()
+        except Exception:
+            logging.warning("Could not insert the replay name tag %s", token, exc_info=True)
+
+    def copy_replay_name_now(self) -> None:
+        text = render_replay_name(self.replay_name_template_var.get(), self._replay_name_preview_values())
+        if not text:
+            logging.info("Replay name is empty; nothing copied to the clipboard")
+            return
+        self._copy_replay_name_to_clipboard(text)
+
+    def _copy_replay_name_to_clipboard(self, text: str) -> None:
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+        except Exception:
+            logging.warning("Could not copy the replay name to the clipboard", exc_info=True)
+            return
+        logging.info("Replay name copied to the clipboard: %s", text)
+
+    def _on_replay_name_copy_requested(self, text: str) -> None:
+        if self._exiting:
+            return
+        self.root.after(0, lambda value=text: self._copy_replay_name_to_clipboard(value))
     def _attach_to_existing_headless_if_available(self) -> bool:
         response = send_headless_control_command("status")
         if not response or not response.get('ok'):
@@ -27907,6 +34981,8 @@ class DownloaderUI:
             auto_start=bool(self.auto_start_var.get()),
             start_minimized=bool(self.start_minimized_var.get()),
             minimize_to_tray_on_close=bool(self.minimize_to_tray_var.get()),
+            trading_paints_warning_dont_ask=bool(getattr(self.config, "trading_paints_warning_dont_ask", False)),
+            manage_cloud_sync=bool(self.manage_cloud_sync_var.get()),
             auto_refresh_paints=bool(self.auto_refresh_var.get()),
             cleanup_before_fetch=bool(self.cleanup_before_fetch_var.get()),
             delete_downloaded_livery=bool(self.cleanup_on_exit_var.get()),
@@ -27979,6 +35055,14 @@ class DownloaderUI:
             retries=self.config.retries,
             retry_backoff_seconds=self.config.retry_backoff_seconds,
             iracing_documents_dir=self._read_iracing_documents_dir_setting(),
+            replay_name_template=str(self.replay_name_template_var.get()),
+            copy_replay_name_on_finish=bool(self.copy_replay_name_on_finish_var.get()),
+            warning_decal_mode=warning_decal_mode_from_label(self.warning_decal_mode_var.get()),
+            warning_decal_irating=clamp_warning_decal_irating(self.warning_decal_irating_var.get()),
+            warning_decal_safety=clamp_warning_decal_safety(self.warning_decal_safety_var.get()),
+            use_default_spec_maps=bool(self.use_default_spec_maps_var.get()),
+            create_own_car_thumbnails=bool(self.create_own_car_thumbnails_var.get()),
+            create_session_car_thumbnails=bool(self.create_session_car_thumbnails_var.get()),
             # Read from disk, not memory: another launch may have saved a new startup
             # mode since this window opened, and saving settings must not undo it.
             launch_mode_preference=self.config_store.load_launch_mode_preference(),
@@ -28228,9 +35312,12 @@ class DownloaderUI:
         self._normalize_random_pool_category_ui_values()
         self.on_setting_changed()
         self._refresh_random_pool_summary(force=True)
+    def _run_cloud_sync_action(self, action: Callable[[], None]) -> None:
+        threading.Thread(target=action, name="NishizumiCloudSync", daemon=True).start()
     def on_setting_changed(self) -> None:
         if self.verbose_var.get() and not self.show_activity_var.get():
             self.show_activity_var.set(True)
+        old_manage_cloud_sync = bool(getattr(self.config, "manage_cloud_sync", False))
         old_collection_ids = set(parse_tp_collection_ids_from_text(getattr(self.config, "tp_collection_pool_sources", "")))
         old_update_settings = (
             bool(getattr(self.config, "check_updates_automatically", True)),
@@ -28265,6 +35352,9 @@ class DownloaderUI:
             except Exception as exc:
                 logging.debug("Trading Paints collection pool reconciliation failed: %s", exc)
         self._apply_autostart(self.config.auto_start)
+        new_manage_cloud_sync = bool(getattr(self.config, "manage_cloud_sync", False))
+        if new_manage_cloud_sync != old_manage_cloud_sync:
+            self._run_cloud_sync_action(self.cloud_sync.pause if new_manage_cloud_sync else self.cloud_sync.resume)
         if self._headless_controller_mode:
             response = send_headless_control_command("reload_config")
             if response and response.get('ok'):
@@ -28357,6 +35447,312 @@ class DownloaderUI:
     def clear_downloaded_now(self) -> None:
         self._append_log("Manual clear requested.")
         self.service.request_clear_current_downloads()
+
+    def purge_all_downloaded_paints(self) -> None:
+        if self._purge_in_progress:
+            self._append_log("A paint purge is already running.")
+            return
+        snapshot = self.service.get_runtime_snapshot()
+        if snapshot.current_session is not None and session_processing_active(snapshot.session_rows):
+            self.messagebox.showinfo(
+                APP_NAME,
+                "Wait until the current session has finished processing before deleting all downloaded paints.",
+                parent=self.root,
+            )
+            return
+        session = snapshot.current_session
+        own_member_id = int(session.local_user_id or 0) if session is not None else 0
+        own_team_id = int(session.local_team_id or 0) if session is not None else 0
+        if own_member_id <= 0:
+            own_member_id, _source = resolve_iracing_ui_preview_member_id(self.config)
+        paints_dir = default_paints_dir(self.config)
+        protected = iracing_ui_preview_protected_paths()
+        self._purge_in_progress = True
+        self.status_var.set("Checking downloaded paints…")
+
+        def _worker() -> None:
+            try:
+                files = select_purge_files(
+                    paints_dir,
+                    own_member_id=own_member_id,
+                    own_team_id=own_team_id,
+                    protected_paths=protected,
+                )
+                count, size = purge_file_stats(files)
+            except Exception as exc:  # noqa: BLE001
+                logging.warning("Could not inspect the paint folder for a purge: %s", exc)
+                error_text = str(exc)
+                self.root.after(0, lambda: self._finish_purge(0, 0, error_text))
+                return
+            self.root.after(0, lambda: self._confirm_purge_files(files, count, size, paints_dir))
+
+        threading.Thread(target=_worker, name="NishizumiPaintPurgeScan", daemon=True).start()
+
+    def _confirm_purge_files(self, files: list[Path], count: int, size: int, paints_dir: Path) -> None:
+        if not files:
+            self._finish_purge(0, 0, "")
+            return
+        message = (
+            f"Delete {count} downloaded paint file(s) ({format_folder_size(size)}) from:\n\n"
+            f"{paints_dir}\n\n"
+            "Your own paints, iRacing UI preview files and unrecognised files are kept."
+        )
+        try:
+            confirmed = self.messagebox.askyesno(APP_NAME, message, parent=self.root)
+        except Exception:
+            confirmed = False
+        if not confirmed:
+            self._purge_in_progress = False
+            self.status_var.set("Purge cancelled.")
+            return
+        self.status_var.set(f"Deleting {count} downloaded paint file(s)…")
+
+        def _worker() -> None:
+            removed = 0
+            freed = 0
+            failed = 0
+            for path in files:
+                try:
+                    size_bytes = int(path.stat().st_size)
+                except OSError:
+                    size_bytes = 0
+                if _hard_delete_file(path, paints_root=paints_dir):
+                    removed += 1
+                    freed += size_bytes
+                else:
+                    failed += 1
+            self.root.after(0, lambda: self._finish_purge(removed, freed, "" if not failed else f"{failed} file(s) could not be deleted"))
+
+        threading.Thread(target=_worker, name="NishizumiPaintPurge", daemon=True).start()
+
+    def _finish_purge(self, removed: int, freed: int, error: str) -> None:
+        self._purge_in_progress = False
+        if error:
+            self.status_var.set("Purge finished with errors.")
+            self._append_log(f"Paint purge: removed {removed} file(s), {format_folder_size(freed)}; {error}.")
+            return
+        if removed <= 0:
+            self.status_var.set("No downloaded paints to delete.")
+            self._append_log("Paint purge found no files to delete.")
+            return
+        self.status_var.set(f"Deleted {removed} downloaded paint file(s).")
+        self._append_log(f"Paint purge removed {removed} file(s) ({format_folder_size(freed)}).")
+        self._refresh_session_tree()
+
+    def open_tags_forbidden_manager(self) -> None:
+        existing = self._manager_window
+        try:
+            if existing is not None and existing.winfo_exists():
+                existing.deiconify()
+                existing.lift()
+                existing.focus_force()
+                return
+        except Exception:
+            self._manager_window = None
+        ttk = self.ttk
+        window = self.tk.Toplevel(self.root)
+        window.title("Tags & forbidden paints")
+        window.geometry("980x620")
+        window.transient(self.root)
+        window.columnconfigure(0, weight=1)
+        window.rowconfigure(0, weight=1)
+        self._manager_window = window
+        notebook = ttk.Notebook(window)
+        notebook.grid(row=0, column=0, sticky="nsew", padx=10, pady=(10, 0))
+
+        tag_tab = ttk.Frame(notebook, padding=8)
+        theme_tab = ttk.Frame(notebook, padding=8)
+        forbidden_tab = ttk.Frame(notebook, padding=8)
+        notebook.add(tag_tab, text="Tagged drivers")
+        notebook.add(theme_tab, text="Theme files")
+        notebook.add(forbidden_tab, text="Forbidden paints")
+
+        tag_tab.columnconfigure(0, weight=1)
+        tag_tab.rowconfigure(0, weight=1)
+        self._manager_tag_tree = ttk.Treeview(tag_tab, columns=("id", "name", "theme"), show="headings", selectmode="extended")
+        for column, label, width in (("id", "iRacing ID", 110), ("name", "Name", 260), ("theme", "Theme", 240)):
+            self._manager_tag_tree.heading(column, text=label)
+            self._manager_tag_tree.column(column, width=width, anchor="w" if column != "id" else "e")
+        self._manager_tag_tree.grid(row=0, column=0, sticky="nsew")
+        tag_scroll = ttk.Scrollbar(tag_tab, orient="vertical", command=self._manager_tag_tree.yview)
+        tag_scroll.grid(row=0, column=1, sticky="ns")
+        self._manager_tag_tree.configure(yscrollcommand=tag_scroll.set)
+        tag_actions = ttk.Frame(tag_tab)
+        tag_actions.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        ttk.Button(tag_actions, text="Remove tag", command=self.remove_selected_manager_tag).pack(side="left")
+        ttk.Button(tag_actions, text="Refresh", command=self._load_manager_tables).pack(side="left", padx=(8, 0))
+
+        theme_tab.columnconfigure(0, weight=1)
+        theme_tab.rowconfigure(0, weight=1)
+        self._manager_theme_tree = ttk.Treeview(
+            theme_tab, columns=("theme", "car", "type", "file"), show="headings", selectmode="browse"
+        )
+        for column, label, width in (
+            ("theme", "Theme", 180),
+            ("car", "Car", 240),
+            ("type", "Type", 90),
+            ("file", "File", 420),
+        ):
+            self._manager_theme_tree.heading(column, text=label)
+            self._manager_theme_tree.column(column, width=width, anchor="w")
+        self._manager_theme_tree.grid(row=0, column=0, sticky="nsew")
+        theme_scroll = ttk.Scrollbar(theme_tab, orient="vertical", command=self._manager_theme_tree.yview)
+        theme_scroll.grid(row=0, column=1, sticky="ns")
+        self._manager_theme_tree.configure(yscrollcommand=theme_scroll.set)
+        theme_actions = ttk.Frame(theme_tab)
+        theme_actions.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        ttk.Button(theme_actions, text="Open themes folder", command=self.open_tag_themes_folder).pack(side="left")
+        ttk.Button(theme_actions, text="Refresh", command=self._load_manager_tables).pack(side="left", padx=(8, 0))
+
+        forbidden_tab.columnconfigure(0, weight=1)
+        forbidden_tab.rowconfigure(0, weight=1)
+        self._manager_forbidden_tree = ttk.Treeview(
+            forbidden_tab, columns=("target", "kind", "car", "name"), show="headings", selectmode="extended"
+        )
+        for column, label, width in (
+            ("target", "Target", 130),
+            ("kind", "Kind", 90),
+            ("car", "Car", 280),
+            ("name", "Name", 300),
+        ):
+            self._manager_forbidden_tree.heading(column, text=label)
+            self._manager_forbidden_tree.column(column, width=width, anchor="w")
+        self._manager_forbidden_tree.grid(row=0, column=0, sticky="nsew")
+        forbidden_scroll = ttk.Scrollbar(forbidden_tab, orient="vertical", command=self._manager_forbidden_tree.yview)
+        forbidden_scroll.grid(row=0, column=1, sticky="ns")
+        self._manager_forbidden_tree.configure(yscrollcommand=forbidden_scroll.set)
+        forbidden_actions = ttk.Frame(forbidden_tab)
+        forbidden_actions.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        ttk.Button(forbidden_actions, text="Allow", command=self.allow_selected_manager_paints).pack(side="left")
+        ttk.Button(forbidden_actions, text="Refresh", command=self._load_manager_tables).pack(side="left", padx=(8, 0))
+
+        self._manager_status_var = self.tk.StringVar(value="Loading stored tags and paints…")
+        ttk.Label(window, textvariable=self._manager_status_var, foreground="#555555").grid(
+            row=1, column=0, sticky="ew", padx=10, pady=(6, 10)
+        )
+        window.protocol("WM_DELETE_WINDOW", self._close_tags_forbidden_manager)
+        self._load_manager_tables()
+
+    def _close_tags_forbidden_manager(self) -> None:
+        window = self._manager_window
+        self._manager_window = None
+        try:
+            if window is not None:
+                window.destroy()
+        except Exception:
+            logging.debug("Could not close the tags & forbidden manager", exc_info=True)
+
+    def _load_manager_tables(self) -> None:
+        if self._manager_loading:
+            return
+        self._manager_loading = True
+        try:
+            self._manager_status_var.set("Loading stored tags and paints…")
+        except Exception:
+            pass
+
+        def _worker() -> None:
+            try:
+                people = load_people()
+                themes = load_tag_themes()
+                forbidden = load_forbidden_tp_paints()
+                rows = build_manager_tables(people, themes, forbidden)
+                error = ""
+            except Exception as exc:  # noqa: BLE001
+                logging.warning("Could not load the tags & forbidden manager: %s", exc)
+                rows = ([], [], [])
+                error = str(exc)
+            self.root.after(0, lambda: self._populate_manager_tables(*rows, error))
+
+        threading.Thread(target=_worker, name="NishizumiManagerLoad", daemon=True).start()
+
+    def _populate_manager_tables(
+        self,
+        tag_rows: list[ManagerTagRow],
+        theme_rows: list[ManagerThemeRow],
+        forbidden_rows: list[ManagerForbiddenRow],
+        error: str,
+    ) -> None:
+        self._manager_loading = False
+        window = self._manager_window
+        try:
+            if window is None or not window.winfo_exists():
+                return
+        except Exception:
+            return
+        self._manager_tag_rows = list(tag_rows)
+        self._manager_theme_rows = list(theme_rows)
+        self._manager_forbidden_rows = list(forbidden_rows)
+        for tree, rows in (
+            (self._manager_tag_tree, [
+                (row.member_id, row.name or "-", row.theme) for row in self._manager_tag_rows
+            ]),
+            (self._manager_theme_tree, [
+                (row.theme, row.car_folder or "-", row.file_type, str(row.path)) for row in self._manager_theme_rows
+            ]),
+            (self._manager_forbidden_tree, [
+                (row.target_label, row.kind, row.car_label, row.display_name or "-") for row in self._manager_forbidden_rows
+            ]),
+        ):
+            for iid in tree.get_children():
+                tree.delete(iid)
+            for index, values in enumerate(rows):
+                tree.insert("", "end", iid=str(index), values=values)
+        if error:
+            self._manager_status_var.set(f"Could not load stored data: {error}")
+        else:
+            self._manager_status_var.set(
+                f"{len(self._manager_tag_rows)} tagged driver(s), {len(self._manager_theme_rows)} theme file(s), "
+                f"{len(self._manager_forbidden_rows)} forbidden paint(s)."
+            )
+
+    def remove_selected_manager_tag(self) -> None:
+        selection = list(self._manager_tag_tree.selection())
+        rows = [self._manager_tag_rows[int(iid)] for iid in selection if iid.isdigit() and int(iid) < len(self._manager_tag_rows)]
+        if not rows:
+            self._manager_status_var.set("Select a tagged driver to remove.")
+            return
+        self._manager_status_var.set(f"Removing {len(rows)} tag(s)…")
+
+        def _worker() -> None:
+            for row in rows:
+                try:
+                    set_tag(row.member_id, "")
+                except Exception as exc:  # noqa: BLE001
+                    logging.warning("Could not remove the tag for %s: %s", row.member_id, exc)
+            self.root.after(0, self._load_manager_tables)
+
+        threading.Thread(target=_worker, name="NishizumiManagerRemoveTag", daemon=True).start()
+
+    def allow_selected_manager_paints(self) -> None:
+        selection = list(self._manager_forbidden_tree.selection())
+        rows = [
+            self._manager_forbidden_rows[int(iid)]
+            for iid in selection
+            if iid.isdigit() and int(iid) < len(self._manager_forbidden_rows)
+        ]
+        if not rows:
+            self._manager_status_var.set("Select a forbidden paint to allow.")
+            return
+        self._manager_status_var.set(f"Allowing {len(rows)} paint(s)…")
+
+        def _worker() -> None:
+            for row in rows:
+                try:
+                    set_tp_paint_forbidden(
+                        row.target_kind,
+                        row.target_id,
+                        row.kind,
+                        row.directory,
+                        row.display_name,
+                        False,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logging.warning("Could not allow the paint %s: %s", row.key, exc)
+            self.root.after(0, self._load_manager_tables)
+
+        threading.Thread(target=_worker, name="NishizumiManagerAllowPaint", daemon=True).start()
+
     def trigger_global_reload_now(self) -> None:
         self._append_log("Manual global texture reload requested.")
         self.service.request_global_texture_reload()
@@ -28367,6 +35763,155 @@ class DownloaderUI:
         self.service.reset_monitor_snapshot()
         self._refresh_monitor_ui()
         self._append_log("TP worker monitor reset.")
+    def _report_callback_exception(self, exc_type, exc_value, exc_tb) -> None:
+        logging.error(
+            "Unhandled error in a window callback",
+            exc_info=(exc_type, exc_value, exc_tb),
+        )
+
+    def view_log(self) -> None:
+        path = default_log_file_path()
+        if not path.exists():
+            self._append_log(f"The log file has not been created yet: {path}")
+            return
+        try:
+            if sys.platform == "win32":
+                os.startfile(path)  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                os.system(f'open "{path}"')
+            else:
+                os.system(f'xdg-open "{path}"')
+        except Exception as exc:
+            self._append_log(f"Could not open the log file: {exc}")
+
+    def _start_trading_paints_check(self) -> None:
+        if bool(getattr(self.config, "trading_paints_warning_dont_ask", False)):
+            return
+
+        def _work() -> None:
+            names = list_running_process_names()
+            self.root.after(0, lambda: self._show_trading_paints_warning(names))
+
+        threading.Thread(target=_work, name="NishizumiPaintsProcessCheck", daemon=True).start()
+
+    def _show_trading_paints_warning(self, process_names: list[str]) -> None:
+        if self._trading_paints_dialog is not None:
+            return
+        if not should_warn_about_trading_paints(
+            process_names,
+            bool(getattr(self.config, "trading_paints_warning_dont_ask", False)),
+        ):
+            return
+        logging.warning("Trading Paints is running; both apps write the same iRacing paint files.")
+        dialog = self.tk.Toplevel(self.root)
+        self._trading_paints_dialog = dialog
+        dialog.title(APP_NAME)
+        dialog.transient(self.root)
+        try:
+            dialog.grab_set()
+        except Exception:
+            pass
+        frame = self.ttk.Frame(dialog, padding=14)
+        frame.pack(fill="both", expand=True)
+        frame.columnconfigure(0, weight=1)
+        self.ttk.Label(
+            frame,
+            text=(
+                "Trading Paints is running. Both apps write the same iRacing paint files, "
+                "so they can overwrite each other and leave you with the wrong paints."
+            ),
+            justify="left",
+            wraplength=520,
+        ).grid(row=0, column=0, columnspan=3, sticky="w")
+        dont_ask_var = self.tk.BooleanVar(value=False)
+        self.ttk.Checkbutton(frame, text="Don't ask again", variable=dont_ask_var).grid(
+            row=1, column=0, sticky="w", pady=(12, 0)
+        )
+
+        def _finish(close_trading_paints: bool) -> None:
+            if bool(dont_ask_var.get()):
+                self.config.trading_paints_warning_dont_ask = True
+                try:
+                    self.config_store.save(self.config)
+                except Exception:
+                    logging.debug("Could not save the Trading Paints warning preference", exc_info=True)
+            try:
+                dialog.grab_release()
+            except Exception:
+                pass
+            dialog.destroy()
+            self._trading_paints_dialog = None
+            if close_trading_paints:
+                threading.Thread(
+                    target=self._request_trading_paints_close,
+                    name="NishizumiPaintsCloseTradingPaints",
+                    daemon=True,
+                ).start()
+
+        self.ttk.Button(frame, text="Close Trading Paints", command=lambda: _finish(True)).grid(
+            row=2, column=1, sticky="e", padx=(8, 0), pady=(14, 0)
+        )
+        self.ttk.Button(frame, text="Keep both", command=lambda: _finish(False)).grid(
+            row=2, column=2, sticky="e", padx=(8, 0), pady=(14, 0)
+        )
+
+    def _request_trading_paints_close(self) -> None:
+        ok, message = request_trading_paints_close()
+        if ok:
+            logging.info("%s", message)
+        else:
+            logging.warning("%s", message)
+        self.root.after(0, lambda: self._append_log(message))
+
+    def _refresh_iracing_sdk_memory_status(self) -> None:
+        enabled = read_iracing_sdk_memory_enabled(self.config)
+        if enabled is None:
+            text = "iRacing SDK memory sharing could not be checked because app.ini was not found."
+            color = "#666666"
+        elif enabled:
+            text = "iRacing SDK memory sharing is enabled (irsdkEnableMem=1)."
+            color = "#176d2b"
+        else:
+            text = (
+                "iRacing SDK memory sharing is disabled (irsdkEnableMem=0), so session details may be missing. "
+                "Close iRacing, set irsdkEnableMem=1 in the [Misc] section of Documents\\iRacing\\app.ini, "
+                "then start iRacing again."
+            )
+            color = "#b00020"
+        self.iracing_sdk_memory_var.set(text)
+        if self.iracing_sdk_memory_label is not None:
+            try:
+                self.iracing_sdk_memory_label.configure(foreground=color)
+            except Exception:
+                pass
+        if enabled is False and not self._iracing_sdk_memory_warned:
+            self._iracing_sdk_memory_warned = True
+            self.status_var.set("iRacing SDK memory sharing is disabled")
+            self._append_log(text)
+
+    def fix_iracing_sdk_memory_now(self) -> None:
+        self._append_log("Checking whether iRacing is running before changing its SDK setting...")
+
+        def _work() -> None:
+            running = iracing_is_running(list_running_process_names())
+            changed, message = fix_iracing_sdk_memory_setting(self.config, iracing_running=running)
+            self.root.after(0, lambda: self._finish_iracing_sdk_memory_fix(changed, message))
+
+        threading.Thread(target=_work, name="NishizumiPaintsSdkMemoryFix", daemon=True).start()
+
+    def _finish_iracing_sdk_memory_fix(self, changed: bool, message: str) -> None:
+        if changed:
+            logging.info("%s", message)
+        else:
+            logging.warning("%s", message)
+        self._append_log(message)
+        self._refresh_iracing_sdk_memory_status()
+        if not changed:
+            try:
+                self.messagebox.showwarning(APP_NAME, message, parent=self.root)
+            except Exception:
+                pass
+
     def export_log(self) -> None:
         default_name = f"nishizumi-paints-log-{time.strftime('%Y%m%d-%H%M%S')}" + ".txt"
         try:
@@ -28436,6 +35981,41 @@ class DownloaderUI:
         self._copy_saved_paints_to_ai(True)
     def copy_session_cars_to_ai(self) -> None:
         self._copy_saved_paints_to_ai(False)
+    def copy_selected_drivers_to_ai(self) -> None:
+        selected = self._require_selected_session_drivers()
+        if selected is None:
+            return
+        snapshot, contexts = selected
+        session = snapshot.current_session
+        assert session is not None
+        target_keys = {session_user_saved_target_key(user) for _row, user in contexts}
+        names = ", ".join(
+            str(user.display_name or "").strip() or str(int(user.user_id)) for _row, user in contexts
+        )
+        saved = list(snapshot.last_saved)
+        ai_livery_root = default_ai_livery_dir()
+
+        def _work() -> tuple[int, list[Path]]:
+            copied_sets, _copied_files, car_paths = import_selected_paint_groups_to_ai_livery(
+                saved,
+                session,
+                ai_livery_root,
+                target_keys,
+            )
+            return copied_sets, car_paths
+
+        def _done(result: object, error: BaseException | None) -> None:
+            if error is not None:
+                self._append_log(f"Could not copy the selected drivers' car paints into the AI livery folder: {error}")
+                return
+            copied_sets, _car_paths = result  # type: ignore[misc]
+            if copied_sets <= 0:
+                self._append_log(f"No downloaded car paint to copy for {names}.")
+                return
+            self._append_log(f"Copied {copied_sets} car set(s) for {names} into the AI livery folder.")
+            self.status_var.set(f"AI livery cache updated ({copied_sets} set{'s' if copied_sets != 1 else ''})")
+
+        self._run_ui_task("copy_selected_to_ai", "Copy selected drivers to AI", _work, _done)
     def clone_active_ai_roster(self) -> None:
         session = self.service.get_runtime_snapshot().current_session
         rosters_dir = default_ai_rosters_dir(self.config)
@@ -28489,6 +36069,439 @@ class DownloaderUI:
                 os.system(f'xdg-open "{path}"')
         except Exception as exc:
             self._append_log(f"Could not open AI livery folder: {exc}")
+    @staticmethod
+    def _league_library_type_label(entry: LeagueLibraryEntry) -> str:
+        if entry.kind == LEAGUE_LIBRARY_DECAL_KIND:
+            return "Decal"
+        if entry.ext == "mip":
+            return "Paint spec (mip)"
+        if entry.num_type == "num":
+            return "Number paint"
+        return "Paint"
+
+    def _refresh_league_library_tree(self) -> None:
+        tree = getattr(self, "league_library_tree", None)
+        if tree is None:
+            return
+        for iid in tree.get_children():
+            tree.delete(iid)
+        try:
+            entries = load_league_library(default_league_library_dir())
+        except Exception as exc:
+            logging.warning("Could not read league library: %s", exc)
+            entries = []
+        self._league_library_entries = entries
+        for index, entry in enumerate(entries):
+            tree.insert(
+                "",
+                "end",
+                iid=str(index),
+                values=(
+                    entry.league_id,
+                    entry.car_class or "-",
+                    "All" if entry.member_id == 0 else entry.member_id,
+                    entry.car_folder,
+                    self._league_library_type_label(entry),
+                ),
+            )
+        status_var = getattr(self, "league_library_status_var", None)
+        if status_var is not None:
+            status_var.set(f"{len(entries)} file(s) in {default_league_library_dir()}.")
+        self._refresh_league_preview_choices()
+
+    def _refresh_league_preview_choices(self) -> None:
+        entries = list(getattr(self, "_league_library_entries", []) or [])
+        leagues = sorted({str(entry.league_id) for entry in entries}, key=lambda value: int(value))
+        combo = getattr(self, "league_preview_league_combo", None)
+        if combo is not None:
+            combo.configure(values=leagues)
+        current = str(self.league_preview_league_var.get() or "").strip()
+        if not current and leagues:
+            default_league = self._league_library_default_league_id()
+            current = str(default_league) if default_league > 0 and str(default_league) in leagues else leagues[0]
+            self.league_preview_league_var.set(current)
+        self._update_league_preview_cars()
+
+    def _update_league_preview_cars(self) -> None:
+        entries = list(getattr(self, "_league_library_entries", []) or [])
+        try:
+            league_id = int(str(self.league_preview_league_var.get() or "").strip())
+        except (TypeError, ValueError):
+            league_id = 0
+        cars = sorted(
+            {entry.car_folder for entry in entries if int(entry.league_id) == league_id and entry.car_folder},
+            key=str.casefold,
+        )
+        combo = getattr(self, "league_preview_car_combo", None)
+        if combo is not None:
+            combo.configure(values=cars)
+        if str(self.league_preview_car_var.get() or "").strip() not in cars:
+            self.league_preview_car_var.set(cars[0] if cars else "")
+
+    def preview_league_decal(self) -> None:
+        try:
+            league_id = int(str(self.league_preview_league_var.get() or "").strip())
+        except (TypeError, ValueError):
+            league_id = 0
+        car_folder = str(self.league_preview_car_var.get() or "").strip()
+        if league_id <= 0 or not car_folder:
+            self.league_library_status_var.set("Choose a league and a car to preview its decal.")
+            return
+        try:
+            member_id = int(str(self.league_preview_driver_var.get() or "0").strip() or "0")
+        except (TypeError, ValueError):
+            member_id = 0
+        selection = league_preview_selection(
+            list(getattr(self, "_league_library_entries", []) or []),
+            league_id,
+            car_folder,
+            car_class=str(self.league_preview_class_var.get() or "").strip(),
+            member_id=member_id,
+            paint_path=self._league_preview_paint_path,
+        )
+        if selection.decal_path is None:
+            self.league_library_status_var.set("No league decal was found for that league and car.")
+            return
+        if selection.paint_path is None:
+            self.league_library_status_var.set("No paint TGA was found; use Choose paint TGA… first.")
+            return
+        try:
+            self.league_preview_panel.show(
+                selection.paint_path,
+                decal_tga=selection.decal_path,
+                car_path=selection.car_folder,
+                member_id=selection.member_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("Could not preview the league decal: %s", exc)
+            self.league_library_status_var.set(f"Could not preview the league decal: {exc}")
+            return
+        self.league_library_status_var.set(
+            f"Previewing {selection.decal_path.name} over {selection.paint_path.name}."
+        )
+
+    def choose_league_preview_paint(self) -> None:
+        try:
+            selected = self.filedialog.askopenfilename(
+                title="Choose a paint TGA for the league decal preview",
+                filetypes=[("TGA paint files", "*.tga"), ("All files", "*.*")],
+                parent=self.root,
+            )
+        except Exception as exc:
+            self.league_library_status_var.set(f"Could not open the paint chooser: {exc}")
+            return
+        if not selected:
+            return
+        self._league_preview_paint_path = Path(selected)
+        self.league_preview_paint_var.set(f"Paint TGA: {self._league_preview_paint_path.name}")
+
+    def export_league_library_pngs(self) -> None:
+        try:
+            league_id = int(str(self.league_preview_league_var.get() or "0").strip() or "0")
+        except (TypeError, ValueError):
+            league_id = 0
+        try:
+            destination = self.filedialog.askdirectory(
+                title="Choose a folder for the league PNGs",
+                parent=self.root,
+            )
+        except Exception as exc:
+            self.league_library_status_var.set(f"Could not open the folder chooser: {exc}")
+            return
+        if not destination:
+            return
+        destination_dir = Path(destination)
+        self.league_library_status_var.set("Exporting league PNGs…")
+
+        def _worker() -> None:
+            if not iracing_render_service_available():
+                self.root.after(
+                    0,
+                    lambda: self._finish_league_export(
+                        destination_dir, 0, 0, "The iRacing UI render service is unavailable, so no PNGs were exported."
+                    ),
+                )
+                return
+            rendered = 0
+            skipped = 0
+            temp_dir = Path(tempfile.mkdtemp(prefix="nishizumi-league-export-"))
+            try:
+                destination_dir.mkdir(parents=True, exist_ok=True)
+                entries = load_league_library(default_league_library_dir())
+                jobs = league_export_jobs(entries, league_id=league_id)
+                for job in jobs:
+                    if job.decal_path is None:
+                        skipped += 1
+                        continue
+                    merged = temp_dir / f"{job.member_id}_{uuid.uuid4().hex}.tga"
+                    source = job.paint_path
+                    if merge_decal_onto_tga(job.paint_path, job.decal_path, merged) is not None:
+                        source = merged
+                    url = iracing_render_url("car", source, car_path=job.car_folder)
+                    if fetch_iracing_render_png(url, destination_dir / job.file_name) is not None:
+                        rendered += 1
+                    else:
+                        skipped += 1
+            except Exception as exc:  # noqa: BLE001
+                logging.warning("Could not export league PNGs: %s", exc)
+                error_text = str(exc)
+                self.root.after(0, lambda: self._finish_league_export(destination_dir, rendered, skipped, error_text))
+                return
+            finally:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+            self.root.after(0, lambda: self._finish_league_export(destination_dir, rendered, skipped, ""))
+
+        threading.Thread(target=_worker, name="NishizumiLeagueExport", daemon=True).start()
+
+    def _finish_league_export(self, destination: Path, rendered: int, skipped: int, error: str) -> None:
+        if error:
+            self.league_library_status_var.set(error)
+            return
+        message = f"Exported {rendered} league PNG(s) to {destination}."
+        if skipped:
+            message += f" {skipped} job(s) were skipped."
+        self.league_library_status_var.set(message)
+
+    def _league_library_default_league_id(self) -> int:
+        try:
+            snapshot = self.service.get_runtime_snapshot()
+            session = snapshot.current_session
+            if session is not None:
+                return max(0, int(session.league_id or 0))
+        except Exception:
+            logging.debug("Could not read the current session league ID", exc_info=True)
+        return 0
+
+    def _ask_league_library_league_id(self, default: int) -> int:
+        try:
+            value = self.simpledialog.askinteger(
+                APP_NAME,
+                "League ID:",
+                initialvalue=default if default > 0 else None,
+                minvalue=1,
+                parent=self.root,
+            )
+        except Exception as exc:
+            logging.warning("League ID prompt failed: %s", exc)
+            return 0
+        return int(value) if value else 0
+
+    def _ask_league_library_car_folder(self, initial: str = "") -> str:
+        try:
+            value = self.simpledialog.askstring(
+                APP_NAME,
+                "iRacing car folder:",
+                initialvalue=initial,
+                parent=self.root,
+            )
+        except Exception as exc:
+            logging.warning("League car folder prompt failed: %s", exc)
+            return ""
+        return str(value or "").strip()
+
+    def _copy_into_league_library(self, source: Path, destination: Path) -> None:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if source.suffix.lower() == ".tga" and source.stat().st_size > LEAGUE_LIBRARY_TGA_RECOMPRESS_BYTES:
+            Image = _load_pillow_image_module()
+            if Image is not None:
+                temp_path = destination.with_name(f"{destination.name}.{uuid.uuid4().hex}.tmp")
+                try:
+                    with Image.open(source) as image:
+                        image.save(temp_path, format="TGA", compression="tga_rle")
+                    os.replace(temp_path, destination)
+                    return
+                except Exception as exc:
+                    logging.warning("Could not RLE-compress %s: %s", source, exc)
+                finally:
+                    temp_path.unlink(missing_ok=True)
+        _write_bytes_atomically(destination, source.read_bytes())
+
+    def _import_league_library_jobs(self, jobs: list[tuple[Path, str]]) -> None:
+        library_dir = default_league_library_dir()
+        library_dir.mkdir(parents=True, exist_ok=True)
+
+        def _worker() -> None:
+            imported = 0
+            failures = 0
+            for source, name in jobs:
+                try:
+                    self._copy_into_league_library(source, library_dir / name)
+                    imported += 1
+                except Exception as exc:  # noqa: BLE001
+                    failures += 1
+                    logging.warning("Could not import %s into the league library: %s", source, exc)
+            message = f"Imported {imported} league file(s) into {library_dir}."
+            if failures:
+                message += f" {failures} file(s) failed."
+
+            def _done() -> None:
+                self._refresh_league_library_tree()
+                self.league_library_status_var.set(message)
+
+            self.root.after(0, _done)
+
+        threading.Thread(target=_worker, name="NishizumiLeagueLibraryImport", daemon=True).start()
+
+    def import_league_library_files(self) -> None:
+        library_dir = default_league_library_dir()
+        library_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            selected = self.filedialog.askopenfilenames(
+                title="Import league decals and paints",
+                initialdir=str(library_dir),
+                filetypes=[("TGA and MIP files", "*.tga *.mip"), ("All files", "*.*")],
+                parent=self.root,
+            )
+        except Exception as exc:
+            self.league_library_status_var.set(f"Could not open the file chooser: {exc}")
+            return
+        paths = [Path(item) for item in (selected or ())]
+        if not paths:
+            return
+        league_id = self._league_library_default_league_id()
+        if league_id <= 0:
+            league_id = self._ask_league_library_league_id(0)
+        if league_id <= 0:
+            return
+        initial_folder = ""
+        if len({path.parent for path in paths}) == 1:
+            parent = paths[0].parent
+            if parent.name and parent.resolve() != library_dir.resolve():
+                initial_folder = parent.name
+        car_folder = self._ask_league_library_car_folder(initial_folder)
+        if not car_folder:
+            return
+        jobs: list[tuple[Path, str]] = []
+        skipped = 0
+        for path in paths:
+            name = league_library_import_name(path.name, league_id, 0, car_folder)
+            if name is None:
+                skipped += 1
+                continue
+            jobs.append((path, name))
+        if not jobs:
+            self.league_library_status_var.set("No importable league decals or paints were selected.")
+            return
+        self.league_library_status_var.set(f"Importing {len(jobs)} league file(s)...")
+        if skipped:
+            logging.info("League library import skipped %s file(s) that are not car decals or paints", skipped)
+        self._import_league_library_jobs(jobs)
+
+    def import_league_library_folder(self) -> None:
+        library_dir = default_league_library_dir()
+        library_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            selected = self.filedialog.askdirectory(
+                title="Import a folder of league car decals and paints",
+                parent=self.root,
+            )
+        except Exception as exc:
+            self.league_library_status_var.set(f"Could not open the folder chooser: {exc}")
+            return
+        root = Path(selected) if selected else None
+        if root is None or not root.is_dir():
+            return
+        files = [
+            path
+            for path in root.rglob("*")
+            if path.is_file() and path.suffix.lower() in {".tga", ".mip"} and path.name.lower().startswith("car_")
+        ]
+        if not files:
+            self.league_library_status_var.set("No car_*.tga or car_*.mip files were found in that folder.")
+            return
+        league_id = self._league_library_default_league_id()
+        if league_id <= 0:
+            league_id = self._ask_league_library_league_id(0)
+        if league_id <= 0:
+            return
+        root_folder = ""
+        if any(path.parent == root for path in files):
+            root_folder = self._ask_league_library_car_folder("")
+            if not root_folder:
+                return
+        jobs: list[tuple[Path, str]] = []
+        skipped = 0
+        for path in files:
+            car_folder = root_folder if path.parent == root else path.parent.name
+            name = league_library_import_name(path.name, league_id, 0, car_folder)
+            if name is None:
+                skipped += 1
+                continue
+            jobs.append((path, name))
+        if not jobs:
+            self.league_library_status_var.set("No importable league car decals or paints were found.")
+            return
+        self.league_library_status_var.set(f"Importing {len(jobs)} league file(s)...")
+        if skipped:
+            logging.info("League library folder import skipped %s file(s) that are not car decals or paints", skipped)
+        self._import_league_library_jobs(jobs)
+
+    def open_league_library_folder(self) -> None:
+        path = default_league_library_dir()
+        path.mkdir(parents=True, exist_ok=True)
+        try:
+            if sys.platform == "win32":
+                os.startfile(path)  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                os.system(f'open "{path}"')
+            else:
+                os.system(f'xdg-open "{path}"')
+        except Exception as exc:
+            self._append_log(f"Could not open league library folder: {exc}")
+
+    def open_default_spec_maps_folder(self) -> None:
+        path = default_spec_maps_dir()
+        path.mkdir(parents=True, exist_ok=True)
+        try:
+            if sys.platform == "win32":
+                os.startfile(path)  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                os.system(f'open "{path}"')
+            else:
+                os.system(f'xdg-open "{path}"')
+        except Exception as exc:
+            self._append_log(f"Could not open default spec maps folder: {exc}")
+
+    def open_car_thumbnails_folder(self) -> None:
+        path = default_car_thumbnails_dir()
+        path.mkdir(parents=True, exist_ok=True)
+        try:
+            if sys.platform == "win32":
+                os.startfile(path)  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                os.system(f'open "{path}"')
+            else:
+                os.system(f'xdg-open "{path}"')
+        except Exception as exc:
+            self._append_log(f"Could not open car thumbnails folder: {exc}")
+
+    def delete_selected_league_library_entries(self) -> None:
+        tree = getattr(self, "league_library_tree", None)
+        if tree is None:
+            return
+        selection = list(tree.selection())
+        if not selection:
+            self.league_library_status_var.set("Select one or more league library files to delete.")
+            return
+        entries = list(getattr(self, "_league_library_entries", []) or [])
+        library_dir = default_league_library_dir()
+        removed = 0
+        for iid in selection:
+            try:
+                entry = entries[int(iid)]
+            except (IndexError, ValueError, TypeError):
+                continue
+            path = library_dir / league_library_name(entry)
+            try:
+                path.unlink()
+                removed += 1
+            except FileNotFoundError:
+                pass
+            except Exception as exc:  # noqa: BLE001
+                logging.warning("Could not delete league library file %s: %s", path, exc)
+        self._refresh_league_library_tree()
+        self.league_library_status_var.set(f"Deleted {removed} league library file(s).")
+
     def open_random_pool_folder(self) -> None:
         path = default_random_pool_dir()
         path.mkdir(parents=True, exist_ok=True)
@@ -30105,6 +38118,11 @@ class DownloaderUI:
         self.exit_app()
     def exit_app(self) -> None:
         self._exiting = True
+        self.cloud_sync.resume()
+        try:
+            self._tp_download_cleanup_preview()
+        except Exception:
+            logging.debug("Could not clean up TP download preview files on exit", exc_info=True)
         if self._auto_update_after_id is not None:
             try:
                 self.root.after_cancel(self._auto_update_after_id)
@@ -30485,6 +38503,21 @@ def run_headless(args: argparse.Namespace | None = None, instance_lock: SingleIn
     if getattr(args, "no_ui_previews", False):
         config.iracing_ui_car_previews = False
     config.verbose = bool(config.verbose or args.verbose)
+    running_processes = list_running_process_names()
+    if should_warn_about_trading_paints(
+        running_processes,
+        bool(getattr(config, "trading_paints_warning_dont_ask", False)),
+    ):
+        logging.warning(
+            "Trading Paints is running. Both apps write the same iRacing paint files, "
+            "so they can overwrite each other."
+        )
+    if read_iracing_sdk_memory_enabled(config) is False:
+        logging.warning(
+            "iRacing SDK memory sharing is disabled (irsdkEnableMem=0). Close iRacing, "
+            "set irsdkEnableMem=1 in the [Misc] section of Documents\\iRacing\\app.ini, "
+            "then start iRacing again."
+        )
     config.poll_seconds = max(args.poll_seconds, 0.2)
     config.retries = max(1, args.retries)
     config.retry_backoff_seconds = max(0.1, args.retry_backoff_seconds)

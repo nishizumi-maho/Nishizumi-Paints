@@ -77,6 +77,8 @@ jobs:
           --add-data "assets/icons/nishizumi_paints_icon.png;assets/icons"
           --add-data "assets/icons/nishizumi_paints_icon.ico;assets/icons"
           --hidden-import irsdk
+          --collect-all tkinterdnd2
+          --hidden-import PIL._tkinter_finder
           Nishizumi_Paintsv6_nobrowser.py
 
       - name: Build the installer
