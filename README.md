@@ -6,13 +6,7 @@ Nishizumi Paints is a Windows desktop companion for iRacing. It watches live ses
 
 Car identification is automatic: the app combines the iRacing SDK, Trading Paints manifests, and the live Trading Paints template catalog. New cars do not require a bundled mapping update or a user-edited JSON file.
 
-[Download the latest release](https://github.com/nishizumi-maho/Nishizumi-Paints/releases/latest)
-;
-[Read the manual](./docs/wiki/Home.md)
-;
-[View the changelog](./CHANGELOG.md)
-;
-[Security policy](./SECURITY.md)
+[Download the latest release](https://github.com/nishizumi-maho/Nishizumi-Paints/releases/latest) · [Read the manual](./docs/wiki/Home.md) · [View the changelog](./CHANGELOG.md) · [Security policy](./SECURITY.md)
 
 ## Requirements
 
@@ -31,14 +25,15 @@ Upgrades use the same app ID and install path, so a newer installer can be run o
 
 From 7.3.2 the installed app can update itself: when a newer release is found it offers to download and install it, and the **Install updates automatically** preference on the General tab does it without asking. The downloaded installer is only executed after its SHA-256 matches the digest published with the release and the download stayed on GitHub's release hosts; otherwise the release page is opened instead. Automatic installation needs the packaged `.exe` — source checkouts only report that an update exists.
 
-## What's new in 7.3
+## What's new in 7.4.0
 
-- Every tab scrolls when its content does not fit the window, so the options added along the 7.3 releases stay reachable on smaller windows and screens. The window also opens at a size that fits the screen and can be resized down to 960x560.
-- The iRacing UI 3D car viewer (`My Content > Cars`) now always shows your own paints. Your Trading Paints car, custom number, spec, decal, helmet, and suit files are kept in the iRacing paint folder at all times instead of only during a live session.
-- Preview files are mirrored locally, so they are restored right after every session cleanup and keep working with no internet connection.
-- Your iRacing customer ID is detected automatically from the live session, the Trading Paints member ID, the AI roster member ID, a confirmed Trading Paints login, or the value remembered from a previous run, with a manual override available.
-- New `iRacing UI car previews` panel in the General tab and on the Easy screen, with a live status line, a configurable re-check interval, and a `Sync previews now` button.
-- The 7.2 automatic car identification and the legacy 7.1 session, Team fallback, RandomPool, collection, and camera-switching improvements remain included.
+- **TP Download** tab: browse and download any Trading Paints member's car paints without being in a session, with 3-D and TGA previews, day/night/team/series/league context, selected/all downloads and a Friends list.
+- **Showroom link preview**: drag or paste a Trading Paints showroom link onto the car preview to try the paint on your own car; it is copied to the iRacing paint folder and can be reloaded in the sim with `Ctrl+R`.
+- **Session previews and tools**: preview the selected driver's car, helmet and suit, export images, and use **Forbid TP / Allow TP**, **Copy to AI**, aliases, friends and paint tags.
+- **League and broadcast tools**: league decal library, per-driver league paints and warning decals by iRating and/or safety rating.
+- **Faster downloads**: the field is requested in batches instead of one request per driver, cars on track download first, and failed downloads retry on the backup server.
+- **Diagnostics and recovery**: **View log** with 31-day/10 MB retention, tracebacks for unhandled errors, a Trading Paints coexistence warning, an iRacing SDK check, safer session YAML handling and AI roster validation.
+- The 7.3 scrolling and iRacing UI preview work, 7.2 automatic car identification, and the 7.1 Team fallback, RandomPool, collection and camera-switching improvements remain included.
 
 ## iRacing UI car previews
 
@@ -86,6 +81,10 @@ Open **Showroom** when you want to pre-fill paints manually instead of waiting f
 - **Teams** downloads known Team paints.
 - **Showroom links** accepts one or more Trading Paints paint links.
 - **Collection** imports usable public paints from a Trading Paints collection.
+
+## TP Download tab
+
+Open **TP Download** to browse a Trading Paints member's paints without a live session. Enter or confirm the member ID, press **Refresh**, select a car, then use the **Car** and **TGA** tabs to preview it. The context controls (day/night, team, series, league and custom numbers) show the paint Trading Paints would serve for that situation. **Download selected** or **Download all** copies the paints to `Documents\iRacing\paint` or a folder you choose. The **Friends** list can download every friend's paints in one click.
 
 ## Privacy notes
 
